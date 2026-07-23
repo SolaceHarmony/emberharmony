@@ -4751,7 +4751,7 @@ fn session_runtime_has_no_operation_wait_path() {
             "static void leave_pass_admission",
         ),
         (
-            "static bool enter_route_admission",
+            "static int enter_route_admission",
             "static void leave_route_admission",
         ),
     ] {
@@ -4762,7 +4762,9 @@ fn session_runtime_has_no_operation_wait_path() {
             .unwrap();
         let admission = &engine[begin..end];
         assert!(!admission.contains("for (;;)") && !admission.contains("while ("));
-        assert!(admission.contains("compare_exchange_strong"));
+        assert!(admission.contains("fetch_add(1"));
+        assert!(admission.contains("fetch_sub(1"));
+        assert!(!admission.contains("compare_exchange"));
         assert!(admission.matches("memory_order_seq_cst").count() >= 3);
     }
 }

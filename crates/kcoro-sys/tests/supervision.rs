@@ -4,7 +4,6 @@ use std::sync::Barrier;
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
-const ABI: u32 = 1;
 const TICKET_PASS: u32 = 4;
 const TICKET_WORKFLOW: u32 = 7;
 const TICKET_CONTROL: u32 = 8;
@@ -51,30 +50,21 @@ type ScopeReady = unsafe extern "C" fn(*mut c_void, u64, u32);
 
 #[repr(C)]
 struct ScopeConfig {
-    size: u32,
-    abi_version: u32,
     child_capacity: u32,
-    reserved: u32,
     ready: Option<ScopeReady>,
     context: *mut c_void,
 }
 
 #[repr(C)]
 struct ChildConfig {
-    size: u32,
-    abi_version: u32,
     child_class: u32,
-    reserved: u32,
     cancel: Option<ScopeCancel>,
     context: *mut c_void,
 }
 
 #[repr(C)]
 struct CycleConfig {
-    size: u32,
-    abi_version: u32,
     child_count: u32,
-    reserved: u32,
     generation: u64,
     parent: Ticket,
     child_tickets: *const Ticket,
@@ -83,13 +73,10 @@ struct CycleConfig {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Lease {
-    size: u32,
-    abi_version: u32,
     slot: u32,
     child_class: u32,
     scope_generation: u64,
     child_generation: u32,
-    reserved: u32,
     parent: Ticket,
     child: Ticket,
 }
@@ -97,13 +84,10 @@ struct Lease {
 impl Default for Lease {
     fn default() -> Self {
         Self {
-            size: size_of::<Self>() as u32,
-            abi_version: ABI,
             slot: 0,
             child_class: 0,
             scope_generation: 0,
             child_generation: 0,
-            reserved: 0,
             parent: Ticket::new(1, 1, TICKET_WORKFLOW),
             child: Ticket::new(1, 1, TICKET_PASS),
         }
@@ -112,8 +96,6 @@ impl Default for Lease {
 
 #[repr(C)]
 struct ScopeSnapshot {
-    size: u32,
-    abi_version: u32,
     capacity: u32,
     children: u32,
     terminal_children: u32,
@@ -124,7 +106,6 @@ struct ScopeSnapshot {
     cause_slot: u32,
     ready_edges: u32,
     cancelling_children: u32,
-    reserved: u32,
     generation: u64,
     parent: Ticket,
 }
@@ -132,8 +113,6 @@ struct ScopeSnapshot {
 impl Default for ScopeSnapshot {
     fn default() -> Self {
         Self {
-            size: size_of::<Self>() as u32,
-            abi_version: ABI,
             capacity: 0,
             children: 0,
             terminal_children: 0,
@@ -144,7 +123,6 @@ impl Default for ScopeSnapshot {
             cause_slot: 0,
             ready_edges: 0,
             cancelling_children: 0,
-            reserved: 0,
             generation: 0,
             parent: Ticket::new(1, 1, TICKET_WORKFLOW),
         }
@@ -153,20 +131,14 @@ impl Default for ScopeSnapshot {
 
 #[repr(C)]
 struct DeadlineConfig {
-    size: u32,
-    abi_version: u32,
     capacity: u32,
-    reserved: u32,
     notify: Option<Notify>,
     context: *mut c_void,
 }
 
 #[repr(C)]
 struct ArmConfig {
-    size: u32,
-    abi_version: u32,
     slot: u32,
-    reserved: u32,
     delay_ns: u64,
     child: Ticket,
     parent: Ticket,
@@ -179,10 +151,7 @@ struct ArmConfig {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Arm {
-    size: u32,
-    abi_version: u32,
     slot: u32,
-    reserved: u32,
     arm_generation: u64,
     child: Ticket,
     parent: Ticket,
@@ -195,10 +164,7 @@ struct Arm {
 impl Default for Arm {
     fn default() -> Self {
         Self {
-            size: size_of::<Self>() as u32,
-            abi_version: ABI,
             slot: 0,
-            reserved: 0,
             arm_generation: 0,
             child: Ticket::new(1, 1, TICKET_DEADLINE),
             parent: Ticket::new(2, 1, TICKET_WORKFLOW),
@@ -213,8 +179,6 @@ impl Default for Arm {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DeadlineEvent {
-    size: u32,
-    abi_version: u32,
     slot: u32,
     kind: u32,
     sequence: u64,
@@ -231,8 +195,6 @@ struct DeadlineEvent {
 impl Default for DeadlineEvent {
     fn default() -> Self {
         Self {
-            size: size_of::<Self>() as u32,
-            abi_version: ABI,
             slot: 0,
             kind: 0,
             sequence: 0,
@@ -250,14 +212,11 @@ impl Default for DeadlineEvent {
 
 #[repr(C)]
 struct DeadlineSnapshot {
-    size: u32,
-    abi_version: u32,
     capacity: u32,
     phase: u32,
     idle: u32,
     armed: u32,
     pending_events: u32,
-    reserved: u32,
     published_events: u64,
     stale_events: u64,
     notifications: u64,
@@ -268,14 +227,11 @@ struct DeadlineSnapshot {
 impl Default for DeadlineSnapshot {
     fn default() -> Self {
         Self {
-            size: size_of::<Self>() as u32,
-            abi_version: ABI,
             capacity: 0,
             phase: 0,
             idle: 0,
             armed: 0,
             pending_events: 0,
-            reserved: 0,
             published_events: 0,
             stale_events: 0,
             notifications: 0,
@@ -429,10 +385,7 @@ fn wait_edge(edge: &Edge, target: u64) {
 
 fn scope(capacity: u32, edge: &Edge) -> *mut c_void {
     let config = ScopeConfig {
-        size: size_of::<ScopeConfig>() as u32,
-        abi_version: ABI,
         child_capacity: capacity,
-        reserved: 0,
         ready: Some(ready),
         context: (edge as *const Edge).cast_mut().cast(),
     };
@@ -443,10 +396,7 @@ fn scope(capacity: u32, edge: &Edge) -> *mut c_void {
 
 fn add(scope: *mut c_void, edge: &Edge, slot: u32, class: u32) {
     let config = ChildConfig {
-        size: size_of::<ChildConfig>() as u32,
-        abi_version: ABI,
         child_class: class,
-        reserved: 0,
         cancel: Some(cancel),
         context: (edge as *const Edge).cast_mut().cast(),
     };
@@ -469,10 +419,7 @@ fn begin(scope: *mut c_void, generation: u64, children: u32) -> Vec<Lease> {
         })
         .collect::<Vec<_>>();
     let config = CycleConfig {
-        size: size_of::<CycleConfig>() as u32,
-        abi_version: ABI,
         child_count: children,
-        reserved: 0,
         generation,
         parent: Ticket::new(generation * 1000 + 1, generation as u32, TICKET_WORKFLOW),
         child_tickets: tickets.as_ptr(),
@@ -487,10 +434,7 @@ fn begin(scope: *mut c_void, generation: u64, children: u32) -> Vec<Lease> {
 
 fn deadline(edge: &Edge, manual: bool, capacity: u32) -> *mut c_void {
     let config = DeadlineConfig {
-        size: size_of::<DeadlineConfig>() as u32,
-        abi_version: ABI,
         capacity,
-        reserved: 0,
         notify: Some(notify),
         context: (edge as *const Edge).cast_mut().cast(),
     };
@@ -506,10 +450,7 @@ fn deadline(edge: &Edge, manual: bool, capacity: u32) -> *mut c_void {
 
 fn arm(source: *mut c_void, slot: u32, delay: Duration) -> Arm {
     let config = ArmConfig {
-        size: size_of::<ArmConfig>() as u32,
-        abi_version: ABI,
         slot,
-        reserved: 0,
         delay_ns: delay.as_nanos() as u64,
         child: Ticket::new(300 + u64::from(slot), 30 + slot, TICKET_DEADLINE),
         parent: Ticket::new(400, 40, TICKET_WORKFLOW),
@@ -722,10 +663,7 @@ fn sealed_scope_runs_one_million_allocation_free_cycles() {
         owner: thread::current(),
     };
     let config = ScopeConfig {
-        size: size_of::<ScopeConfig>() as u32,
-        abi_version: ABI,
         child_capacity: 1,
-        reserved: 0,
         ready: Some(count_ready),
         context: (&edge as *const Edge).cast_mut().cast(),
     };
@@ -739,10 +677,7 @@ fn sealed_scope_runs_one_million_allocation_free_cycles() {
     for generation in 1..=CYCLES {
         ticket[0] = Ticket::new(generation * 2, generation as u32, TICKET_PASS);
         let cycle = CycleConfig {
-            size: size_of::<CycleConfig>() as u32,
-            abi_version: ABI,
             child_count: 1,
-            reserved: 0,
             generation,
             parent: Ticket::new(generation * 2 + 1, generation as u32, TICKET_WORKFLOW),
             child_tickets: ticket.as_ptr(),
@@ -890,10 +825,7 @@ fn blocked_ready_callback_retains_scope_until_it_returns() {
     };
     let blocker = Blocker::new(1);
     let config = ScopeConfig {
-        size: size_of::<ScopeConfig>() as u32,
-        abi_version: ABI,
         child_capacity: 1,
-        reserved: 0,
         ready: Some(blocking_ready),
         context: (&blocker as *const Blocker).cast_mut().cast(),
     };
@@ -1034,10 +966,7 @@ fn deadline_stop_before_first_arm_joins_without_publishing_work() {
     assert_eq!(stopped.published_events, 0);
     assert_eq!(stopped.pending_events, 0);
     let config = ArmConfig {
-        size: size_of::<ArmConfig>() as u32,
-        abi_version: ABI,
         slot: 0,
-        reserved: 0,
         delay_ns: 1,
         child: Ticket::new(300, 30, TICKET_DEADLINE),
         parent: Ticket::new(400, 40, TICKET_WORKFLOW),
@@ -1477,10 +1406,7 @@ fn deadline_join_parks_until_final_cancellation_notify_returns() {
     kcoro_sys::link_anchor();
     let blocker = Blocker::new(2);
     let config = DeadlineConfig {
-        size: size_of::<DeadlineConfig>() as u32,
-        abi_version: ABI,
         capacity: 1,
-        reserved: 0,
         notify: Some(blocking_notify),
         context: (&blocker as *const Blocker).cast_mut().cast(),
     };
@@ -1516,10 +1442,7 @@ fn stopped_is_withheld_until_the_cancellation_walk_has_finished() {
     kcoro_sys::link_anchor();
     let blocker = Blocker::new(1);
     let config = DeadlineConfig {
-        size: size_of::<DeadlineConfig>() as u32,
-        abi_version: ABI,
         capacity: 1,
-        reserved: 0,
         notify: Some(blocking_notify),
         context: (&blocker as *const Blocker).cast_mut().cast(),
     };
@@ -1552,10 +1475,7 @@ fn disarm_notify_retains_arm_admission_until_callback_returns() {
     kcoro_sys::link_anchor();
     let blocker = Blocker::new(1);
     let config = DeadlineConfig {
-        size: size_of::<DeadlineConfig>() as u32,
-        abi_version: ABI,
         capacity: 1,
-        reserved: 0,
         notify: Some(blocking_notify),
         context: (&blocker as *const Blocker).cast_mut().cast(),
     };
@@ -1591,10 +1511,7 @@ fn deadline_join_parks_across_a_queued_expiry_handler() {
     kcoro_sys::link_anchor();
     let blocker = Blocker::new(1);
     let config = DeadlineConfig {
-        size: size_of::<DeadlineConfig>() as u32,
-        abi_version: ABI,
         capacity: 1,
-        reserved: 0,
         notify: Some(blocking_notify),
         context: (&blocker as *const Blocker).cast_mut().cast(),
     };
@@ -1652,10 +1569,7 @@ fn three_permanent_slots_cover_repeated_prepare_commit_and_forced_endpoint_arms(
             (2, 30_000_000_000),
         ] {
             let config = ArmConfig {
-                size: size_of::<ArmConfig>() as u32,
-                abi_version: ABI,
                 slot,
-                reserved: 0,
                 delay_ns,
                 child: Ticket::new(cycle * 10 + u64::from(slot), cycle as u32, TICKET_DEADLINE),
                 parent: Ticket::new(cycle * 10 + 9, cycle as u32, TICKET_WORKFLOW),
@@ -1904,10 +1818,7 @@ fn non_apple_production_arm_is_explicitly_unsupported() {
         owner: thread::current(),
     };
     let config = DeadlineConfig {
-        size: size_of::<DeadlineConfig>() as u32,
-        abi_version: ABI,
         capacity: 1,
-        reserved: 0,
         notify: Some(notify),
         context: (&edge as *const Edge).cast_mut().cast(),
     };

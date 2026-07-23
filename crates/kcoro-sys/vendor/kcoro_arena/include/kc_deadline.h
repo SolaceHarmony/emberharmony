@@ -47,19 +47,13 @@ typedef void (*kc_deadline_guard_hook_manual_test_fn)(void *context,
  * conversation, or numerical scratch owner. */
 
 typedef struct kc_deadline_source_config {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t capacity;
-    uint32_t reserved;
     kc_deadline_notify_fn notify;
     void *context;
 } kc_deadline_source_config;
 
 typedef struct kc_deadline_arm_config {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t slot;
-    uint32_t reserved;
     uint64_t delay_ns;
     kc_ticket_id child;
     kc_ticket_id parent;
@@ -70,10 +64,7 @@ typedef struct kc_deadline_arm_config {
 } kc_deadline_arm_config;
 
 typedef struct kc_deadline_arm {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t slot;
-    uint32_t reserved;
     uint64_t arm_generation;
     kc_ticket_id child;
     kc_ticket_id parent;
@@ -84,8 +75,6 @@ typedef struct kc_deadline_arm {
 } kc_deadline_arm;
 
 typedef struct kc_deadline_event {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t slot;
     uint32_t kind;
     uint64_t sequence;
@@ -100,14 +89,11 @@ typedef struct kc_deadline_event {
 } kc_deadline_event;
 
 typedef struct kc_deadline_source_snapshot {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t capacity;
     uint32_t phase;
     uint32_t idle;
     uint32_t armed;
     uint32_t pending_events;
-    uint32_t reserved;
     uint64_t published_events;
     uint64_t stale_events;
     uint64_t notifications;

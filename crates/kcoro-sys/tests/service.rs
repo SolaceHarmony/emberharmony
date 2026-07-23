@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const ABI: u32 = 1;
 const EBUSY: i32 = 16;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const EDEADLK: i32 = 11;
@@ -22,16 +21,11 @@ const DONE: u32 = 4;
 
 #[repr(C)]
 struct RuntimeConfig {
-    size: u32,
-    abi_version: u32,
     worker_count: u32,
-    reserved: u32,
 }
 
 #[repr(C)]
 struct RuntimeSnapshot {
-    size: u32,
-    abi_version: u32,
     active: usize,
     queued: usize,
     running: usize,
@@ -48,11 +42,8 @@ type Callback = unsafe extern "C" fn(*mut c_void);
 
 #[repr(C)]
 struct ServiceConfig {
-    size: u32,
-    abi_version: u32,
     callback: Option<Callback>,
     context: *mut c_void,
-    reserved: u64,
     owner_init: Option<Callback>,
     owner_fini: Option<Callback>,
 }
@@ -60,8 +51,6 @@ struct ServiceConfig {
 #[repr(C)]
 #[derive(Default)]
 struct ServiceSnapshot {
-    size: u32,
-    abi_version: u32,
     notifications: u64,
     handled_notifications: u64,
     callbacks: u64,
@@ -243,10 +232,7 @@ fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_e
     kcoro_sys::link_anchor();
     const QUOTAS: u64 = 17;
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 2,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -257,11 +243,8 @@ fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_e
         status: AtomicI32::new(0),
     };
     let config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: ABI,
         callback: Some(quota_callback),
         context: (&quota as *const Quota).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };
@@ -277,8 +260,6 @@ fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_e
     wait_for_handled(service, QUOTAS);
 
     let mut snapshot = ServiceSnapshot {
-        size: size_of::<ServiceSnapshot>() as u32,
-        abi_version: ABI,
         ..ServiceSnapshot::default()
     };
     assert_eq!(
@@ -309,10 +290,7 @@ fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_e
 fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 1,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -326,11 +304,8 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
         changed: Condvar::new(),
     };
     let config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: ABI,
         callback: Some(self_join_callback),
         context: (&probe as *const JoinProbe).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };
@@ -367,10 +342,7 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
 fn serial_continuation_acknowledges_each_realtime_edge() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 1,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -378,11 +350,8 @@ fn serial_continuation_acknowledges_each_realtime_edge() {
         callbacks: AtomicU64::new(0),
     };
     let config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: ABI,
         callback: Some(count_callback),
         context: (&count as *const Count).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };
@@ -429,8 +398,6 @@ fn wait_for_calls(seen: &Seen, calls: usize) {
 
 fn runtime_snapshot(runtime: *mut c_void) -> RuntimeSnapshot {
     let mut snapshot = RuntimeSnapshot {
-        size: size_of::<RuntimeSnapshot>() as u32,
-        abi_version: ABI,
         active: 0,
         queued: 0,
         running: 0,
@@ -453,10 +420,7 @@ fn runtime_snapshot(runtime: *mut c_void) -> RuntimeSnapshot {
 fn service_stop_and_join_do_not_stop_the_explicit_runtime() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 1,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -466,11 +430,8 @@ fn service_stop_and_join_do_not_stop_the_explicit_runtime() {
         changed: Condvar::new(),
     };
     let config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: ABI,
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };
@@ -493,8 +454,6 @@ fn service_stop_and_join_do_not_stop_the_explicit_runtime() {
 
 fn service_snapshot(service: *mut c_void) -> ServiceSnapshot {
     let mut snapshot = ServiceSnapshot {
-        size: size_of::<ServiceSnapshot>() as u32,
-        abi_version: ABI,
         ..ServiceSnapshot::default()
     };
     assert_eq!(
@@ -519,10 +478,7 @@ fn wait_for_handled(service: *mut c_void, handled: u64) {
 fn retained_service_coalesces_edges_without_lost_wakes_or_concurrent_callbacks() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 2,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -532,11 +488,8 @@ fn retained_service_coalesces_edges_without_lost_wakes_or_concurrent_callbacks()
         changed: Condvar::new(),
     };
     let config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: ABI,
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };
@@ -615,10 +568,7 @@ fn retained_service_coalesces_edges_without_lost_wakes_or_concurrent_callbacks()
 fn joining_an_unstarted_service_is_terminal_and_cannot_enable_uaf() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 1,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -627,11 +577,8 @@ fn joining_an_unstarted_service_is_terminal_and_cannot_enable_uaf() {
         changed: Condvar::new(),
     };
     let config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: ABI,
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };
@@ -654,10 +601,7 @@ fn concurrent_start_and_runtime_stop_always_reaches_a_destroyable_terminal_state
     kcoro_sys::link_anchor();
     for _ in 0..256 {
         let config = RuntimeConfig {
-            size: size_of::<RuntimeConfig>() as u32,
-            abi_version: ABI,
             worker_count: 2,
-            reserved: 0,
         };
         let mut runtime = std::ptr::null_mut();
         assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -666,11 +610,8 @@ fn concurrent_start_and_runtime_stop_always_reaches_a_destroyable_terminal_state
             callbacks: AtomicU64::new(0),
         };
         let config = ServiceConfig {
-            size: size_of::<ServiceConfig>() as u32,
-            abi_version: ABI,
             callback: Some(count_callback),
             context: (&count as *const Count).cast_mut().cast(),
-            reserved: 0,
             owner_init: None,
             owner_fini: None,
         };
@@ -711,10 +652,7 @@ fn stop_and_join_cannot_overtake_either_start_publication_boundary() {
     kcoro_sys::link_anchor();
     for target in [1, 2] {
         let config = RuntimeConfig {
-            size: size_of::<RuntimeConfig>() as u32,
-            abi_version: ABI,
             worker_count: 2,
-            reserved: 0,
         };
         let mut runtime = std::ptr::null_mut();
         assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -723,11 +661,8 @@ fn stop_and_join_cannot_overtake_either_start_publication_boundary() {
             callbacks: AtomicU64::new(0),
         };
         let config = ServiceConfig {
-            size: size_of::<ServiceConfig>() as u32,
-            abi_version: ABI,
             callback: Some(count_callback),
             context: (&count as *const Count).cast_mut().cast(),
-            reserved: 0,
             owner_init: None,
             owner_fini: None,
         };
@@ -766,10 +701,7 @@ fn stop_and_join_cannot_overtake_either_start_publication_boundary() {
 fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 2,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -781,11 +713,8 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
         changed: Condvar::new(),
     };
     let config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: ABI,
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };

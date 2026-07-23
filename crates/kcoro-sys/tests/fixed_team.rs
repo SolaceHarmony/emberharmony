@@ -47,29 +47,20 @@ const HEALTHY_GENERATIONS: u64 = 1_000_000;
 
 #[repr(C)]
 struct RuntimeConfig {
-    size: u32,
-    abi_version: u32,
     worker_count: u32,
-    reserved: u32,
 }
 
 #[repr(C)]
 struct ServiceConfig {
-    size: u32,
-    abi_version: u32,
     callback: Option<unsafe extern "C" fn(*mut c_void)>,
     context: *mut c_void,
-    reserved: u64,
     owner_init: Option<unsafe extern "C" fn(*mut c_void)>,
     owner_fini: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 #[repr(C)]
 struct TeamConfig {
-    size: u32,
-    abi_version: u32,
     member_count: u32,
-    reserved: u32,
     member: Option<unsafe extern "C" fn(*mut c_void, u32, u32, u64)>,
     context: *mut c_void,
     runtime: *mut c_void,
@@ -79,8 +70,6 @@ struct TeamConfig {
 
 #[repr(C)]
 struct TeamSnapshot {
-    size: u32,
-    abi_version: u32,
     member_count: u32,
     started_members: u32,
     dispatched_generation: u64,
@@ -93,8 +82,6 @@ struct TeamSnapshot {
 
 #[repr(C)]
 struct TeamQuorumSnapshot {
-    size: u32,
-    abi_version: u32,
     generation: u64,
     expected_mask: u64,
     entered_mask: u64,
@@ -302,8 +289,6 @@ unsafe extern "C" fn chain_edge(context: *mut c_void, generation: u64) {
         chain.bad.fetch_add(1, Ordering::Relaxed);
     }
     let mut snapshot = TeamSnapshot {
-        size: size_of::<TeamSnapshot>() as u32,
-        abi_version: 1,
         member_count: 0,
         started_members: 0,
         dispatched_generation: 0,
@@ -408,8 +393,6 @@ unsafe extern "C" fn handoff_edge(context: *mut c_void, generation: u64) {
         handoff.bad.fetch_add(1, Ordering::Relaxed);
     }
     let mut snapshot = TeamSnapshot {
-        size: size_of::<TeamSnapshot>() as u32,
-        abi_version: 1,
         member_count: 0,
         started_members: 0,
         dispatched_generation: 0,
@@ -664,8 +647,6 @@ unsafe extern "C" {
 
 fn quorum_snapshot() -> TeamQuorumSnapshot {
     TeamQuorumSnapshot {
-        size: size_of::<TeamQuorumSnapshot>() as u32,
-        abi_version: 1,
         generation: u64::MAX,
         expected_mask: u64::MAX,
         entered_mask: u64::MAX,
@@ -675,10 +656,7 @@ fn quorum_snapshot() -> TeamQuorumSnapshot {
 
 fn runtime(workers: u32) -> *mut c_void {
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: 1,
         worker_count: workers,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -715,10 +693,7 @@ fn completion_edges_drive_every_generation_and_terminal_teardown() {
         callback_join_status: AtomicI32::new(i32::MIN),
     };
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(chain_member),
         context: (&chain as *const Chain).cast_mut().cast(),
         runtime,
@@ -748,8 +723,6 @@ fn completion_edges_drive_every_generation_and_terminal_teardown() {
     assert_eq!(unsafe { kc_team_join(team) }, 0);
 
     let mut snapshot = TeamSnapshot {
-        size: size_of::<TeamSnapshot>() as u32,
-        abi_version: 1,
         member_count: 0,
         started_members: 0,
         dispatched_generation: 0,
@@ -795,10 +768,7 @@ fn completion_edges_drive_every_generation_and_terminal_teardown() {
 fn completion_edge_resumes_state_before_the_next_dispatch() {
     kcoro_sys::link_anchor();
     let runtime_config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: 1,
         worker_count: 3,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(
@@ -822,11 +792,8 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
         callback_gate: Barrier::new(2),
     };
     let service_config = ServiceConfig {
-        size: size_of::<ServiceConfig>() as u32,
-        abi_version: 1,
         callback: Some(handoff_service),
         context: (&handoff as *const Handoff).cast_mut().cast(),
-        reserved: 0,
         owner_init: None,
         owner_fini: None,
     };
@@ -845,10 +812,7 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
     let retired = Retired::new();
 
     let team_config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: 2,
-        reserved: 0,
         member: Some(handoff_member),
         context: (&handoff as *const Handoff).cast_mut().cast(),
         runtime,
@@ -916,10 +880,7 @@ fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
         bad: AtomicU32::new(0),
     };
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(publisher_member),
         context: (&race as *const PublisherRace).cast_mut().cast(),
         runtime,
@@ -1000,10 +961,7 @@ fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
         bad: AtomicU32::new(0),
     };
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(quorum_member),
         context: (&quorum as *const Quorum).cast_mut().cast(),
         runtime,
@@ -1109,10 +1067,7 @@ fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
         returned: AtomicU64::new(0),
     };
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(injected_member),
         context: (&injected as *const Injected).cast_mut().cast(),
         runtime,
@@ -1157,8 +1112,6 @@ fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
     assert_eq!(injected.calls.load(Ordering::Acquire), MEMBER_COUNT - 1);
     assert_eq!(injected.callbacks.load(Ordering::Acquire), 0);
     let mut snapshot = TeamSnapshot {
-        size: size_of::<TeamSnapshot>() as u32,
-        abi_version: 1,
         member_count: 0,
         started_members: 0,
         dispatched_generation: 0,
@@ -1193,10 +1146,7 @@ fn one_million_healthy_generations_report_the_fixed_team_budget_floor() {
         bad: AtomicU32::new(0),
     };
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(healthy_member),
         context: (&healthy as *const Healthy).cast_mut().cast(),
         runtime,
@@ -1263,10 +1213,7 @@ fn fixed_team_rejects_members_that_cannot_fit_the_quorum_mask() {
         bad: AtomicU32::new(0),
     };
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: 65,
-        reserved: 0,
         member: Some(publisher_member),
         context: (&race as *const PublisherRace).cast_mut().cast(),
         runtime,
@@ -1285,10 +1232,7 @@ fn partial_start_retires_only_started_frames_and_remains_destroyable() {
     let runtime = runtime(MEMBER_COUNT);
     let retired = Retired::new();
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(noop_member),
         context: std::ptr::null_mut(),
         runtime,
@@ -1305,8 +1249,6 @@ fn partial_start_retires_only_started_frames_and_remains_destroyable() {
     assert!(unsafe { kc_team_dispatch_notify(team, 1, None, std::ptr::null_mut()) } < 0);
 
     let mut snapshot = TeamSnapshot {
-        size: size_of::<TeamSnapshot>() as u32,
-        abi_version: 1,
         member_count: 0,
         started_members: 0,
         dispatched_generation: 0,
@@ -1331,10 +1273,7 @@ fn stopping_an_unstarted_team_has_no_retirement_callback_to_outlive_it() {
     let runtime = runtime(MEMBER_COUNT);
     let retired = Retired::new();
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(noop_member),
         context: std::ptr::null_mut(),
         runtime,
@@ -1360,10 +1299,7 @@ fn concurrent_stop_cannot_overtake_start_admission_and_lose_retirement() {
         release: Barrier::new(2),
     };
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(noop_member),
         context: std::ptr::null_mut(),
         runtime,
@@ -1394,8 +1330,6 @@ fn concurrent_stop_cannot_overtake_start_admission_and_lose_retirement() {
     retired.wait();
     assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     let mut snapshot = TeamSnapshot {
-        size: size_of::<TeamSnapshot>() as u32,
-        abi_version: 1,
         member_count: 0,
         started_members: 0,
         dispatched_generation: 0,
@@ -1420,10 +1354,7 @@ fn team_join_cannot_overtake_the_last_retirement_callback() {
     let runtime = runtime(MEMBER_COUNT);
     let gate = RetiredGate::new();
     let config = TeamConfig {
-        size: size_of::<TeamConfig>() as u32,
-        abi_version: 1,
         member_count: MEMBER_COUNT,
-        reserved: 0,
         member: Some(noop_member),
         context: std::ptr::null_mut(),
         runtime,

@@ -28,10 +28,7 @@ typedef void (*kc_team_completion_fn)(void *context, uint64_t generation);
 typedef void (*kc_team_retired_fn)(void *context, uint64_t last_generation);
 
 typedef struct kc_team_config {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t member_count;
-    uint32_t reserved;
     kc_team_member_fn member;
     void *context;
     kc_runtime_t *runtime;
@@ -40,8 +37,6 @@ typedef struct kc_team_config {
 } kc_team_config;
 
 typedef struct kc_team_snapshot {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t member_count;
     uint32_t started_members;
     uint64_t dispatched_generation;
@@ -61,8 +56,6 @@ typedef struct kc_team_snapshot {
  * bit.
  */
 typedef struct kc_team_quorum_snapshot {
-    uint32_t size;
-    uint32_t abi_version;
     uint64_t generation;
     uint64_t expected_mask;
     uint64_t entered_mask;

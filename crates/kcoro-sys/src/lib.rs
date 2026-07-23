@@ -13,8 +13,6 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
-const ABI_VERSION: u32 = 1;
-
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const ECANCELED: i32 = 89;
 #[cfg(target_os = "freebsd")]
@@ -36,10 +34,7 @@ const EBUSY: i32 = 16;
 
 #[repr(C)]
 struct NativeRuntimeConfig {
-    size: u32,
-    abi_version: u32,
     worker_count: u32,
-    reserved: u32,
 }
 
 type NativeCallback = unsafe extern "C" fn(*mut c_void);
@@ -48,11 +43,8 @@ type OwnerInitializer = dyn FnOnce() -> Box<ServiceTask> + Send + 'static;
 
 #[repr(C)]
 struct NativeServiceConfig {
-    size: u32,
-    abi_version: u32,
     callback: Option<NativeCallback>,
     context: *mut c_void,
-    reserved: u64,
     owner_init: Option<NativeCallback>,
     owner_fini: Option<NativeCallback>,
 }
@@ -60,8 +52,6 @@ struct NativeServiceConfig {
 #[repr(C)]
 #[derive(Default)]
 struct NativeServiceSnapshot {
-    size: u32,
-    abi_version: u32,
     notifications: u64,
     handled_notifications: u64,
     callbacks: u64,
@@ -306,10 +296,7 @@ impl Runtime {
     /// Create a runtime with explicit setup parameters.
     pub fn with_config(config: RuntimeConfig) -> Result<Self, i32> {
         let config = NativeRuntimeConfig {
-            size: std::mem::size_of::<NativeRuntimeConfig>() as u32,
-            abi_version: ABI_VERSION,
             worker_count: config.workers,
-            reserved: 0,
         };
         let mut raw = std::ptr::null_mut();
         status(unsafe { kc_runtime_create(&config, &mut raw) })?;
@@ -446,11 +433,8 @@ impl Runtime {
             reschedule_error: AtomicI32::new(0),
         });
         let config = NativeServiceConfig {
-            size: std::mem::size_of::<NativeServiceConfig>() as u32,
-            abi_version: ABI_VERSION,
             callback: Some(invoke),
             context: (&*context as *const Callback).cast_mut().cast(),
-            reserved: 0,
             owner_init: None,
             owner_fini: Some(retire),
         };
@@ -542,11 +526,8 @@ impl Runtime {
             reschedule_error: AtomicI32::new(0),
         });
         let config = NativeServiceConfig {
-            size: std::mem::size_of::<NativeServiceConfig>() as u32,
-            abi_version: ABI_VERSION,
             callback: Some(invoke),
             context: (&*context as *const Callback).cast_mut().cast(),
-            reserved: 0,
             owner_init: Some(initialize),
             owner_fini: Some(retire),
         };
@@ -934,11 +915,7 @@ impl Service {
     }
 
     pub fn snapshot(&self) -> Result<ServiceSnapshot, i32> {
-        let mut snapshot = NativeServiceSnapshot {
-            size: std::mem::size_of::<NativeServiceSnapshot>() as u32,
-            abi_version: ABI_VERSION,
-            ..NativeServiceSnapshot::default()
-        };
+        let mut snapshot = NativeServiceSnapshot::default();
         status(unsafe { kc_service_snapshot_get(self.inner.lease.raw.as_ptr(), &mut snapshot) })?;
         Ok(ServiceSnapshot {
             notifications: snapshot.notifications,

@@ -1546,6 +1546,11 @@ void *server_step(koro_cont_t *continuation) {
         }
         if (drain_server(server)) {
             KORO_YIELD(continuation);
+            /* The mailbox edge may coalesce with this cooperative
+             * self-publication.  Drain the shared-buffer predicates again
+             * before callback suspension so a published record cannot be
+             * stranded behind a dormant continuation. */
+            continue;
         }
         KORO_SUSPEND(continuation);
     }
@@ -1620,8 +1625,6 @@ Status server_create(const ServerConfig &config, Server **out,
     if (status == Ok) status = register_service(server);
     if (status == Ok) status = create_liveness_port(server);
     kc_runtime_config runtime_config{
-        .size = sizeof(runtime_config),
-        .abi_version = KC_ABI_VERSION,
         .worker_count = config.coordination_workers,
     };
     if (status == Ok &&
@@ -1629,8 +1632,6 @@ Status server_create(const ServerConfig &config, Server **out,
         status = IoError;
     }
     koro_cont_config continuation_config{
-        .size = sizeof(continuation_config),
-        .abi_version = KC_ABI_VERSION,
         .step = server_step,
         .argument = server,
         .frame_size = sizeof(uint64_t),

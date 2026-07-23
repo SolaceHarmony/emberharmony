@@ -59,6 +59,7 @@
 #include "lfm_detokenizer.h"
 #include "lfm_detokenizer_program.h"
 #include "lfm_model_plan.h"
+#include "../runtime/lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
 
 extern "C" {
@@ -1110,6 +1111,10 @@ struct Engine {
     std::atomic<uint64_t> audio_encode_passes{0};
     std::atomic<int> test_audio_route_depth_status{0};
     std::atomic<int> test_audio_route_detokenizer_status{0};
+    /* Owner-published control evidence for the fatal outer truth-gate
+     * watchdog. This is retained setup-time state, not a copied payload
+     * snapshot and not part of the product ABI. */
+    LfmEngineDiagnosticState diagnostics;
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
@@ -1153,6 +1158,30 @@ struct Engine {
     DepthScratch depth_scratch;
 };
 
+static void publish_engine_diagnostics(Engine *engine,
+                                       uint64_t activations) {
+    if (!engine) return;
+    LfmEngineDiagnosticState &state = engine->diagnostics;
+    state.bridge_activations.store(activations, std::memory_order_relaxed);
+    state.team_generation.store(
+        engine->bridge_team_generation.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    state.bridge_phase.store(engine->bridge_phase,
+                             std::memory_order_relaxed);
+    state.request.store(static_cast<uint32_t>(engine->cur_req),
+                        std::memory_order_relaxed);
+    state.stage.store(engine->supervised_work.stage,
+                      std::memory_order_relaxed);
+    state.program_phase.store(engine->supervised_work.program_phase,
+                              std::memory_order_relaxed);
+    state.bridge_valid.store(engine->bridge_valid ? 1u : 0u,
+                             std::memory_order_relaxed);
+    state.active_status.store(
+        engine->active_status.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    state.publications.fetch_add(1, std::memory_order_release);
+}
+
 
 static void notify_service(kc_service_notifier_t *notifier) {
     if (!notifier) return;
@@ -1195,13 +1224,16 @@ static void update_capacity_high_water(std::atomic<uint32_t> *counter,
 
 static bool enter_pass_admission(Engine *e) {
     if (e->pass_closed.load(std::memory_order_seq_cst)) return false;
-    /* One contested publication attempt: backpressure is an outcome, not a
-     * reason to spin on the admission word. */
-    uint32_t previous = e->pass_publishers.load(std::memory_order_seq_cst);
-    if (previous >= PASS_PUBLISHER_CAPACITY ||
-        !e->pass_publishers.compare_exchange_strong(
-            previous, previous + 1, std::memory_order_seq_cst,
-            std::memory_order_seq_cst)) return false;
+    /* One bounded RMW claims one publisher lease. A load+single-CAS here
+     * falsely turned ordinary simultaneous publishers into backpressure: both
+     * could observe the same count and one lost only because the other arrived.
+     * fetch_add gives each producer a distinct place without a retry loop. */
+    const uint32_t previous =
+        e->pass_publishers.fetch_add(1, std::memory_order_seq_cst);
+    if (previous >= PASS_PUBLISHER_CAPACITY) {
+        e->pass_publishers.fetch_sub(1, std::memory_order_seq_cst);
+        return false;
+    }
     if (!e->pass_closed.load(std::memory_order_seq_cst)) return true;
     e->pass_publishers.fetch_sub(1, std::memory_order_seq_cst);
     return false;
@@ -1213,18 +1245,17 @@ static void leave_pass_admission(Engine *e) {
     if (previous == 0 || previous > PASS_PUBLISHER_CAPACITY) std::abort();
 }
 
-static bool enter_route_admission(Engine *e) {
-    if (e->route_retire.load(std::memory_order_seq_cst)) return false;
-    /* The broker accepts one linearization attempt. A losing producer keeps
-     * its ticket state and receives BUSY instead of becoming a retry loop. */
-    uint32_t previous = e->route_publishers.load(std::memory_order_seq_cst);
-    if (previous >= ROUTE_PUBLISHER_CAPACITY ||
-        !e->route_publishers.compare_exchange_strong(
-            previous, previous + 1, std::memory_order_seq_cst,
-            std::memory_order_seq_cst)) return false;
-    if (!e->route_retire.load(std::memory_order_seq_cst)) return true;
+static int enter_route_admission(Engine *e) {
+    if (e->route_retire.load(std::memory_order_seq_cst)) return -ECANCELED;
+    const uint32_t previous =
+        e->route_publishers.fetch_add(1, std::memory_order_seq_cst);
+    if (previous >= ROUTE_PUBLISHER_CAPACITY) {
+        e->route_publishers.fetch_sub(1, std::memory_order_seq_cst);
+        return -EBUSY;
+    }
+    if (!e->route_retire.load(std::memory_order_seq_cst)) return 0;
     e->route_publishers.fetch_sub(1, std::memory_order_seq_cst);
-    return false;
+    return -ECANCELED;
 }
 
 static void leave_route_admission(Engine *e) {
@@ -4269,8 +4300,6 @@ static bool deadline_event_matches(const Engine *e,
 static void team_supervisor_main(void *context) {
     Engine *e = static_cast<Engine *>(context);
     kc_deadline_event event = {
-        .size = sizeof(event),
-        .abi_version = KC_ABI_VERSION,
     };
     const int event_status = kc_deadline_source_event_get(
         e->team_deadlines, TEAM_DEADLINE_SLOT, &event);
@@ -4281,8 +4310,6 @@ static void team_supervisor_main(void *context) {
             std::abort();
         }
         kc_team_quorum_snapshot quorum = {
-            .size = sizeof(quorum),
-            .abi_version = KC_ABI_VERSION,
             .generation = event.team_generation,
             .expected_mask = expected_team_mask(e),
             .entered_mask = 0,
@@ -4313,8 +4340,6 @@ static void team_supervisor_main(void *context) {
     }
 
     kc_deadline_source_snapshot snapshot = {
-        .size = sizeof(snapshot),
-        .abi_version = KC_ABI_VERSION,
     };
     if (kc_deadline_source_snapshot_get(e->team_deadlines, &snapshot) != 0) {
         std::abort();
@@ -4393,10 +4418,7 @@ static void begin_team_supervision(Engine *e, uint64_t generation) {
     e->supervised_deadline = child;
     e->supervised_armed_ns = kc_port_monotonic_ns();
     const kc_deadline_arm_config config = {
-        .size = sizeof(config),
-        .abi_version = KC_ABI_VERSION,
         .slot = TEAM_DEADLINE_SLOT,
-        .reserved = 0,
         .delay_ns = e->supervised_hard_budget_ns,
         .child = child,
         .parent = e->active_submission.ticket,
@@ -4456,6 +4478,8 @@ static void redispatch_team_stage(Engine *e, uint64_t generation) {
 
 static void bridge_team_complete(void *context, uint64_t generation) {
     Engine *e = static_cast<Engine *>(context);
+    e->diagnostics.team_completion_edge.store(generation,
+                                               std::memory_order_release);
     e->block_completions.fetch_add(e->block_count,
                                    std::memory_order_relaxed);
     if (e->supervised_team_generation != generation) std::abort();
@@ -4473,6 +4497,8 @@ static void bridge_team_complete(void *context, uint64_t generation) {
 
 static void consume_team_completion(Engine *e, uint64_t generation) {
     if (!e || e->supervised_team_generation != generation) std::abort();
+    e->diagnostics.team_completion_consumed.store(
+        generation, std::memory_order_release);
     if (e->supervised_hard_budget_ns == 0) {
         if (e->team_deadline_arm.arm_generation != 0 ||
             !claim_team_terminal(&e->team_terminal, generation,
@@ -4819,7 +4845,11 @@ static void *bridge_continuation_step(koro_cont_t *continuation) {
     KORO_BEGIN(continuation);
     for (;;) {
         frame->activations++;
-        if (bridge_step_once(frame->engine)) break;
+        if (bridge_step_once(frame->engine)) {
+            publish_engine_diagnostics(frame->engine, frame->activations);
+            break;
+        }
+        publish_engine_diagnostics(frame->engine, frame->activations);
         KORO_SUSPEND(continuation);
     }
     KORO_END(continuation);
@@ -5268,12 +5298,14 @@ static void release_audio_route(AudioRouteInstance *route,
 class RouteProducerAdmission {
   public:
     explicit RouteProducerAdmission(Engine *engine) : engine_(engine) {
-        held_ = engine_ && enter_route_admission(engine_);
+        status_ = engine_ ? enter_route_admission(engine_) : -EINVAL;
+        held_ = status_ == 0;
     }
 
     ~RouteProducerAdmission() { release(); }
 
     explicit operator bool() const { return held_; }
+    int status() const { return status_; }
 
     void release() {
         if (!held_) return;
@@ -5287,6 +5319,7 @@ class RouteProducerAdmission {
   private:
     Engine *engine_ = nullptr;
     bool held_ = false;
+    int status_ = -EINVAL;
 };
 
 class AudioRouteLease {
@@ -5425,6 +5458,8 @@ static int mount_audio_route(PassSlot *slot, AudioRouteInstance *route,
 
 static void audio_route_service_main(void *context) {
     Engine *engine = static_cast<Engine *>(context);
+    engine->diagnostics.route_callbacks.fetch_add(
+        1, std::memory_order_relaxed);
     AudioRoutePool *pool = engine->route_pool;
     if (engine->route_retire.load(std::memory_order_acquire)) {
         if (engine->route_publishers.load(std::memory_order_seq_cst) != 0) {
@@ -5567,20 +5602,14 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         return nullptr;
     }
     const kc_runtime_config runtime_config = {
-        .size = sizeof(kc_runtime_config),
-        .abi_version = KC_ABI_VERSION,
         .worker_count = static_cast<uint32_t>(workers),
-        .reserved = 0,
     };
     if (kc_runtime_create(&runtime_config, &e->control_runtime) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
     const kc_team_config team_config = {
-        .size = sizeof(kc_team_config),
-        .abi_version = KC_ABI_VERSION,
         .member_count = static_cast<uint32_t>(workers),
-        .reserved = 0,
         .member = lane_member,
         .context = e,
         .runtime = e->control_runtime,
@@ -5598,8 +5627,6 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         return nullptr;
     }
     const koro_cont_config bridge_continuation_config = {
-        .size = sizeof(koro_cont_config),
-        .abi_version = KC_ABI_VERSION,
         .step = bridge_continuation_step,
         .argument = e,
         .frame_size = sizeof(BridgeContinuationFrame),
@@ -5622,18 +5649,12 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         .activations = 0,
     };
     const kc_service_config route_service_config = {
-        .size = sizeof(kc_service_config),
-        .abi_version = KC_ABI_VERSION,
         .callback = audio_route_service_main,
         .context = e,
-        .reserved = 0,
     };
     const kc_service_config supervisor_service_config = {
-        .size = sizeof(kc_service_config),
-        .abi_version = KC_ABI_VERSION,
         .callback = team_supervisor_main,
         .context = e,
-        .reserved = 0,
     };
     if (kc_service_create(e->control_runtime, &route_service_config,
                           &e->route_service) != 0 ||
@@ -5647,10 +5668,7 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         return nullptr;
     }
     const kc_deadline_source_config deadline_config = {
-        .size = sizeof(deadline_config),
-        .abi_version = KC_ABI_VERSION,
         .capacity = 1,
-        .reserved = 0,
         .notify = deadline_supervisor_notify,
         .context = e->supervisor_notifier,
     };
@@ -5839,8 +5857,6 @@ int lfm_internal_engine_fatal_capsule_for_test(
         .epoch = 55,
     };
     const kc_deadline_event event = {
-        .size = sizeof(event),
-        .abi_version = KC_ABI_VERSION,
         .slot = TEAM_DEADLINE_SLOT,
         .kind = KC_DEADLINE_EVENT_EXPIRED,
         .sequence = 77,
@@ -5859,8 +5875,6 @@ int lfm_internal_engine_fatal_capsule_for_test(
         .team_generation = generation,
     };
     const kc_team_quorum_snapshot quorum = {
-        .size = sizeof(quorum),
-        .abi_version = KC_ABI_VERSION,
         .generation = generation,
         .expected_mask = expected_mask,
         .entered_mask = entered_mask,
@@ -5987,7 +6001,7 @@ int lfm_engine_audio_encode_submit(
     *out_handle = {};
     *out_adapted_values = 0;
     RouteProducerAdmission admission(e);
-    if (!admission) return -ECANCELED;
+    if (!admission) return admission.status();
     AudioRouteLease claim(e);
     if (!claim) return -EBUSY;
     BackbonePlan *model = model_id == 0 ? nullptr : find_model(e, model_id);
@@ -6078,12 +6092,89 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
     return 0;
 }
 
+extern "C++" int lfm_internal_engine_diagnostic_view(
+    void *ep, LfmEngineDiagnosticView *out) {
+    Engine *engine = static_cast<Engine *>(ep);
+    if (!engine || !out || !engine->control_runtime ||
+        !engine->bridge_continuation || !engine->route_service ||
+        !engine->supervisor_service || !engine->team || !engine->bridge) {
+        return -EINVAL;
+    }
+    *out = {
+        .state = &engine->diagnostics,
+        .runtime = engine->control_runtime,
+        .bridge_continuation = engine->bridge_continuation,
+        .route_service = engine->route_service,
+        .supervisor_service = engine->supervisor_service,
+        .team = engine->team,
+        .bridge = engine->bridge,
+        .owner = engine,
+    };
+    return 0;
+}
+
+extern "C++" int lfm_internal_engine_diagnostic_counts(
+    const LfmEngineDiagnosticView *view, LfmEngineDiagnosticCounts *out) {
+    if (!view || !view->owner || !view->state || !out) return -EINVAL;
+    Engine *engine = static_cast<Engine *>(view->owner);
+    LfmEngineDiagnosticCounts counts = {
+        .pass_submissions =
+            engine->pass_submissions.load(std::memory_order_acquire),
+        .pass_completions =
+            engine->pass_completions.load(std::memory_order_acquire),
+        .bridge_dispatches =
+            engine->bridge_dispatches.load(std::memory_order_acquire),
+        .dispatch_wakes =
+            engine->dispatch_wakes.load(std::memory_order_acquire),
+        .route_dispatches =
+            engine->route_dispatches.load(std::memory_order_acquire),
+        .route_admission_deferrals =
+            engine->route_admission_deferrals.load(std::memory_order_acquire),
+        .bridge_team_generation =
+            engine->bridge_team_generation.load(std::memory_order_acquire),
+        .bridge_team_completion =
+            engine->bridge_team_completion.load(std::memory_order_acquire),
+        .bridge_retired_generation =
+            engine->bridge_retired_generation.load(std::memory_order_acquire),
+        .gang_lease = engine->gang_lease.load(std::memory_order_acquire),
+        .team_terminal =
+            engine->team_terminal.load(std::memory_order_acquire),
+        .pass_slots_live =
+            engine->pass_slots_live.load(std::memory_order_acquire),
+    };
+    for (const AudioRouteInstance &route : engine->route_pool->routes) {
+        switch (route.state.load(std::memory_order_acquire)) {
+        case AUDIO_ROUTE_FREE:
+            counts.routes_free++;
+            break;
+        case AUDIO_ROUTE_CLAIMED:
+            counts.routes_claimed++;
+            break;
+        case AUDIO_ROUTE_READY:
+            counts.routes_ready++;
+            break;
+        case AUDIO_ROUTE_DISPATCHING:
+            counts.routes_dispatching++;
+            break;
+        case AUDIO_ROUTE_RUNNING:
+            counts.routes_running++;
+            break;
+        case AUDIO_ROUTE_DONE:
+            counts.routes_done++;
+            break;
+        default:
+            std::abort();
+        }
+    }
+    *out = counts;
+    return 0;
+}
+
 int lfm_internal_engine_stackless_runtime_for_test(
     void *ep, kc_runtime_snapshot *out_runtime, KcTicketIdV1 *out_bridge) {
     Engine *engine = static_cast<Engine *>(ep);
     if (!engine || !engine->control_runtime || !engine->bridge_continuation ||
-        !out_runtime || out_runtime->size < sizeof(*out_runtime) ||
-        !out_bridge) {
+        !out_runtime || !out_bridge) {
         return -EINVAL;
     }
     const int status = kc_runtime_snapshot_get(engine->control_runtime,
@@ -6411,7 +6502,7 @@ static int run_audio_route(
     }
 
     RouteProducerAdmission admission(e);
-    if (!admission) return -ECANCELED;
+    if (!admission) return admission.status();
     AudioRouteLease claim(e);
     if (!claim) return -EBUSY;
     AudioRouteInstance *route = claim.route();
@@ -6629,7 +6720,7 @@ int lfm_engine_control_route_submit(
     if (!engine || !notify || !out_handle) return -EINVAL;
     *out_handle = {};
     RouteProducerAdmission admission(engine);
-    if (!admission) return -ECANCELED;
+    if (!admission) return admission.status();
     AudioRouteLease claim(engine);
     if (!claim) return -EBUSY;
     AudioRouteInstance *route = claim.route();
@@ -6955,7 +7046,7 @@ int lfm_engine_prefill_submit(
     }
     *out_handle = {};
     RouteProducerAdmission admission(e);
-    if (!admission) return -ECANCELED;
+    if (!admission) return admission.status();
     AudioRouteLease claim(e);
     if (!claim) return -EBUSY;
     BackbonePlan *model = find_model(e, id);

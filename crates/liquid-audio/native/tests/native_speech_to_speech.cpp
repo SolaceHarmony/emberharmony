@@ -3,12 +3,12 @@
 #include "lfm_detokenizer.h"
 #include "lfm_detokenizer_program.h"
 #include "lfm_runtime.h"
+#include "../src/runtime/lfm_runtime_diagnostics.hpp"
 #include "lfm_runtime_internal.h"
 #include "lfm_safetensors.h"
 #include "lfm_session.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -54,116 +54,6 @@ constexpr uint32_t GATE_ALL_DONE =
     GATE_CONTINUATION_DONE | GATE_WATCHDOG_DONE;
 
 void copy_error(char *destination, size_t capacity, const char *source);
-
-int run_detokenizer_frame(LfmAudioDetokenizerState *state,
-                          const uint32_t *codes, uint32_t flush,
-                          uint32_t lanes, float *pcm, size_t capacity,
-                          size_t *samples) {
-    LfmAudioDetokenizerProgram program{};
-    int status = lfm_detokenizer_program_begin(
-        &program, state, codes, pcm, capacity, flush);
-    size_t transitions = 0;
-    while (status == 0 && program.active) {
-        if (++transitions > 256) {
-            status = -ELOOP;
-            break;
-        }
-        for (uint32_t lane = 0; lane < lanes && status == 0; ++lane)
-            status = lfm_detokenizer_program_run(&program, lane, lanes);
-        if (status == 0) status = lfm_detokenizer_program_advance(&program);
-        if (status > 0) status = 0;
-    }
-    if (status != 0) {
-        lfm_detokenizer_program_cancel(&program);
-        return status;
-    }
-    *samples = program.produced;
-    return 0;
-}
-
-int verify_detokenizer_lane_invariance(const char *model_path, char *error,
-                                       size_t error_length) {
-    const std::string detokenizer =
-        std::string(model_path) + "/audio_detokenizer";
-    LfmWeightImage *image = nullptr;
-    LfmAudioDetokenizerPlan *plan = nullptr;
-    LfmAudioDetokenizerState *three = nullptr;
-    LfmAudioDetokenizerState *eight = nullptr;
-    int status = lfm_weights_open_bundle(
-        model_path, detokenizer.c_str(), &image, error, error_length);
-    if (status == 0)
-        status = lfm_detokenizer_plan_new_from_image(
-            &plan, image, error, error_length);
-    if (status == 0)
-        status = lfm_detokenizer_state_new(
-            &three, plan, error, error_length);
-    if (status == 0)
-        status = lfm_detokenizer_state_new(
-            &eight, plan, error, error_length);
-    std::array<float, LFM_DETOKENIZER_MAX_STEP_SAMPLES> three_pcm{};
-    std::array<float, LFM_DETOKENIZER_MAX_STEP_SAMPLES> eight_pcm{};
-    for (uint32_t frame = 0; frame < 3 && status == 0; ++frame) {
-        uint32_t codes[LFM_DETOKENIZER_CODEBOOKS]{};
-        for (uint32_t codebook = 0;
-             codebook < LFM_DETOKENIZER_CODEBOOKS; ++codebook) {
-            codes[codebook] =
-                (17u + frame * 197u + codebook * 263u) %
-                LFM_DETOKENIZER_CODE_VALUES;
-        }
-        size_t three_samples = 0;
-        size_t eight_samples = 0;
-        status = run_detokenizer_frame(
-            three, codes, 0, 3, three_pcm.data(), three_pcm.size(),
-            &three_samples);
-        if (status == 0)
-            status = run_detokenizer_frame(
-                eight, codes, 0, 8, eight_pcm.data(), eight_pcm.size(),
-                &eight_samples);
-        if (status == 0 &&
-            (three_samples != eight_samples ||
-             std::memcmp(three_pcm.data(), eight_pcm.data(),
-                         three_samples * sizeof(float)) != 0)) {
-            status = LFM_STATUS_INTERNAL;
-            size_t sample = 0;
-            while (sample < std::min(three_samples, eight_samples) &&
-                   std::memcmp(three_pcm.data() + sample,
-                               eight_pcm.data() + sample, sizeof(float)) == 0) {
-                ++sample;
-            }
-            std::snprintf(
-                error, error_length,
-                "detokenizer output changed with fixed-team width at frame "
-                "%u sample %zu/%zu: 3-lane=%a 8-lane=%a",
-                frame, sample, std::min(three_samples, eight_samples),
-                sample < three_samples ? three_pcm[sample] : 0.0,
-                sample < eight_samples ? eight_pcm[sample] : 0.0);
-        }
-    }
-    if (status == 0) {
-        size_t three_samples = 0;
-        size_t eight_samples = 0;
-        status = run_detokenizer_frame(
-            three, nullptr, 1, 3, three_pcm.data(), three_pcm.size(),
-            &three_samples);
-        if (status == 0)
-            status = run_detokenizer_frame(
-                eight, nullptr, 1, 8, eight_pcm.data(), eight_pcm.size(),
-                &eight_samples);
-        if (status == 0 &&
-            (three_samples != eight_samples ||
-             std::memcmp(three_pcm.data(), eight_pcm.data(),
-                         three_samples * sizeof(float)) != 0)) {
-            status = LFM_STATUS_INTERNAL;
-            copy_error(error, error_length,
-                       "detokenizer flush changed with fixed-team width");
-        }
-    }
-    lfm_detokenizer_state_free(eight);
-    lfm_detokenizer_state_free(three);
-    lfm_detokenizer_plan_free(plan);
-    lfm_weights_close(image);
-    return status;
-}
 
 struct Gate;
 
@@ -260,6 +150,17 @@ struct GateEvidence {
     char second_text[4096]{};
 };
 
+struct alignas(128) GateDiagnosticState {
+    std::atomic<uint64_t> publications{0};
+    std::atomic<uint32_t> outcome{0};
+    std::atomic<int32_t> status{0};
+    std::atomic<uint32_t> first_terminals{0};
+    std::atomic<uint32_t> second_terminals{0};
+    std::atomic<uint32_t> first_stopped{0};
+    std::atomic<uint32_t> second_stopped{0};
+    std::atomic<uint32_t> stop_requested{0};
+};
+
 struct Gate {
     LfmRuntime *runtime = nullptr;
     LfmModel *model = nullptr;
@@ -277,6 +178,8 @@ struct Gate {
     std::atomic<bool> submitted{false};
     std::atomic<int32_t> external_failure{0};
     std::atomic<uint32_t> terminal_edges{0};
+    GateDiagnosticState diagnostics;
+    LfmRuntimeDiagnosticView runtime_diagnostics{};
     AudibleMonitor monitor;
     float *closed_loop_pcm = nullptr;
     uint64_t closed_loop_frames = 0;
@@ -757,7 +660,7 @@ int process_event(Gate *gate, GateFrame *frame, uint32_t endpoint,
     if (event.kind == LFM_EVENT_STOPPED) {
         if (first) frame->first_stopped = true;
         else frame->second_stopped = true;
-        return 0;
+        return event.status;
     }
     if (event.kind == LFM_EVENT_ERROR) {
         char message[EVENT_PAYLOAD + 1]{};
@@ -880,12 +783,27 @@ uint32_t advance_gate(Gate *gate, GateFrame *frame) {
             if (status != 0 && frame->status == 0) {
                 const LfmTicketIdV1 expected = edge->index == 0
                     ? gate->first_ticket : frame->second_ticket;
+                const LfmSessionDiagnosticState *owner = edge->index == 0
+                    ? gate->runtime_diagnostics.first.state
+                    : gate->runtime_diagnostics.second.state;
+                const uint32_t cause = owner
+                    ? owner->terminal_cause.load(std::memory_order_acquire)
+                    : 0;
+                const uint32_t operation = owner
+                    ? owner->terminal_operation.load(
+                          std::memory_order_acquire)
+                    : 0;
+                const int32_t owner_status = owner
+                    ? owner->terminal_status.load(std::memory_order_acquire)
+                    : 0;
                 frame->status = status;
                 std::snprintf(
                     frame->error, sizeof(frame->error),
                     "native event failed: status=%d endpoint=%u kind=%u "
+                    "cause=%u operation=%u owner_status=%d "
                     "ticket={%llu,%llu,%u,%u} expected={%llu,%llu,%u,%u}",
-                    status, edge->index, event.kind,
+                    status, edge->index, event.kind, cause, operation,
+                    owner_status,
                     static_cast<unsigned long long>(event.ticket.runtime_epoch),
                     static_cast<unsigned long long>(event.ticket.sequence),
                     event.ticket.generation, event.ticket.kind,
@@ -950,6 +868,23 @@ uint32_t advance_gate(Gate *gate, GateFrame *frame) {
     return GATE_SUSPEND;
 }
 
+void publish_gate_diagnostics(Gate *gate, const GateFrame *frame) {
+    GateDiagnosticState &state = gate->diagnostics;
+    state.outcome.store(frame->outcome, std::memory_order_relaxed);
+    state.status.store(frame->status, std::memory_order_relaxed);
+    state.first_terminals.store(frame->first_terminals,
+                                std::memory_order_relaxed);
+    state.second_terminals.store(frame->second_terminals,
+                                 std::memory_order_relaxed);
+    state.first_stopped.store(frame->first_stopped ? 1u : 0u,
+                              std::memory_order_relaxed);
+    state.second_stopped.store(frame->second_stopped ? 1u : 0u,
+                               std::memory_order_relaxed);
+    state.stop_requested.store(frame->stop_requested ? 1u : 0u,
+                               std::memory_order_relaxed);
+    state.publications.fetch_add(1, std::memory_order_release);
+}
+
 void *gate_step(koro_cont_t *continuation) {
     auto *gate = static_cast<Gate *>(koro_cont_argument(continuation));
     auto *frame = static_cast<GateFrame *>(koro_cont_frame(continuation));
@@ -960,9 +895,14 @@ void *gate_step(koro_cont_t *continuation) {
             KORO_SUSPEND(continuation);
         }
         frame->outcome = advance_gate(gate, frame);
+        publish_gate_diagnostics(gate, frame);
         if (frame->outcome == GATE_DONE) break;
         if (frame->outcome == GATE_YIELD) {
             KORO_YIELD(continuation);
+            /* A callback may have been coalesced with the self-publication
+             * that resumed this yield.  Re-enter the predicate drain before
+             * the frame is allowed to suspend on a future callback. */
+            continue;
         }
         KORO_SUSPEND(continuation);
     }
@@ -998,6 +938,249 @@ void gate_retired(void *context, const kc_ticket_id *identity) {
     publish_terminal_edge(gate, GATE_CONTINUATION_DONE);
 }
 
+void print_session_watchdog(const char *name,
+                            const LfmSessionDiagnosticView &view) {
+    kc_service_snapshot coordinator = {
+    };
+    kc_service_snapshot delivery = {
+    };
+    const int coordinator_status =
+        kc_service_snapshot_get(view.coordinator, &coordinator);
+    const int delivery_status =
+        kc_service_snapshot_get(view.delivery, &delivery);
+    const LfmSessionDiagnosticState *state = view.state;
+    std::fprintf(
+        stderr,
+        "native speech watchdog: %s session={pub=%llu progress=%u "
+        "coord_phase=%u action={active=%u phase=%u admission=%u route=%u "
+        "playback=%u ticket=%llu route_ticket=%llu} result={active=%u "
+        "next=%u count=%u} queues={event=%llu command=%llu pcm=%llu} "
+        "delivery_pending=%u stop=%u event_done=%u operation=%u "
+        "terminal=%d cause=%u terminal_operation=%u} "
+        "coordinator={rc=%d state=%u notify=%llu handled=%llu callbacks=%llu} "
+        "delivery={rc=%d state=%u notify=%llu handled=%llu callbacks=%llu}\n",
+        name,
+        static_cast<unsigned long long>(
+            state->publications.load(std::memory_order_acquire)),
+        state->progress.load(std::memory_order_acquire),
+        state->coordinator_phase.load(std::memory_order_acquire),
+        state->action_active.load(std::memory_order_acquire),
+        state->action_phase.load(std::memory_order_acquire),
+        state->admission_pending.load(std::memory_order_acquire),
+        state->route_pending.load(std::memory_order_acquire),
+        state->playback_active.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(
+            state->action_ticket_sequence.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            state->action_route_sequence.load(std::memory_order_acquire)),
+        state->result_active.load(std::memory_order_acquire),
+        state->result_next.load(std::memory_order_acquire),
+        state->result_count.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(
+            state->event_depth.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            state->command_depth.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            state->pcm_depth.load(std::memory_order_acquire)),
+        state->delivery_pending.load(std::memory_order_acquire),
+        state->stop.load(std::memory_order_acquire),
+        state->event_done.load(std::memory_order_acquire),
+        state->conversation_operation.load(std::memory_order_acquire),
+        state->terminal_status.load(std::memory_order_acquire),
+        state->terminal_cause.load(std::memory_order_acquire),
+        state->terminal_operation.load(std::memory_order_acquire),
+        coordinator_status, coordinator.run_state,
+        static_cast<unsigned long long>(coordinator.notifications),
+        static_cast<unsigned long long>(coordinator.handled_notifications),
+        static_cast<unsigned long long>(coordinator.callbacks), delivery_status,
+        delivery.run_state,
+        static_cast<unsigned long long>(delivery.notifications),
+        static_cast<unsigned long long>(delivery.handled_notifications),
+        static_cast<unsigned long long>(delivery.callbacks));
+}
+
+void print_native_watchdog(Gate *gate) {
+    const LfmRuntimeDiagnosticView &view = gate->runtime_diagnostics;
+    koro_cont_snapshot gate_cont{};
+    koro_cont_snapshot bridge_cont{};
+    kc_runtime_snapshot coordination = {
+    };
+    kc_runtime_snapshot engine_runtime = {
+    };
+    kc_service_snapshot route = {
+    };
+    kc_service_snapshot supervisor = {
+    };
+    kc_team_snapshot team = {
+    };
+    kc_team_quorum_snapshot quorum = {
+    };
+    LfmKernelBridgeSnapshotV1 bridge = {
+        .size = sizeof(LfmKernelBridgeSnapshotV1),
+        .abi_version = KC_COORD_ABI_VERSION,
+    };
+    LfmEngineDiagnosticCounts counts{};
+    const int gate_status =
+        koro_cont_snapshot_get(gate->continuation, &gate_cont);
+    const int bridge_cont_status = koro_cont_snapshot_get(
+        view.engine.bridge_continuation, &bridge_cont);
+    const int coordination_status =
+        kc_runtime_snapshot_get(view.coordination, &coordination);
+    const int engine_runtime_status =
+        kc_runtime_snapshot_get(view.engine.runtime, &engine_runtime);
+    const int route_status =
+        kc_service_snapshot_get(view.engine.route_service, &route);
+    const int supervisor_status =
+        kc_service_snapshot_get(view.engine.supervisor_service, &supervisor);
+    const int team_status = kc_team_snapshot_get(view.engine.team, &team);
+    const int quorum_status = team_status == 0 &&
+            team.dispatched_generation != 0
+        ? kc_team_quorum_snapshot_get(view.engine.team,
+                                      team.dispatched_generation, &quorum)
+        : -EINVAL;
+    const int queue_status =
+        lfm_kernel_bridge_snapshot(view.engine.bridge, &bridge);
+    const int counts_status =
+        lfm_internal_engine_diagnostic_counts(&view.engine, &counts);
+    const LfmEngineDiagnosticState *engine = view.engine.state;
+    const uint64_t gate_first_head =
+        gate->first_edge.events.head.value.load(std::memory_order_acquire);
+    const uint64_t gate_first_tail =
+        gate->first_edge.events.tail.value.load(std::memory_order_acquire);
+    const uint64_t gate_second_head =
+        gate->second_edge.events.head.value.load(std::memory_order_acquire);
+    const uint64_t gate_second_tail =
+        gate->second_edge.events.tail.value.load(std::memory_order_acquire);
+
+    const char *classification = "unclassified";
+    if (quorum_status == 0 &&
+        quorum.returned_mask != quorum.expected_mask) {
+        classification = "hung-team-generation";
+    } else if (engine->team_completion_edge.load(std::memory_order_acquire) >
+               engine->team_completion_consumed.load(
+                   std::memory_order_acquire)) {
+        classification = "lost-team-completion-resume";
+    } else if (queue_status == 0 &&
+               bridge.completions_published > bridge.completions_consumed) {
+        classification = "lost-bridge-completion-resume";
+    } else if (counts_status == 0 && counts.routes_ready != 0 &&
+               route_status == 0 && route.run_state == KORO_SUSPENDED &&
+               route.notifications == route.handled_notifications) {
+        classification = "orphaned-ready-route";
+    } else if ((gate_first_tail != gate_first_head ||
+                gate_second_tail != gate_second_head) &&
+               gate_status == 0 && gate_cont.run_state == KORO_SUSPENDED &&
+               gate_cont.wake_pending == 0) {
+        classification = "lost-gate-event-resume";
+    }
+
+    std::fprintf(
+        stderr,
+        "native speech watchdog: classification=%s gate={rc=%d state=%u "
+        "wake=%u worker=%u pub=%llu outcome=%u status=%d terminals=%u/%u "
+        "stopped=%u/%u stop=%u rings=%llu:%llu/%llu:%llu edges=%u} "
+        "coord_runtime={rc=%d active=%zu queued=%zu running=%zu dormant=%zu "
+        "wake=%llu resumes=%llu}\n",
+        classification, gate_status, gate_cont.run_state,
+        gate_cont.wake_pending, gate_cont.current_worker,
+        static_cast<unsigned long long>(
+            gate->diagnostics.publications.load(std::memory_order_acquire)),
+        gate->diagnostics.outcome.load(std::memory_order_acquire),
+        gate->diagnostics.status.load(std::memory_order_acquire),
+        gate->diagnostics.first_terminals.load(std::memory_order_acquire),
+        gate->diagnostics.second_terminals.load(std::memory_order_acquire),
+        gate->diagnostics.first_stopped.load(std::memory_order_acquire),
+        gate->diagnostics.second_stopped.load(std::memory_order_acquire),
+        gate->diagnostics.stop_requested.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(gate_first_head),
+        static_cast<unsigned long long>(gate_first_tail),
+        static_cast<unsigned long long>(gate_second_head),
+        static_cast<unsigned long long>(gate_second_tail),
+        gate->terminal_edges.load(std::memory_order_acquire),
+        coordination_status, coordination.active, coordination.queued,
+        coordination.running, coordination.dormant,
+        static_cast<unsigned long long>(coordination.wake_requests),
+        static_cast<unsigned long long>(coordination.resumes));
+    std::fprintf(
+        stderr,
+        "native speech watchdog: engine={pub=%llu bridge={rc=%d state=%u "
+        "wake=%u worker=%u phase=%u valid=%u activations=%llu} request=%u "
+        "stage=%u program_phase=%u active_status=%d team_gen=%llu "
+        "completion_edge=%llu consumed=%llu route_callbacks=%llu} "
+        "runtime={rc=%d active=%zu queued=%zu running=%zu dormant=%zu "
+        "wake=%llu resumes=%llu} route={rc=%d state=%u notify=%llu "
+        "handled=%llu callbacks=%llu} supervisor={rc=%d state=%u "
+        "notify=%llu handled=%llu callbacks=%llu}\n",
+        static_cast<unsigned long long>(
+            engine->publications.load(std::memory_order_acquire)),
+        bridge_cont_status, bridge_cont.run_state, bridge_cont.wake_pending,
+        bridge_cont.current_worker,
+        engine->bridge_phase.load(std::memory_order_acquire),
+        engine->bridge_valid.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(
+            engine->bridge_activations.load(std::memory_order_acquire)),
+        engine->request.load(std::memory_order_acquire),
+        engine->stage.load(std::memory_order_acquire),
+        engine->program_phase.load(std::memory_order_acquire),
+        engine->active_status.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(
+            engine->team_generation.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            engine->team_completion_edge.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            engine->team_completion_consumed.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            engine->route_callbacks.load(std::memory_order_acquire)),
+        engine_runtime_status, engine_runtime.active, engine_runtime.queued,
+        engine_runtime.running, engine_runtime.dormant,
+        static_cast<unsigned long long>(engine_runtime.wake_requests),
+        static_cast<unsigned long long>(engine_runtime.resumes), route_status,
+        route.run_state, static_cast<unsigned long long>(route.notifications),
+        static_cast<unsigned long long>(route.handled_notifications),
+        static_cast<unsigned long long>(route.callbacks), supervisor_status,
+        supervisor.run_state,
+        static_cast<unsigned long long>(supervisor.notifications),
+        static_cast<unsigned long long>(supervisor.handled_notifications),
+        static_cast<unsigned long long>(supervisor.callbacks));
+    std::fprintf(
+        stderr,
+        "native speech watchdog: team={rc=%d members=%u started=%u "
+        "dispatched=%llu completed=%llu returned=%u quorum_rc=%d "
+        "masks=%016llx/%016llx/%016llx} queue={rc=%d submit=%llu/%llu "
+        "complete=%llu/%llu} counts={rc=%d pass=%llu/%llu dispatch=%llu "
+        "wake=%llu route=%llu deferral=%llu slots=%u "
+        "routes=%u/%u/%u/%u/%u/%u bridge_gen=%llu edge=%llu retired=%llu "
+        "lease=%llu terminal=%llu}\n",
+        team_status, team.member_count, team.started_members,
+        static_cast<unsigned long long>(team.dispatched_generation),
+        static_cast<unsigned long long>(team.completed_generation),
+        team.completed_members, quorum_status,
+        static_cast<unsigned long long>(quorum.expected_mask),
+        static_cast<unsigned long long>(quorum.entered_mask),
+        static_cast<unsigned long long>(quorum.returned_mask), queue_status,
+        static_cast<unsigned long long>(bridge.submissions_consumed),
+        static_cast<unsigned long long>(bridge.submissions_accepted),
+        static_cast<unsigned long long>(bridge.completions_consumed),
+        static_cast<unsigned long long>(bridge.completions_published),
+        counts_status,
+        static_cast<unsigned long long>(counts.pass_completions),
+        static_cast<unsigned long long>(counts.pass_submissions),
+        static_cast<unsigned long long>(counts.bridge_dispatches),
+        static_cast<unsigned long long>(counts.dispatch_wakes),
+        static_cast<unsigned long long>(counts.route_dispatches),
+        static_cast<unsigned long long>(counts.route_admission_deferrals),
+        counts.pass_slots_live, counts.routes_free, counts.routes_claimed,
+        counts.routes_ready, counts.routes_dispatching, counts.routes_running,
+        counts.routes_done,
+        static_cast<unsigned long long>(counts.bridge_team_generation),
+        static_cast<unsigned long long>(counts.bridge_team_completion),
+        static_cast<unsigned long long>(counts.bridge_retired_generation),
+        static_cast<unsigned long long>(counts.gang_lease),
+        static_cast<unsigned long long>(counts.team_terminal));
+    print_session_watchdog("first", view.first);
+    print_session_watchdog("second", view.second);
+}
+
 void watchdog_fired(void *context) {
     auto *gate = static_cast<Gate *>(context);
     if (gate) {
@@ -1020,6 +1203,7 @@ void watchdog_fired(void *context) {
             static_cast<unsigned long long>(tail),
             static_cast<unsigned long long>(callbacks),
             gate->terminal_edges.load(std::memory_order_acquire));
+        print_native_watchdog(gate);
         int32_t expected = 0;
         gate->external_failure.compare_exchange_strong(
             expected, -ETIMEDOUT, std::memory_order_release,
@@ -1090,6 +1274,68 @@ void copy_error(char *destination, size_t capacity, const char *source) {
     std::snprintf(destination, capacity, "%s", source ? source : "unknown");
 }
 
+int validate_native_diagnostics(Gate *gate, char *error,
+                                size_t error_length) {
+    if (!gate || !gate->runtime_diagnostics.engine.state) {
+        copy_error(error, error_length,
+                   "native diagnostic pointer view was not retained");
+        return LFM_STATUS_INTERNAL;
+    }
+    const LfmRuntimeDiagnosticView &view = gate->runtime_diagnostics;
+    kc_team_snapshot team = {
+    };
+    LfmKernelBridgeSnapshotV1 bridge = {
+        .size = sizeof(LfmKernelBridgeSnapshotV1),
+        .abi_version = KC_COORD_ABI_VERSION,
+    };
+    LfmEngineDiagnosticCounts counts{};
+    const int team_status = kc_team_snapshot_get(view.engine.team, &team);
+    const int bridge_status =
+        lfm_kernel_bridge_snapshot(view.engine.bridge, &bridge);
+    const int counts_status =
+        lfm_internal_engine_diagnostic_counts(&view.engine, &counts);
+    const LfmEngineDiagnosticState *state = view.engine.state;
+    const uint64_t completion_edge =
+        state->team_completion_edge.load(std::memory_order_acquire);
+    const uint64_t completion_consumed =
+        state->team_completion_consumed.load(std::memory_order_acquire);
+    const uint32_t live_routes =
+        counts.routes_claimed + counts.routes_ready +
+        counts.routes_dispatching + counts.routes_running + counts.routes_done;
+    const bool settled =
+        team_status == 0 && bridge_status == 0 && counts_status == 0 &&
+        team.dispatched_generation == team.completed_generation &&
+        bridge.submissions_accepted == bridge.submissions_consumed &&
+        bridge.completions_published == bridge.completions_consumed &&
+        counts.pass_submissions == counts.pass_completions &&
+        counts.pass_slots_live == 0 && live_routes == 0 &&
+        counts.gang_lease == 0 && completion_edge == completion_consumed &&
+        view.first.state->event_done.load(std::memory_order_acquire) != 0 &&
+        view.second.state->event_done.load(std::memory_order_acquire) != 0;
+    if (settled) return 0;
+    std::snprintf(
+        error, error_length,
+        "native diagnostic settlement failed: rc=%d/%d/%d team=%llu/%llu "
+        "sq=%llu/%llu cq=%llu/%llu pass=%llu/%llu slots=%u routes=%u "
+        "lease=%llu edge=%llu/%llu done=%u/%u",
+        team_status, bridge_status, counts_status,
+        static_cast<unsigned long long>(team.completed_generation),
+        static_cast<unsigned long long>(team.dispatched_generation),
+        static_cast<unsigned long long>(bridge.submissions_consumed),
+        static_cast<unsigned long long>(bridge.submissions_accepted),
+        static_cast<unsigned long long>(bridge.completions_consumed),
+        static_cast<unsigned long long>(bridge.completions_published),
+        static_cast<unsigned long long>(counts.pass_completions),
+        static_cast<unsigned long long>(counts.pass_submissions),
+        counts.pass_slots_live, live_routes,
+        static_cast<unsigned long long>(counts.gang_lease),
+        static_cast<unsigned long long>(completion_consumed),
+        static_cast<unsigned long long>(completion_edge),
+        view.first.state->event_done.load(std::memory_order_acquire),
+        view.second.state->event_done.load(std::memory_order_acquire));
+    return LFM_STATUS_INTERNAL;
+}
+
 int close_gate(Gate *gate, char *error, size_t error_length) {
     int result = 0;
     const char *failure = nullptr;
@@ -1127,6 +1373,7 @@ int close_gate(Gate *gate, char *error, size_t error_length) {
         record(status, close.destroy);
         *session = nullptr;
     }
+    gate->runtime_diagnostics = {};
     if (gate->continuation) {
         /* Public completion deliberately precedes DONE so its callback context
          * remains retained. Once the sessions' own continuations have retired,
@@ -1195,6 +1442,15 @@ int run_once(Gate *gate, uint64_t run, uint32_t audible, GateEvidence *evidence,
     gate->submitted.store(false, std::memory_order_relaxed);
     gate->external_failure.store(0, std::memory_order_relaxed);
     gate->terminal_edges.store(0, std::memory_order_relaxed);
+    gate->diagnostics.publications.store(0, std::memory_order_relaxed);
+    gate->diagnostics.outcome.store(0, std::memory_order_relaxed);
+    gate->diagnostics.status.store(0, std::memory_order_relaxed);
+    gate->diagnostics.first_terminals.store(0, std::memory_order_relaxed);
+    gate->diagnostics.second_terminals.store(0, std::memory_order_relaxed);
+    gate->diagnostics.first_stopped.store(0, std::memory_order_relaxed);
+    gate->diagnostics.second_stopped.store(0, std::memory_order_relaxed);
+    gate->diagnostics.stop_requested.store(0, std::memory_order_relaxed);
+    gate->runtime_diagnostics = {};
     gate->first_ticket = {};
     gate->audible = audible != 0;
     gate->monitor.head.store(0, std::memory_order_relaxed);
@@ -1261,10 +1517,13 @@ int run_once(Gate *gate, uint64_t run, uint32_t audible, GateEvidence *evidence,
         status = lfm_playback_consumer_create(
             gate->second_session, &gate->second_playback);
     }
+    if (status == 0) {
+        status = lfm_internal_runtime_diagnostic_view(
+            gate->runtime, gate->first_session, gate->second_session,
+            &gate->runtime_diagnostics);
+    }
 
     const koro_cont_config continuation = {
-        .size = sizeof(koro_cont_config),
-        .abi_version = KC_ABI_VERSION,
         .step = gate_step,
         .argument = gate,
         .frame_size = sizeof(GateFrame),
@@ -1376,6 +1635,9 @@ int run_once(Gate *gate, uint64_t run, uint32_t audible, GateEvidence *evidence,
         copy_error(error, error_length, frame->error);
     }
     if (status == 0) {
+        status = validate_native_diagnostics(gate, error, error_length);
+    }
+    if (status == 0) {
         evidence->first_hash = frame->first_pcm.hash;
         evidence->second_hash = frame->second_pcm.hash;
         evidence->first_frames = frame->first_pcm.frames;
@@ -1392,6 +1654,9 @@ int run_once(Gate *gate, uint64_t run, uint32_t audible, GateEvidence *evidence,
                     sizeof(evidence->first_text));
         std::memcpy(evidence->second_text, frame->second_text,
                     sizeof(evidence->second_text));
+    }
+    if (status != 0 && gate->runtime_diagnostics.engine.state) {
+        print_native_watchdog(gate);
     }
     const int closed = close_gate(gate, error, error_length);
     monitor_destroy(gate);
@@ -1464,9 +1729,7 @@ extern "C" int lfm_native_speech_to_speech_gate(
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     error[0] = '\0';
-    int status = verify_detokenizer_lane_invariance(
-        model_path, error, error_length);
-    if (status != 0) return status;
+    int status = 0;
     Gate gate{};
     const LfmRuntimeConfigV1 config = {
         .size = sizeof(LfmRuntimeConfigV1),
@@ -1539,7 +1802,8 @@ extern "C" int lfm_native_speech_to_speech_gate(
     if (status == 0) {
         std::fprintf(stderr,
                      "native speech gate: lanes=%u A=%llu frames/%llu nonzero "
-                     "hash=%016llx, B=%llu frames/%llu nonzero hash=%016llx\n"
+                     "hash=%016llx, B=%llu frames/%llu nonzero hash=%016llx "
+                     "weights=%s generation=%llu payload_reads=%llu/%llu\n"
                      "A: %s\nB: %s\n",
                      kernel_lanes,
                      static_cast<unsigned long long>(first.first_frames),
@@ -1548,6 +1812,15 @@ extern "C" int lfm_native_speech_to_speech_gate(
                      static_cast<unsigned long long>(first.second_frames),
                      static_cast<unsigned long long>(first.second_nonzero),
                      static_cast<unsigned long long>(first.second_hash),
+                     (gate.before.weight_flags & LFM_WEIGHT_LOAD_BUILT)
+                         ? "built"
+                         : "attached",
+                     static_cast<unsigned long long>(
+                         gate.before.weight_generation),
+                     static_cast<unsigned long long>(
+                         gate.before.weight_payload_read_calls),
+                     static_cast<unsigned long long>(
+                         gate.before.weight_payload_read_bytes),
                      first.first_text, first.second_text);
         if (audible != 0) {
             std::fprintf(

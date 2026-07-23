@@ -49,13 +49,10 @@ typedef void (*kc_scope_ready_fn)(void *context, uint64_t generation,
                                   uint32_t cause);
 
 typedef struct kc_scope_child_lease {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t slot;
     uint32_t child_class;
     uint64_t scope_generation;
     uint32_t child_generation;
-    uint32_t reserved;
     kc_ticket_id parent;
     kc_ticket_id child;
 } kc_scope_child_lease;
@@ -68,19 +65,13 @@ typedef void (*kc_scope_child_cancel_fn)(
  * continuation execution, or destruction of the scope is permitted. */
 
 typedef struct kc_fixed_scope_config {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t child_capacity;
-    uint32_t reserved;
     kc_scope_ready_fn ready;
     void *context;
 } kc_fixed_scope_config;
 
 typedef struct kc_scope_child_config {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t child_class;
-    uint32_t reserved;
     kc_scope_child_cancel_fn cancel;
     void *context;
 } kc_scope_child_config;
@@ -88,18 +79,13 @@ typedef struct kc_scope_child_config {
 /* Per-cycle identity is rebound into the sealed role table synchronously.
  * child_tickets is borrowed only for cycle_begin; no pointer is retained. */
 typedef struct kc_fixed_scope_cycle_config {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t child_count;
-    uint32_t reserved;
     uint64_t generation;
     kc_ticket_id parent;
     const kc_ticket_id *child_tickets;
 } kc_fixed_scope_cycle_config;
 
 typedef struct kc_fixed_scope_snapshot {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t capacity;
     uint32_t children;
     uint32_t terminal_children;
@@ -110,7 +96,6 @@ typedef struct kc_fixed_scope_snapshot {
     uint32_t cause_slot;
     uint32_t ready_edges;
     uint32_t cancelling_children;
-    uint32_t reserved;
     uint64_t generation;
     kc_ticket_id parent;
 } kc_fixed_scope_snapshot;

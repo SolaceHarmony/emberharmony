@@ -31,11 +31,8 @@ typedef struct kc_service_notifier kc_service_notifier_t;
 typedef void (*kc_service_fn)(void *context);
 
 typedef struct kc_service_config {
-    uint32_t size;
-    uint32_t abi_version;
     kc_service_fn callback;
     void *context;
-    uint64_t reserved;
     /* Optional owner-affine lifecycle hooks. owner_init runs exactly once on
      * the service's eligible worker before its first callback can run.
      * owner_fini runs exactly once on that same worker after every admitted
@@ -47,8 +44,6 @@ typedef struct kc_service_config {
 } kc_service_config;
 
 typedef struct kc_service_snapshot {
-    uint32_t size;
-    uint32_t abi_version;
     uint64_t notifications;
     uint64_t handled_notifications;
     uint64_t callbacks;

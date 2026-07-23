@@ -125,9 +125,7 @@ static void stop_service(kc_service_t *service)
 int kc_service_create(kc_runtime_t *runtime, const kc_service_config *config,
                       kc_service_t **out)
 {
-    if (!runtime || !config || !out || config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || !config->callback ||
-        config->reserved != 0) return -EINVAL;
+    if (!runtime || !config || !out || !config->callback) return -EINVAL;
 
     kc_service_t *service = calloc(1, sizeof(*service));
     if (!service) return -ENOMEM;
@@ -151,8 +149,6 @@ int kc_service_create(kc_runtime_t *runtime, const kc_service_config *config,
         atomic_is_lock_free(&runtime->wake_requests) &&
         kc_runtime_work_realtime_safe_internal(runtime);
     const koro_cont_config continuation_config = {
-        .size = sizeof(koro_cont_config),
-        .abi_version = KC_ABI_VERSION,
         .step = service_step,
         .argument = service,
         .frame_size = 0,
@@ -488,11 +484,9 @@ int kc_service_join(kc_service_t *service)
 
 int kc_service_snapshot_get(kc_service_t *service, kc_service_snapshot *out)
 {
-    if (!service || !out || out->size < sizeof(*out)) return -EINVAL;
+    if (!service || !out) return -EINVAL;
     unsigned phase = atomic_load_explicit(&service->phase, memory_order_acquire);
     *out = (kc_service_snapshot){
-        .size = sizeof(*out),
-        .abi_version = KC_ABI_VERSION,
         .notifications = atomic_load_explicit(&service->notifications,
                                               memory_order_acquire),
         .handled_notifications = atomic_load_explicit(

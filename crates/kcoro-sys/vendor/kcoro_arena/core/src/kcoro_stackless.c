@@ -21,9 +21,7 @@ int koro_cont_create_on(kc_runtime_t *runtime,
                         const koro_cont_config *config,
                         koro_cont_t **out)
 {
-    if (!runtime || !config || !out ||
-        config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || !config->step) return -EINVAL;
+    if (!runtime || !config || !out || !config->step) return -EINVAL;
     if (config->worker_mask &&
         (runtime->worker_count < 64 &&
          (config->worker_mask >> runtime->worker_count) != 0)) return -EINVAL;
@@ -147,6 +145,22 @@ uint32_t koro_cont_current_worker(const koro_cont_t *continuation)
         ? atomic_load_explicit(&continuation->current_worker,
                                memory_order_acquire)
         : UINT32_MAX;
+}
+
+int koro_cont_snapshot_get(const koro_cont_t *continuation,
+                           koro_cont_snapshot *out)
+{
+    if (!continuation || !out) return -EINVAL;
+    const int state = atomic_load_explicit(&continuation->run_state,
+                                           memory_order_acquire);
+    *out = (koro_cont_snapshot){
+        .identity = continuation->identity,
+        .run_state = (uint32_t)koro_run_public(state),
+        .wake_pending = koro_run_has_wake(state) ? 1u : 0u,
+        .current_worker = atomic_load_explicit(
+            &continuation->current_worker, memory_order_acquire),
+    };
+    return 0;
 }
 
 uint32_t koro_cont_state_get(const koro_cont_t *continuation)

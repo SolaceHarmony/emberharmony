@@ -190,13 +190,10 @@ static kc_scope_child_lease child_lease(const kc_fixed_scope_t *scope,
 {
     const kc_fixed_scope_child *child = &scope->slots[slot];
     return (kc_scope_child_lease){
-        .size = sizeof(kc_scope_child_lease),
-        .abi_version = KC_ABI_VERSION,
         .slot = slot,
         .child_class = child->child_class,
         .scope_generation = generation,
         .child_generation = lease_generation,
-        .reserved = 0,
         .parent = atomic_ticket_load(&scope->parent),
         .child = atomic_ticket_load(&child->ticket),
     };
@@ -341,9 +338,7 @@ int kc_fixed_scope_create(const kc_fixed_scope_config *config,
 {
     if (!out) return -EINVAL;
     *out = NULL;
-    if (!config || config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || config->reserved != 0 ||
-        config->child_capacity == 0 || !config->ready ||
+    if (!config || config->child_capacity == 0 || !config->ready ||
         sizeof(kc_fixed_scope_child) > SIZE_MAX / config->child_capacity)
         return -EINVAL;
 
@@ -392,10 +387,7 @@ int kc_fixed_scope_add_role(kc_fixed_scope_t *scope,
                             const kc_scope_child_config *config,
                             uint32_t *out_slot)
 {
-    if (!scope || !config || !out_slot ||
-        config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || config->reserved != 0 ||
-        !config->cancel ||
+    if (!scope || !config || !out_slot || !config->cancel ||
         (config->child_class != KC_SCOPE_CHILD_FUNCTIONAL &&
          config->child_class != KC_SCOPE_CHILD_TELEMETRY)) return -EINVAL;
     if (scope_phase(atomic_load_explicit(&scope->control,
@@ -433,9 +425,8 @@ int kc_fixed_scope_cycle_begin(
     kc_fixed_scope_t *scope, const kc_fixed_scope_cycle_config *config,
     kc_scope_child_lease *out_leases, size_t lease_capacity)
 {
-    if (!scope || !config || config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || config->reserved != 0 ||
-        config->generation == 0 || !ticket_valid(&config->parent) ||
+    if (!scope || !config || config->generation == 0 ||
+        !ticket_valid(&config->parent) ||
         config->child_count != scope->children ||
         lease_capacity < scope->children ||
         (scope->children && (!config->child_tickets || !out_leases)))
@@ -492,13 +483,10 @@ int kc_fixed_scope_cycle_begin(
                        KC_SCOPE_CAUSE_NONE),
             memory_order_relaxed);
         out_leases[slot] = (kc_scope_child_lease){
-            .size = sizeof(kc_scope_child_lease),
-            .abi_version = KC_ABI_VERSION,
             .slot = slot,
             .child_class = child->child_class,
             .scope_generation = config->generation,
             .child_generation = cycle,
-            .reserved = 0,
             .parent = config->parent,
             .child = config->child_tickets[slot],
         };
@@ -517,8 +505,7 @@ int kc_fixed_scope_child_terminal(kc_fixed_scope_t *scope,
                                   const kc_scope_child_lease *lease,
                                   uint32_t cause)
 {
-    if (!scope || !lease || lease->size < sizeof(*lease) ||
-        lease->abi_version != KC_ABI_VERSION || lease->reserved != 0 ||
+    if (!scope || !lease ||
         cause < KC_SCOPE_CAUSE_COMPLETE || cause > KC_SCOPE_CAUSE_STOPPED)
         return -EINVAL;
     int admission = publisher_enter(scope);
@@ -622,7 +609,7 @@ int kc_fixed_scope_cancel(kc_fixed_scope_t *scope, uint64_t generation,
 int kc_fixed_scope_snapshot_get(const kc_fixed_scope_t *scope,
                                 kc_fixed_scope_snapshot *out)
 {
-    if (!scope || !out || out->size < sizeof(*out)) return -EINVAL;
+    if (!scope || !out) return -EINVAL;
     uint32_t cancelling = 0;
     for (uint32_t slot = 0; slot < scope->children; ++slot) {
         uint64_t word = atomic_load_explicit(&scope->slots[slot].word,
@@ -630,8 +617,6 @@ int kc_fixed_scope_snapshot_get(const kc_fixed_scope_t *scope,
         cancelling += child_state(word) == KC_SCOPE_SLOT_CANCELLING;
     }
     *out = (kc_fixed_scope_snapshot){
-        .size = sizeof(*out),
-        .abi_version = KC_ABI_VERSION,
         .capacity = scope->capacity,
         .children = scope->children,
         .terminal_children = atomic_load_explicit(
@@ -646,7 +631,6 @@ int kc_fixed_scope_snapshot_get(const kc_fixed_scope_t *scope,
         .ready_edges = atomic_load_explicit(&scope->ready_edges,
                                              memory_order_acquire),
         .cancelling_children = cancelling,
-        .reserved = 0,
         .generation = atomic_load_explicit(&scope->generation,
                                             memory_order_acquire),
         .parent = atomic_ticket_load(&scope->parent),

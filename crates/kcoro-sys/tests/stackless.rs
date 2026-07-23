@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const ABI: u32 = 1;
 const EBUSY: i32 = 16;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const ECANCELED: i32 = 89;
@@ -17,10 +16,7 @@ const ESTALE: i32 = 116;
 
 #[repr(C)]
 struct RuntimeConfig {
-    size: u32,
-    abi_version: u32,
     worker_count: u32,
-    reserved: u32,
 }
 
 #[repr(C)]
@@ -37,8 +33,6 @@ type Complete = unsafe extern "C" fn(*mut c_void, *const Ticket);
 
 #[repr(C)]
 struct ContConfig {
-    size: u32,
-    abi_version: u32,
     step: Option<Step>,
     argument: *mut c_void,
     frame_size: usize,
@@ -313,10 +307,7 @@ unsafe extern "C" {
 
 fn runtime(workers: u32) -> *mut c_void {
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: workers,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -336,8 +327,6 @@ fn callback_restores_the_exact_frame_on_another_free_worker() {
     let runtime = runtime(2);
     let signal = Signal::new();
     let config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(frame_step),
         argument: (&signal as *const Signal).cast_mut().cast(),
         frame_size: size_of::<Frame>(),
@@ -364,8 +353,6 @@ fn callback_restores_the_exact_frame_on_another_free_worker() {
         changed: Condvar::new(),
     };
     let blocker_config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(blocker_step),
         argument: (&blocker as *const Blocker).cast_mut().cast(),
         frame_size: 0,
@@ -469,8 +456,6 @@ fn callback_during_running_becomes_the_next_resume_without_a_lost_edge() {
         stages: AtomicU32::new(0),
     };
     let config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(lost_wake_step),
         argument: (&state as *const LostWake).cast_mut().cast(),
         frame_size: 0,
@@ -532,8 +517,6 @@ fn callback_wins_against_terminal_claim_and_receives_one_successor_invocation() 
         completed: AtomicBool::new(false),
     };
     let config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(terminal_race_step),
         argument: (&race as *const TerminalRace).cast_mut().cast(),
         frame_size: 0,
@@ -586,8 +569,6 @@ fn done_is_published_only_after_the_completion_callback_releases_its_context() {
         completed: AtomicBool::new(false),
     };
     let config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(completion_gate_step),
         argument: std::ptr::null_mut(),
         frame_size: 0,
@@ -630,8 +611,6 @@ fn callback_ticket_names_one_coroutine_not_a_fifo_position() {
     let first = Signal::new();
     let second = Signal::new();
     let make = |signal: &Signal| ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(exact_step),
         argument: (signal as *const Signal).cast_mut().cast(),
         frame_size: 16,
@@ -685,8 +664,6 @@ fn slot_reuse_cannot_overtake_a_worker_holding_the_prior_publication() {
     };
     let first = Signal::new();
     let config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(completion_gate_step),
         argument: std::ptr::null_mut(),
         frame_size: 0,
@@ -740,8 +717,6 @@ fn registration_cannot_erase_a_late_reader_of_the_closed_generation() {
     let runtime = runtime(2);
     let first = Signal::new();
     let config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(completion_gate_step),
         argument: std::ptr::null_mut(),
         frame_size: 0,

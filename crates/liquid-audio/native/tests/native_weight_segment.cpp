@@ -156,10 +156,7 @@ extern "C" int lfm_internal_weights_continuation_singleflight_test(
     };
     kc_runtime_t *runtime = nullptr;
     const kc_runtime_config runtime_config{
-        .size = sizeof(runtime_config),
-        .abi_version = KC_ABI_VERSION,
         .worker_count = kOpenCount,
-        .reserved = 0,
     };
     int status = kc_runtime_create(&runtime_config, &runtime);
     if (status != 0) {
@@ -169,8 +166,6 @@ extern "C" int lfm_internal_weights_continuation_singleflight_test(
 
     for (uint32_t index = 0; index < kOpenCount; ++index) {
         const koro_cont_config config{
-            .size = sizeof(config),
-            .abi_version = KC_ABI_VERSION,
             .step = open_step,
             .argument = &harness,
             .frame_size = sizeof(OpenFrame),

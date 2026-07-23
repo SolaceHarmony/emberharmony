@@ -626,6 +626,7 @@ struct LfmConversation {
     bool generation_ended = false;
     ConversationAdmission admission{};
     std::atomic_flag active = ATOMIC_FLAG_INIT;
+    std::atomic<uint32_t> active_operation{LFM_CONVERSATION_OPERATION_NONE};
 
     ~LfmConversation() {
         lfm_engine_prefill_workspace_destroy(prefill_workspace);
@@ -777,13 +778,23 @@ bool same_ticket(const KcTicketIdV1 &left, const KcTicketIdV1 &right) {
 
 class ConversationClaim {
   public:
-    explicit ConversationClaim(LfmConversation *conversation) : conversation_(conversation) {
+    explicit ConversationClaim(LfmConversation *conversation,
+                               LfmConversationOperation operation)
+        : conversation_(conversation) {
         held_ = conversation_ &&
                 !conversation_->active.test_and_set(std::memory_order_acquire);
+        if (held_) {
+            conversation_->active_operation.store(operation,
+                                                  std::memory_order_release);
+        }
     }
 
     ~ConversationClaim() {
-        if (held_) conversation_->active.clear(std::memory_order_release);
+        if (held_) {
+            conversation_->active_operation.store(
+                LFM_CONVERSATION_OPERATION_NONE, std::memory_order_relaxed);
+            conversation_->active.clear(std::memory_order_release);
+        }
     }
 
     explicit operator bool() const { return held_; }
@@ -1690,7 +1701,7 @@ int lfm_conversation_prepare_pcm_native(LfmConversation *conversation,
         return -EINVAL;
     }
     *out_playback_frames = 0;
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation, LFM_CONVERSATION_OPERATION_PREPARE);
     if (!claim) return -EBUSY;
     return prepare_pcm_claimed(*conversation, max_sample_count, capture_rate,
                                playback_rate, out_playback_frames);
@@ -1761,7 +1772,8 @@ int lfm_conversation_begin_pcm_spans_submit_native(
     LfmF32SpanChain pcm{};
     int status = lfm_f32_span_chain_init(spans, span_count, &pcm);
     if (status != 0) return status;
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation,
+                            LFM_CONVERSATION_OPERATION_ADMISSION);
     if (!claim) return -EBUSY;
     LfmModel *model = conversation->model;
     if (!model || !model->tokenizer || !model->frontend || !model->conformer ||
@@ -1791,7 +1803,8 @@ int lfm_conversation_begin_text_submit_native(
         !notify_context || !out_handle) {
         return -EINVAL;
     }
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation,
+                            LFM_CONVERSATION_OPERATION_ADMISSION);
     if (!claim) return -EBUSY;
     LfmModel *model = conversation->model;
     if (!model || !model->tokenizer || model->depth_plan_id == 0 ||
@@ -1834,7 +1847,8 @@ int lfm_conversation_begin_mixed_submit_native(
         !notify_context || !out_handle) {
         return -EINVAL;
     }
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation,
+                            LFM_CONVERSATION_OPERATION_ADMISSION);
     if (!claim) return -EBUSY;
     LfmModel *model = conversation->model;
     if (!model || !model->tokenizer || !model->frontend || !model->conformer ||
@@ -1884,6 +1898,8 @@ int lfm_conversation_begin_collect_native(
     admission = {};
     admission.generation = generation;
     *handle = {};
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
+                                         std::memory_order_relaxed);
     conversation->active.clear(std::memory_order_release);
     return status;
 }
@@ -1891,7 +1907,7 @@ int lfm_conversation_begin_collect_native(
 int lfm_conversation_next_requires_playback_native(
     LfmConversation *conversation) {
     if (!conversation) return -EINVAL;
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation, LFM_CONVERSATION_OPERATION_NEXT);
     if (!claim) return -EBUSY;
     if (!conversation->generation_active || conversation->generation_ended) {
         return 0;
@@ -1907,9 +1923,15 @@ int lfm_conversation_next_submit_native(
     if (conversation->active.test_and_set(std::memory_order_acquire)) {
         return -EBUSY;
     }
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NEXT,
+                                         std::memory_order_release);
     const int status = submit_next_text_emission_claimed(
         *conversation, notify, notify_context, out_handle);
-    if (status != 0) conversation->active.clear(std::memory_order_release);
+    if (status != 0) {
+        conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
+                                             std::memory_order_relaxed);
+        conversation->active.clear(std::memory_order_release);
+    }
     return status;
 }
 
@@ -1923,6 +1945,8 @@ int lfm_conversation_next_collect_native(
     if (handle->record != nullptr) return status;
     const int finish = finish_next_text_emission_claimed(
         *conversation, status, out);
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
+                                         std::memory_order_relaxed);
     conversation->active.clear(std::memory_order_release);
     return finish;
 }
@@ -1936,9 +1960,15 @@ int lfm_conversation_next_into_submit_native(
     if (conversation->active.test_and_set(std::memory_order_acquire)) {
         return -EBUSY;
     }
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NEXT,
+                                         std::memory_order_release);
     const int status = submit_next_emission_into_claimed(
         *conversation, *target, notify, notify_context, out_handle);
-    if (status != 0) conversation->active.clear(std::memory_order_release);
+    if (status != 0) {
+        conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
+                                             std::memory_order_relaxed);
+        conversation->active.clear(std::memory_order_release);
+    }
     return status;
 }
 
@@ -1952,6 +1982,8 @@ int lfm_conversation_next_into_collect_native(
     if (handle->record != nullptr) return status;
     const int finish = finish_next_emission_into_claimed(
         *conversation, status, out, out_samples);
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
+                                         std::memory_order_relaxed);
     conversation->active.clear(std::memory_order_release);
     return finish;
 }
@@ -1963,7 +1995,8 @@ int lfm_conversation_interrupt_submit_native(
         return -EINVAL;
     }
     *out_handle = {};
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation,
+                            LFM_CONVERSATION_OPERATION_INTERRUPT);
     if (!claim) return -EBUSY;
     /* An emission is published before it becomes the input to the following
      * recurrence pass. Interrupt/truncation must close that one-pass seam: the
@@ -2040,6 +2073,8 @@ int lfm_conversation_interrupt_collect_native(
         conversation->generation_active = false;
         conversation->generation_ended = true;
     }
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
+                                         std::memory_order_relaxed);
     conversation->active.clear(std::memory_order_release);
     return result;
 }
@@ -2853,7 +2888,7 @@ extern "C" int lfm_conversation_create(LfmModel *model,
 
 extern "C" int lfm_conversation_reset(LfmConversation *conversation) {
     if (!conversation) return -EINVAL;
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation, LFM_CONVERSATION_OPERATION_RESET);
     if (!claim) return -EBUSY;
     return reset_memory(*conversation);
 }
@@ -2861,6 +2896,8 @@ extern "C" int lfm_conversation_reset(LfmConversation *conversation) {
 extern "C" int lfm_conversation_close(LfmConversation *conversation) {
     if (!conversation) return 0;
     if (conversation->active.test_and_set(std::memory_order_acquire)) return -EBUSY;
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_CLOSE,
+                                         std::memory_order_release);
     LfmModel *model = conversation->model;
     delete conversation;
     std::lock_guard<std::mutex> lock(model->lifecycle);
@@ -3481,7 +3518,8 @@ lfm_internal_conversation_listen_probe_submit_for_test(
     LfmF32SpanChain chain{};
     int status = lfm_f32_span_chain_init(&span, 1, &chain);
     if (status != 0) return status;
-    ConversationClaim claim(conversation);
+    ConversationClaim claim(conversation,
+                            LFM_CONVERSATION_OPERATION_LISTEN_PROBE);
     if (!claim) return -EBUSY;
     LfmModel *model = conversation->model;
     if (!model || !model->frontend || !model->conformer ||
@@ -3536,6 +3574,13 @@ lfm_internal_conversation_listen_probe_collect_for_test(
     *out_rows = probe->rows;
     *out_encode_ns = probe->encode_ns;
     delete probe;
+    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
+                                         std::memory_order_relaxed);
     conversation->active.clear(std::memory_order_release);
     return status;
+}
+
+const std::atomic<uint32_t> *lfm_conversation_operation_view_native(
+    const LfmConversation *conversation) {
+    return conversation ? &conversation->active_operation : nullptr;
 }

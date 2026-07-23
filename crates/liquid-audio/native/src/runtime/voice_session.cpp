@@ -13,6 +13,7 @@
 #include "lfm_sesame_detector.h"
 #include "lfm_platform_audio_internal.h"
 #include "lfm_runtime_internal.h"
+#include "lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
 
 #include <algorithm>
@@ -971,6 +972,10 @@ struct LfmSession {
     bool delivery_done = false;
     bool services_joined = false;
     bool start_cleanup = false;
+    /* Coordinator-owned, setup-time resident control evidence. Numerical and
+     * PCM state remain in their owner buffers; the truth gate receives only a
+     * pointer view of these atomics. */
+    LfmSessionDiagnosticState diagnostics;
     std::atomic<uint32_t> capture_producers{0};
     std::atomic<uint32_t> playback_consumers{0};
     std::atomic<bool> platform_retirement_ready{false};
@@ -1647,15 +1652,44 @@ void close_publications(LfmSession *session) {
                                              std::memory_order_acq_rel);
 }
 
+enum SessionTerminalCause : uint32_t {
+    SESSION_TERMINAL_NONE = 0,
+    SESSION_TERMINAL_COORDINATOR_NOTIFY = 1,
+    SESSION_TERMINAL_DELIVERY_NOTIFY = 2,
+    SESSION_TERMINAL_REQUEST_STOP = 3,
+    SESSION_TERMINAL_PLATFORM_RETIRE = 4,
+    SESSION_TERMINAL_CAPTURE_RETIRE = 5,
+    SESSION_TERMINAL_CONVERSATION_INTERRUPT = 6,
+    SESSION_TERMINAL_PLAYBACK_RETIRE = 7,
+};
+
+void record_terminal_failure(LfmSession *session, int32_t status,
+                             SessionTerminalCause cause) {
+    if (!session || status == 0) return;
+    int32_t expected = 0;
+    if (!session->terminal_status.compare_exchange_strong(
+            expected, status, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    const std::atomic<uint32_t> *operation =
+        lfm_conversation_operation_view_native(session->conversation);
+    session->diagnostics.terminal_cause.store(cause,
+                                              std::memory_order_relaxed);
+    session->diagnostics.terminal_operation.store(
+        operation ? operation->load(std::memory_order_acquire) : 0,
+        std::memory_order_relaxed);
+    session->diagnostics.terminal_status.store(status,
+                                               std::memory_order_release);
+}
+
 void notify_session(LfmSession *session) {
     if (!session || !session->coordinator_notifier) return;
     const int status =
         kc_service_notifier_notify(session->coordinator_notifier);
     if (status != 0 && status != -ECANCELED) {
-        int32_t expected = 0;
-        session->terminal_status.compare_exchange_strong(
-            expected, status, std::memory_order_acq_rel,
-            std::memory_order_acquire);
+        record_terminal_failure(session, status,
+                                SESSION_TERMINAL_COORDINATOR_NOTIFY);
         close_publications(session);
         session->stop.store(true, std::memory_order_release);
     }
@@ -1668,10 +1702,8 @@ int notify_delivery(LfmSession *session) {
     const int status =
         kc_service_notifier_notify(session->delivery_notifier);
     if (status != 0 && status != -ECANCELED) {
-        int32_t expected = 0;
-        session->terminal_status.compare_exchange_strong(
-            expected, status, std::memory_order_acq_rel,
-            std::memory_order_acquire);
+        record_terminal_failure(session, status,
+                                SESSION_TERMINAL_DELIVERY_NOTIFY);
         close_publications(session);
         session->stop.store(true, std::memory_order_release);
         notify_session(session);
@@ -1680,12 +1712,7 @@ int notify_delivery(LfmSession *session) {
 }
 
 void request_stop(LfmSession *session, int32_t status) {
-    if (status != 0) {
-        int32_t expected = 0;
-        session->terminal_status.compare_exchange_strong(expected, status,
-                                                         std::memory_order_acq_rel,
-                                                         std::memory_order_acquire);
-    }
+    record_terminal_failure(session, status, SESSION_TERMINAL_REQUEST_STOP);
     close_publications(session);
     bool first = !session->stop.exchange(true, std::memory_order_acq_rel);
     if (first) {
@@ -1743,10 +1770,7 @@ int capture_supervision_create(LfmSession *session) {
     }
 
     const kc_fixed_scope_config scope_config = {
-        .size = sizeof(kc_fixed_scope_config),
-        .abi_version = KC_ABI_VERSION,
         .child_capacity = CAPTURE_DEADLINE_COUNT,
-        .reserved = 0,
         .ready = capture_scope_ready,
         .context = supervision.notifier,
     };
@@ -1754,10 +1778,7 @@ int capture_supervision_create(LfmSession *session) {
     if (status != 0) return status;
     for (uint32_t slot = 0; slot < CAPTURE_DEADLINE_COUNT; ++slot) {
         const kc_scope_child_config child = {
-            .size = sizeof(kc_scope_child_config),
-            .abi_version = KC_ABI_VERSION,
             .child_class = KC_SCOPE_CHILD_FUNCTIONAL,
-            .reserved = 0,
             .cancel = capture_scope_cancel,
             .context = &supervision.roles[slot],
         };
@@ -1777,10 +1798,7 @@ int capture_supervision_create(LfmSession *session) {
     }
 
     const kc_deadline_source_config source_config = {
-        .size = sizeof(kc_deadline_source_config),
-        .abi_version = KC_ABI_VERSION,
         .capacity = CAPTURE_DEADLINE_COUNT,
-        .reserved = 0,
         .notify = capture_supervision_notify,
         .context = supervision.notifier,
     };
@@ -1803,12 +1821,8 @@ int build_capture_supervision_snapshot(
     if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
     const CaptureSupervision &supervision = session->capture_supervision;
     kc_fixed_scope_snapshot scope = {
-        .size = sizeof(kc_fixed_scope_snapshot),
-        .abi_version = KC_ABI_VERSION,
     };
     kc_deadline_source_snapshot source = {
-        .size = sizeof(kc_deadline_source_snapshot),
-        .abi_version = KC_ABI_VERSION,
     };
     if (supervision.scope) {
         const int status = kc_fixed_scope_snapshot_get(
@@ -1991,10 +2005,7 @@ int capture_deadline_arm(LfmSession *session, uint32_t slot,
     }
     role.domain_generation = domain_generation;
     const kc_deadline_arm_config config = {
-        .size = sizeof(kc_deadline_arm_config),
-        .abi_version = KC_ABI_VERSION,
         .slot = slot,
-        .reserved = 0,
         .delay_ns = delay_ns,
         .child = role.lease.child,
         .parent = role.lease.parent,
@@ -2036,10 +2047,7 @@ int capture_supervision_begin(LfmSession *session, uint64_t cursor) {
     }
     kc_scope_child_lease leases[CAPTURE_DEADLINE_COUNT]{};
     const kc_fixed_scope_cycle_config cycle = {
-        .size = sizeof(kc_fixed_scope_cycle_config),
-        .abi_version = KC_ABI_VERSION,
         .child_count = CAPTURE_DEADLINE_COUNT,
-        .reserved = 0,
         .generation = generation,
         .parent = expected_parent,
         .child_tickets = tickets,
@@ -2224,8 +2232,6 @@ int capture_supervision_drain_events(LfmSession *session, bool *progress) {
     CaptureSupervision &supervision = session->capture_supervision;
     for (CaptureDeadlineRole &role : supervision.roles) {
         kc_deadline_event event = {
-            .size = sizeof(kc_deadline_event),
-            .abi_version = KC_ABI_VERSION,
         };
         const int observed = kc_deadline_source_event_get(
             supervision.source, role.slot, &event);
@@ -2402,8 +2408,6 @@ int step_capture_supervision(LfmSession *session) {
     if (events != 0) return events;
 
     kc_fixed_scope_snapshot scope = {
-        .size = sizeof(kc_fixed_scope_snapshot),
-        .abi_version = KC_ABI_VERSION,
     };
     int status = kc_fixed_scope_snapshot_get(supervision.scope, &scope);
     if (status != 0) return status;
@@ -2500,8 +2504,6 @@ int step_capture_supervision(LfmSession *session) {
         return CAPTURE_SUPERVISION_PROGRESS;
     }
     kc_deadline_source_snapshot source = {
-        .size = sizeof(kc_deadline_source_snapshot),
-        .abi_version = KC_ABI_VERSION,
     };
     status = kc_deadline_source_snapshot_get(supervision.source, &source);
     if (status != 0) return status;
@@ -4517,10 +4519,8 @@ SessionProgress session_step(LfmSession *session) {
                 session->platform_audio.context);
             if (retired == LFM_STATUS_WOULD_BLOCK) return SESSION_IDLE;
             if (retired != 0) {
-                int32_t expected = 0;
-                session->terminal_status.compare_exchange_strong(
-                    expected, retired, std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                record_terminal_failure(session, retired,
+                                        SESSION_TERMINAL_PLATFORM_RETIRE);
             }
             continue;
         }
@@ -4736,10 +4736,8 @@ SessionProgress session_step(LfmSession *session) {
             const int retire = retire_closed_capture_producer(session);
             if (retire == CAPTURE_RETIRE_PROGRESS) continue;
             if (retire < 0) {
-                int32_t expected = 0;
-                session->terminal_status.compare_exchange_strong(
-                    expected, retire, std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                record_terminal_failure(session, retire,
+                                        SESSION_TERMINAL_CAPTURE_RETIRE);
                 continue;
             }
             if (session->command_pending) {
@@ -4788,10 +4786,9 @@ SessionProgress session_step(LfmSession *session) {
                     return SESSION_BLOCKED_ROUTE;
                 }
                 if (teardown != 0) {
-                    int32_t expected = 0;
-                    session->terminal_status.compare_exchange_strong(
-                        expected, teardown, std::memory_order_acq_rel,
-                        std::memory_order_acquire);
+                    record_terminal_failure(
+                        session, teardown,
+                        SESSION_TERMINAL_CONVERSATION_INTERRUPT);
                 }
             }
             if (!playback_evidence_empty(
@@ -4800,10 +4797,8 @@ SessionProgress session_step(LfmSession *session) {
             }
             const int playback_retired = retire_playback_history(session);
             if (playback_retired != 0) {
-                int32_t expected = 0;
-                session->terminal_status.compare_exchange_strong(
-                    expected, playback_retired, std::memory_order_acq_rel,
-                    std::memory_order_acquire);
+                record_terminal_failure(session, playback_retired,
+                                        SESSION_TERMINAL_PLAYBACK_RETIRE);
                 continue;
             }
             flush_published(session);
@@ -4926,6 +4921,64 @@ SessionProgress session_step(LfmSession *session) {
     return SESSION_READY;
 }
 
+void publish_session_diagnostics(LfmSession *session,
+                                 SessionProgress progress) {
+    if (!session) return;
+    LfmSessionDiagnosticState &state = session->diagnostics;
+    const uint64_t event_head =
+        session->events.head.value.load(std::memory_order_acquire);
+    const uint64_t event_tail =
+        session->events.tail.value.load(std::memory_order_acquire);
+    const uint64_t command_head =
+        session->commands.head.value.load(std::memory_order_acquire);
+    const uint64_t command_tail =
+        session->commands.tail.value.load(std::memory_order_acquire);
+    const uint64_t pcm_head =
+        session->pcm_views.head.value.load(std::memory_order_acquire);
+    const uint64_t pcm_tail =
+        session->pcm_views.tail.value.load(std::memory_order_acquire);
+    state.action_ticket_sequence.store(session->action.ticket.sequence,
+                                       std::memory_order_relaxed);
+    state.action_route_sequence.store(session->action.route.ticket.sequence,
+                                      std::memory_order_relaxed);
+    state.event_depth.store(event_tail - event_head,
+                            std::memory_order_relaxed);
+    state.command_depth.store(command_tail - command_head,
+                              std::memory_order_relaxed);
+    state.pcm_depth.store(pcm_tail - pcm_head, std::memory_order_relaxed);
+    state.progress.store(progress, std::memory_order_relaxed);
+    state.coordinator_phase.store(session->coordinator_phase,
+                                  std::memory_order_relaxed);
+    state.action_phase.store(session->action.phase,
+                             std::memory_order_relaxed);
+    state.action_active.store(session->action.active ? 1u : 0u,
+                              std::memory_order_relaxed);
+    state.admission_pending.store(
+        session->action.admission_pending ? 1u : 0u,
+        std::memory_order_relaxed);
+    state.route_pending.store(session->action.route_pending ? 1u : 0u,
+                              std::memory_order_relaxed);
+    state.playback_active.store(session->action.playback.active ? 1u : 0u,
+                               std::memory_order_relaxed);
+    state.result_active.store(session->result.active ? 1u : 0u,
+                             std::memory_order_relaxed);
+    state.result_next.store(session->result.next, std::memory_order_relaxed);
+    state.result_count.store(session->result.count, std::memory_order_relaxed);
+    state.delivery_pending.store(session->delivery_pending ? 1u : 0u,
+                                 std::memory_order_relaxed);
+    state.stop.store(session->stop.load(std::memory_order_acquire) ? 1u : 0u,
+                     std::memory_order_relaxed);
+    state.event_done.store(
+        session->event_done.load(std::memory_order_acquire) ? 1u : 0u,
+        std::memory_order_relaxed);
+    const std::atomic<uint32_t> *operation =
+        lfm_conversation_operation_view_native(session->conversation);
+    state.conversation_operation.store(
+        operation ? operation->load(std::memory_order_acquire) : 0,
+        std::memory_order_relaxed);
+    state.publications.fetch_add(1, std::memory_order_release);
+}
+
 void coordinator_main(void *context) {
     LfmSession *session = static_cast<LfmSession *>(context);
     /* kc_service_start publishes its retained continuation once so owner
@@ -4941,6 +4994,7 @@ void coordinator_main(void *context) {
         return;
     }
     const SessionProgress progress = session_step(session);
+    publish_session_diagnostics(session, progress);
     publish_playback_policy_snapshot(session);
     publish_capture_supervision_snapshot(session);
     if (progress == SESSION_DONE) {
@@ -5263,10 +5317,7 @@ static int runtime_create_impl(const LfmRuntimeConfigV1 *config,
         return LFM_STATUS_OUT_OF_MEMORY;
     }
     const kc_runtime_config coordination = {
-        .size = sizeof(kc_runtime_config),
-        .abi_version = KC_ABI_VERSION,
         .worker_count = config->coordination_workers,
-        .reserved = 0,
     };
     if (kc_runtime_create(&coordination, &runtime->coordination) != 0) {
         lfm_engine_free(runtime->engine);
@@ -5691,11 +5742,8 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
                          static_cast<uint32_t>(playback_samples));
     }
     const kc_service_config coordinator = {
-        .size = sizeof(kc_service_config),
-        .abi_version = KC_ABI_VERSION,
         .callback = coordinator_main,
         .context = session,
-        .reserved = 0,
     };
     if (rc == 0 &&
         kc_service_create(runtime->coordination, &coordinator,
@@ -5708,11 +5756,8 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
         rc = LFM_STATUS_INTERNAL;
     }
     const kc_service_config delivery = {
-        .size = sizeof(kc_service_config),
-        .abi_version = KC_ABI_VERSION,
         .callback = delivery_main,
         .context = session,
-        .reserved = 0,
     };
     if (rc == 0 &&
         kc_service_create(runtime->coordination, &delivery,
@@ -7285,3 +7330,33 @@ int playback_release(LfmSession *session, const LfmPcmLeaseV1 *lease) {
 }
 
 } // namespace
+
+int lfm_internal_runtime_diagnostic_view(LfmRuntime *runtime,
+                                         LfmSession *first,
+                                         LfmSession *second,
+                                         LfmRuntimeDiagnosticView *out) {
+    if (!runtime || !first || !second || !out || !runtime->engine ||
+        first->runtime != runtime || second->runtime != runtime ||
+        !first->coordinator || !first->delivery || !second->coordinator ||
+        !second->delivery) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    LfmRuntimeDiagnosticView view = {
+        .coordination = runtime->coordination,
+        .first = {
+            .state = &first->diagnostics,
+            .coordinator = first->coordinator,
+            .delivery = first->delivery,
+        },
+        .second = {
+            .state = &second->diagnostics,
+            .coordinator = second->coordinator,
+            .delivery = second->delivery,
+        },
+    };
+    const int status =
+        lfm_internal_engine_diagnostic_view(runtime->engine, &view.engine);
+    if (status != 0) return status;
+    *out = view;
+    return 0;
+}

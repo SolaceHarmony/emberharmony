@@ -13,8 +13,6 @@ struct Ticket {
 
 #[repr(C)]
 struct RuntimeSnapshot {
-    size: u32,
-    abi_version: u32,
     active: usize,
     queued: usize,
     running: usize,
@@ -49,8 +47,6 @@ fn production_engine_mounts_lanes_and_bridge_on_one_bounded_pool() {
     );
 
     let mut runtime = RuntimeSnapshot {
-        size: size_of::<RuntimeSnapshot>() as u32,
-        abi_version: 1,
         active: 0,
         queued: 0,
         running: 0,

@@ -9,20 +9,13 @@
 extern "C" {
 #endif
 
-#define KC_ABI_VERSION 1u
-
 typedef struct kc_runtime kc_runtime_t;
 
 typedef struct kc_runtime_config {
-    uint32_t size;
-    uint32_t abi_version;
     unsigned worker_count;
-    uint32_t reserved;
 } kc_runtime_config;
 
 typedef struct kc_runtime_snapshot {
-    uint32_t size;
-    uint32_t abi_version;
     size_t active;
     size_t queued;
     size_t running;

@@ -32,13 +32,14 @@ typedef enum koro_run_state {
 typedef enum koro_suspend_kind {
     /* Only a correlated callback may make this frame runnable again. */
     KORO_SUSPEND_CALLBACK = 0,
-    /* Cooperative scheduling point.  The runtime republishes the frame. */
+    /* Cooperative scheduling point.  The runtime republishes the frame.
+     * Execution resumes immediately after KORO_YIELD.  A predicate-draining
+     * loop must recheck its owner buffer before callback suspension because
+     * a callback edge may legally coalesce with the self-publication. */
     KORO_SUSPEND_YIELD = 1,
 } koro_suspend_kind;
 
 typedef struct koro_cont_config {
-    uint32_t size;
-    uint32_t abi_version;
     koro_step_fn step;
     void *argument;
     size_t frame_size;
@@ -50,6 +51,16 @@ typedef struct koro_cont_config {
     void *completion_context;
 } koro_cont_config;
 
+/* Read-only control evidence for native supervision and fatal test gates. It
+ * contains no frame bytes and does not retain the continuation. The owner
+ * must keep its setup-time lease alive while reading this view. */
+typedef struct koro_cont_snapshot {
+    kc_ticket_id identity;
+    uint32_t run_state;
+    uint32_t wake_pending;
+    uint32_t current_worker;
+} koro_cont_snapshot;
+
 /* Creation is a setup-time allocation and registration operation.  The frame
  * is fixed for its lifetime; starting and resuming allocate nothing. */
 int koro_cont_create_on(struct kc_runtime *runtime,
@@ -57,8 +68,8 @@ int koro_cont_create_on(struct kc_runtime *runtime,
                         koro_cont_t **out);
 int koro_cont_start(koro_cont_t *continuation);
 
-/* A callback resumes one exact logical coroutine.  The complete identity is
- * the GOSUB return address; stale or unrelated callbacks are rejected. */
+/* A callback resumes one exact logical coroutine. The complete identity is
+ * its correlation key; stale or unrelated callbacks are rejected. */
 int koro_cont_resume(koro_cont_t *continuation,
                      const kc_ticket_id *identity);
 kc_ticket_id koro_cont_identity(const koro_cont_t *continuation);
@@ -73,6 +84,8 @@ void koro_cont_release(koro_cont_t *continuation);
 void *koro_cont_frame(koro_cont_t *continuation);
 void *koro_cont_argument(koro_cont_t *continuation);
 uint32_t koro_cont_current_worker(const koro_cont_t *continuation);
+int koro_cont_snapshot_get(const koro_cont_t *continuation,
+                           koro_cont_snapshot *out);
 uint32_t koro_cont_state_get(const koro_cont_t *continuation);
 void koro_cont_state_set(koro_cont_t *continuation, uint32_t state,
                          uint32_t suspend_kind);

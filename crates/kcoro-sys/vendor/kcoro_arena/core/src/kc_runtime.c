@@ -12,10 +12,8 @@ static _Thread_local kc_runtime_t *current_worker_runtime;
 static _Thread_local koro_cont_t *current_worker_continuation;
 static _Thread_local uint32_t current_worker_index = UINT32_MAX;
 
-enum {
-    KC_RUNTIME_SLOT_CLOSED = 1u << 31,
-    KC_RUNTIME_SLOT_READERS = KC_RUNTIME_SLOT_CLOSED - 1,
-};
+static const unsigned KC_RUNTIME_SLOT_CLOSED = 1u << 31;
+static const unsigned KC_RUNTIME_SLOT_READERS = (1u << 31) - 1;
 
 static uint64_t next_epoch(void)
 {
@@ -96,9 +94,6 @@ static int create_continuation_board(kc_runtime_t *runtime)
 int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
 {
     if (!out) return -EINVAL;
-    if (config && (config->size < sizeof(*config) ||
-                   config->abi_version != KC_ABI_VERSION ||
-                   config->reserved != 0)) return -EINVAL;
     kc_runtime_t *runtime = calloc(1, sizeof(*runtime));
     if (!runtime) return -ENOMEM;
     atomic_init(&runtime->refs, 1);
@@ -766,7 +761,7 @@ int kc_runtime_destroy(kc_runtime_t *runtime)
 
 int kc_runtime_snapshot_get(kc_runtime_t *runtime, kc_runtime_snapshot *out)
 {
-    if (!runtime || !out || out->size < sizeof(*out)) return -EINVAL;
+    if (!runtime || !out) return -EINVAL;
     KC_MUTEX_LOCK(&runtime->mu);
     const size_t active = atomic_load_explicit(&runtime->active,
                                                memory_order_acquire);
@@ -775,7 +770,6 @@ int kc_runtime_snapshot_get(kc_runtime_t *runtime, kc_runtime_snapshot *out)
     const size_t running = atomic_load_explicit(&runtime->running,
                                                 memory_order_acquire);
     *out = (kc_runtime_snapshot){
-        .size = sizeof(*out), .abi_version = KC_ABI_VERSION,
         .active = active, .queued = queued, .running = running,
         .dormant = active > queued + running ? active - queued - running : 0,
         .workers = runtime->worker_count,

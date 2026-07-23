@@ -289,11 +289,9 @@ static void *team_member_step(koro_cont_t *continuation)
 
 int kc_team_create(const kc_team_config *config, kc_team_t **out)
 {
-    if (!config || !out || config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || !config->runtime ||
+    if (!config || !out || !config->runtime ||
         !config->member || config->member_count == 0 ||
-        config->member_count > KC_TEAM_MAX_MEMBERS ||
-        config->reserved != 0) return -EINVAL;
+        config->member_count > KC_TEAM_MAX_MEMBERS) return -EINVAL;
     kc_team_t *team = calloc(1, sizeof(*team));
     if (!team) return -ENOMEM;
     team->config = *config;
@@ -312,8 +310,6 @@ int kc_team_create(const kc_team_config *config, kc_team_t **out)
         atomic_init(&team->progress[index].entered_generation, 0);
         atomic_init(&team->progress[index].returned_generation, 0);
         const koro_cont_config member_config = {
-            .size = sizeof(koro_cont_config),
-            .abi_version = KC_ABI_VERSION,
             .step = team_member_step,
             .argument = team,
             .frame_size = sizeof(kc_team_member_frame),
@@ -518,10 +514,8 @@ int kc_team_destroy(kc_team_t *team)
 
 int kc_team_snapshot_get(kc_team_t *team, kc_team_snapshot *out)
 {
-    if (!team || !out || out->size < sizeof(*out)) return -EINVAL;
+    if (!team || !out) return -EINVAL;
     *out = (kc_team_snapshot){
-        .size = sizeof(*out),
-        .abi_version = KC_ABI_VERSION,
         .member_count = team->config.member_count,
         .started_members = atomic_load_explicit(&team->started_members,
                                                 memory_order_acquire),
@@ -542,7 +536,7 @@ int kc_team_snapshot_get(kc_team_t *team, kc_team_snapshot *out)
 int kc_team_quorum_snapshot_get(kc_team_t *team, uint64_t generation,
                                 kc_team_quorum_snapshot *out)
 {
-    if (!team || !out || out->size < sizeof(*out) || generation == 0)
+    if (!team || !out || generation == 0)
         return -EINVAL;
     if (atomic_load_explicit(&team->dispatched_generation,
                              memory_order_acquire) != generation)
@@ -568,8 +562,6 @@ int kc_team_quorum_snapshot_get(kc_team_t *team, uint64_t generation,
     const uint64_t expected = team->config.member_count == KC_TEAM_MAX_MEMBERS
         ? UINT64_MAX : (UINT64_C(1) << team->config.member_count) - 1;
     *out = (kc_team_quorum_snapshot){
-        .size = sizeof(*out),
-        .abi_version = KC_ABI_VERSION,
         .generation = generation,
         .expected_mask = expected,
         .entered_mask = entered,

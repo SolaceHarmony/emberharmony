@@ -386,10 +386,7 @@ static int start_team(kc_runtime_t *runtime, uint32_t members,
                       kc_team_member_fn member, Coop *coop, kc_team_t **out)
 {
     const kc_team_config config = {
-        .size = sizeof(config),
-        .abi_version = 1,
         .member_count = members,
-        .reserved = 0,
         .member = member,
         .context = coop,
         .runtime = runtime,
@@ -417,11 +414,8 @@ static int run_runner(kc_runtime_t *runtime, Runner *runner)
     int status = 0;
 
     const kc_service_config service_config = {
-        .size = sizeof(service_config),
-        .abi_version = 1,
         .callback = runner_service,
         .context = runner,
-        .reserved = 0,
         .owner_init = NULL,
         .owner_fini = NULL,
     };
@@ -708,10 +702,7 @@ int main(void)
             .pass = {0},
         };
         const kc_runtime_config runtime_config = {
-            .size = sizeof(runtime_config),
-            .abi_version = 1,
             .worker_count = members,
-            .reserved = 0,
         };
         kc_runtime_t *runtime = NULL;
         int status = kc_runtime_create(&runtime_config, &runtime);

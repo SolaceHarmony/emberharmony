@@ -478,8 +478,6 @@ void *gate_step(koro_cont_t *continuation) {
             RequestTask &task = gate->tasks[index];
             task.gate = gate;
             koro_cont_config config{
-                .size = sizeof(config),
-                .abi_version = KC_ABI_VERSION,
                 .step = request_step,
                 .argument = &task,
                 .frame_size = 0,
@@ -911,8 +909,6 @@ int run_client(int argc, char **argv) {
     child->service = argv[2];
     child->evidence_fd = static_cast<int>(fd);
     kc_runtime_config runtime_config{
-        .size = sizeof(runtime_config),
-        .abi_version = KC_ABI_VERSION,
         .worker_count = 2,
     };
     if (kc_runtime_create(&runtime_config, &child->runtime) != 0 ||
@@ -920,8 +916,6 @@ int run_client(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     koro_cont_config config{
-        .size = sizeof(config),
-        .abi_version = KC_ABI_VERSION,
         .step = child_step,
         .argument = child,
         .frame_size = sizeof(uint64_t),
@@ -966,8 +960,6 @@ int run_gate(const char *program, const char *checkpoint) {
         "com.solaceharmony.lfm.host-gate", DISPATCH_QUEUE_SERIAL);
     if (!gate->queue) return EXIT_FAILURE;
     kc_runtime_config runtime_config{
-        .size = sizeof(runtime_config),
-        .abi_version = KC_ABI_VERSION,
         .worker_count = 2,
     };
     if (kc_runtime_create(&runtime_config, &gate->runtime) != 0 ||
@@ -975,8 +967,6 @@ int run_gate(const char *program, const char *checkpoint) {
         return EXIT_FAILURE;
     }
     koro_cont_config config{
-        .size = sizeof(config),
-        .abi_version = KC_ABI_VERSION,
         .step = gate_step,
         .argument = gate,
         .frame_size = sizeof(GateFrame),

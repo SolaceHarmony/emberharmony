@@ -9,15 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const ABI: u32 = 1;
 const IDLE_MAX_PCT: f64 = 0.5;
 
 #[repr(C)]
 struct RuntimeConfig {
-    size: u32,
-    abi_version: u32,
     worker_count: u32,
-    reserved: u32,
 }
 
 #[repr(C)]
@@ -34,8 +30,6 @@ type Complete = unsafe extern "C" fn(*mut c_void, *const Ticket);
 
 #[repr(C)]
 struct ContConfig {
-    size: u32,
-    abi_version: u32,
     step: Option<Step>,
     argument: *mut c_void,
     frame_size: usize,
@@ -134,10 +128,7 @@ fn idle(runtime: *mut c_void, window: Duration) -> f64 {
 fn bounded_workers_are_silent_before_and_after_a_callback_resume() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
-        size: size_of::<RuntimeConfig>() as u32,
-        abi_version: ABI,
         worker_count: 4,
-        reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
@@ -158,8 +149,6 @@ fn bounded_workers_are_silent_before_and_after_a_callback_resume() {
         changed: Condvar::new(),
     };
     let config = ContConfig {
-        size: size_of::<ContConfig>() as u32,
-        abi_version: ABI,
         step: Some(step),
         argument: (&edge as *const Edge).cast_mut().cast(),
         frame_size: 32,

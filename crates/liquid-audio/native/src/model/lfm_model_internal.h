@@ -8,6 +8,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+#include <atomic>
+#endif
+
 /* Private native owner ABI. These are lifecycle/configuration records used
  * only between the opaque product runtime and the native model owner. They do
  * not expose numerical operations, activations, or checkpoint views. */
@@ -72,6 +76,17 @@ enum LfmNativeEmissionKind : uint32_t {
     LFM_NATIVE_EMISSION_TEXT = 1,
     LFM_NATIVE_EMISSION_AUDIO_CODES = 2,
     LFM_NATIVE_EMISSION_FINISHED = 3,
+};
+
+enum LfmConversationOperation : uint32_t {
+    LFM_CONVERSATION_OPERATION_NONE = 0,
+    LFM_CONVERSATION_OPERATION_PREPARE = 1,
+    LFM_CONVERSATION_OPERATION_ADMISSION = 2,
+    LFM_CONVERSATION_OPERATION_NEXT = 3,
+    LFM_CONVERSATION_OPERATION_INTERRUPT = 4,
+    LFM_CONVERSATION_OPERATION_RESET = 5,
+    LFM_CONVERSATION_OPERATION_CLOSE = 6,
+    LFM_CONVERSATION_OPERATION_LISTEN_PROBE = 7,
 };
 
 struct LfmNativeEmission {
@@ -209,5 +224,7 @@ LFM_INTERNAL_API int lfm_conversation_interrupt_collect_native(
 LFM_INTERNAL_API int
 lfm_conversation_belongs_to(const LfmConversation *conversation,
                             const LfmModel *model);
+LFM_INTERNAL_API const std::atomic<uint32_t> *
+lfm_conversation_operation_view_native(const LfmConversation *conversation);
 
 #endif /* LFM_MODEL_INTERNAL_H */

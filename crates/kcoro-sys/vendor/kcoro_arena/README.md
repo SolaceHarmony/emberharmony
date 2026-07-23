@@ -64,14 +64,21 @@ as a separate archive.
 
 ## Verification
 
-From the EmberHarmony repository root:
+The authoritative kernel tests are native C++23 programs. Build outside the
+source tree:
 
 ```sh
-cargo test -p kcoro-sys
+cmake -S crates/kcoro-sys/vendor/kcoro_arena \
+      -B /tmp/emberharmony-kcoro-build
+cmake --build /tmp/emberharmony-kcoro-build --parallel
+ctest --test-dir /tmp/emberharmony-kcoro-build --output-on-failure
 ```
 
-The tests execute the real native runtime and source-gate the absence of the
-retired scheduler, channel, timer, and persistence APIs.
+The first direct gate proves that dormant logical continuations are bounded by
+the fixed registration board, slot reuse changes generation, stale callbacks
+cannot resume a replacement frame, and an exact callback resumes the saved
+stackless program counter and frame. Rust bindings are not the authority for
+the native kernel.
 
 ## License
 

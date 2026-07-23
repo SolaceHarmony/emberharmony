@@ -448,9 +448,7 @@ static int source_create(const kc_deadline_source_config *config, int manual,
 {
     if (!out) return -EINVAL;
     *out = NULL;
-    if (!config || config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || config->capacity == 0 ||
-        config->reserved != 0 || !config->notify ||
+    if (!config || config->capacity == 0 || !config->notify ||
         sizeof(kc_deadline_slot) > SIZE_MAX / config->capacity) return -EINVAL;
     kc_deadline_source_t *source = calloc(1, sizeof(*source));
     if (!source) return -ENOMEM;
@@ -575,8 +573,6 @@ int kc_deadline_source_arm(kc_deadline_source_t *source,
                            kc_deadline_arm *out_arm)
 {
     if (!source || !config || !out_arm ||
-        config->size < sizeof(*config) ||
-        config->abi_version != KC_ABI_VERSION || config->reserved != 0 ||
         config->slot >= source->capacity || !ticket_valid(&config->child) ||
         config->child.kind != KC_TICKET_KIND_DEADLINE ||
         !ticket_valid(&config->parent) || config->scope_generation == 0 ||
@@ -617,10 +613,7 @@ int kc_deadline_source_arm(kc_deadline_source_t *source,
 
     uint64_t armed_generation = generation + 1;
     slot->scheduled = (kc_deadline_arm){
-        .size = sizeof(slot->scheduled),
-        .abi_version = KC_ABI_VERSION,
         .slot = config->slot,
-        .reserved = 0,
         .arm_generation = armed_generation,
         .child = config->child,
         .parent = config->parent,
@@ -741,7 +734,7 @@ int kc_deadline_source_disarm(kc_deadline_source_t *source, uint32_t slot,
 int kc_deadline_source_event_get(const kc_deadline_source_t *source,
                                  uint32_t slot, kc_deadline_event *out)
 {
-    if (!source || !out || out->size < sizeof(*out) ||
+    if (!source || !out ||
         slot >= source->capacity) return -EINVAL;
     const kc_deadline_slot *record = &source->slots[slot];
     uint64_t control = atomic_load_explicit(&record->control,
@@ -751,8 +744,6 @@ int kc_deadline_source_event_get(const kc_deadline_source_t *source,
     uint64_t sequence = atomic_load_explicit(&event->sequence,
                                              memory_order_acquire);
     *out = (kc_deadline_event){
-        .size = sizeof(*out),
-        .abi_version = KC_ABI_VERSION,
         .slot = slot,
         .kind = atomic_load_explicit(&event->kind, memory_order_relaxed),
         .sequence = sequence,
@@ -817,15 +808,11 @@ static int event_identity_equal(const kc_deadline_event *left,
 int kc_deadline_source_event_ack(kc_deadline_source_t *source,
                                  const kc_deadline_event *event)
 {
-    if (!source || !event || event->size < sizeof(*event) ||
-        event->abi_version != KC_ABI_VERSION ||
+    if (!source || !event ||
         event->slot >= source->capacity || event->sequence == 0 ||
         event->current_arm_generation == 0) return -EINVAL;
     kc_deadline_slot *record = &source->slots[event->slot];
-    kc_deadline_event stored = {
-        .size = sizeof(stored),
-        .abi_version = KC_ABI_VERSION,
-    };
+    kc_deadline_event stored = {0};
     int observed = kc_deadline_source_event_get(source, event->slot, &stored);
     if (observed != 0) return observed == -EAGAIN ? -ESTALE : observed;
     if (!event_identity_equal(&stored, event)) return -ESTALE;
@@ -970,7 +957,7 @@ int kc_deadline_source_join(kc_deadline_source_t *source)
 int kc_deadline_source_snapshot_get(const kc_deadline_source_t *source,
                                     kc_deadline_source_snapshot *out)
 {
-    if (!source || !out || out->size < sizeof(*out)) return -EINVAL;
+    if (!source || !out) return -EINVAL;
     uint32_t idle = 0;
     uint32_t armed = 0;
     uint32_t events = 0;
@@ -982,14 +969,11 @@ int kc_deadline_source_snapshot_get(const kc_deadline_source_t *source,
         events += state == KC_DEADLINE_SLOT_EVENT;
     }
     *out = (kc_deadline_source_snapshot){
-        .size = sizeof(*out),
-        .abi_version = KC_ABI_VERSION,
         .capacity = source->capacity,
         .phase = atomic_load_explicit(&source->phase, memory_order_acquire),
         .idle = idle,
         .armed = armed,
         .pending_events = events,
-        .reserved = 0,
         .published_events = atomic_load_explicit(
             &source->published_events, memory_order_acquire),
         .stale_events = atomic_load_explicit(&source->stale_events,
