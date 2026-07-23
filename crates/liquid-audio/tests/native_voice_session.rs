@@ -4742,31 +4742,19 @@ fn session_runtime_has_no_operation_wait_path() {
             "forbidden numerical waiter returned: {forbidden}"
         );
     }
-    assert!(engine.contains("std::atomic<bool> pass_closed"));
-    assert!(engine.contains("std::atomic<uint32_t> pass_publishers"));
-    assert!(engine.contains("std::atomic<uint32_t> route_publishers"));
-    for (begin, end) in [
-        (
-            "static bool enter_pass_admission",
-            "static void leave_pass_admission",
-        ),
-        (
-            "static int enter_route_admission",
-            "static void leave_route_admission",
-        ),
-    ] {
-        let begin = engine.find(begin).unwrap();
-        let end = engine[begin..]
-            .find(end)
-            .map(|offset| begin + offset)
-            .unwrap();
-        let admission = &engine[begin..end];
-        assert!(!admission.contains("for (;;)") && !admission.contains("while ("));
-        assert!(admission.contains("fetch_add(1"));
-        assert!(admission.contains("fetch_sub(1"));
-        assert!(!admission.contains("compare_exchange"));
-        assert!(admission.matches("memory_order_seq_cst").count() >= 3);
-    }
+    assert!(engine.contains("kc::AdmissionGate<PASS_PUBLISHER_CAPACITY>"));
+    assert!(engine.contains("kc::AdmissionGate<ROUTE_PUBLISHER_CAPACITY>"));
+    assert!(engine.contains("PassSlotPool slots"));
+    assert!(!engine.contains("std::atomic<bool> pass_closed"));
+    assert!(!engine.contains("std::atomic<uint32_t> pass_publishers"));
+    assert!(!engine.contains("std::atomic<uint32_t> route_publishers"));
+    let coordination =
+        include_str!("../../kcoro-sys/vendor/kcoro_arena/include/kc_coordination.hpp");
+    assert!(coordination.contains("class AdmissionGate final"));
+    assert!(coordination.contains("class SlotPool final"));
+    assert!(!coordination.contains("compare_exchange_weak"));
+    assert!(!coordination.contains("for (;;)"));
+    assert!(!coordination.contains("while ("));
 }
 
 #[test]
@@ -4801,7 +4789,8 @@ fn kernel_bridge_is_a_bounded_ticket_edge_not_a_descriptor_registry() {
 
     let engine = include_str!("../native/src/engine/flashkern_engine.cpp");
     assert!(engine.contains(".slot = slot->index"));
-    assert!(engine.contains(".generation = ticket_generation"));
+    assert!(engine.contains(".generation = ticket.generation"));
+    assert!(engine.contains("e->tickets.mint(KC_COORD_TICKET_PASS)"));
     assert!(engine.contains("submission.descriptor.slot < e->slots.size()"));
     assert!(!engine.contains("LfmKernelDescriptor"));
     assert!(!engine.contains("KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR"));

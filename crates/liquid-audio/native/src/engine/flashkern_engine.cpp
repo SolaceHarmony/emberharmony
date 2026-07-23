@@ -59,6 +59,7 @@
 #include "lfm_detokenizer.h"
 #include "lfm_detokenizer_program.h"
 #include "lfm_model_plan.h"
+#include "kc_coordination.hpp"
 #include "../runtime/lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
 
@@ -140,8 +141,6 @@ enum : uint32_t {
 };
 constexpr size_t PREFILL_ROWS = LFM_PREFILL_MAX_ROWS;
 constexpr size_t TOKEN_INPUT_MAX_IDS = 8;
-std::atomic<uint64_t> next_engine_epoch{1};
-
 static bool checked_size_product(size_t left, size_t right, size_t *out) {
     if (left != 0 && right > SIZE_MAX / left) return false;
     *out = left * right;
@@ -597,32 +596,13 @@ constexpr uint32_t GRID_LANES = BLOCK_DOMAIN_COUNT * BLOCK_LANES;
 
 enum : uint32_t {
     PASS_SLOT_FREE = 0,
-    PASS_SLOT_CLAIMING = 1,
-    PASS_SLOT_RESERVED = 2,
-    PASS_SLOT_SUBMITTING = 3,
-    PASS_SLOT_SUBMITTED = 4,
-    PASS_SLOT_RUNNING = 5,
-    PASS_SLOT_COMPLETING = 6,
-    PASS_SLOT_COMPLETE = 7,
-    PASS_SLOT_RELEASING = 8,
+    PASS_SLOT_RESERVED = 1,
+    PASS_SLOT_SUBMITTING = 2,
+    PASS_SLOT_SUBMITTED = 3,
+    PASS_SLOT_RUNNING = 4,
+    PASS_SLOT_COMPLETING = 5,
+    PASS_SLOT_COMPLETE = 6,
 };
-
-constexpr uint64_t PASS_SLOT_STATE_BITS = 8;
-constexpr uint64_t PASS_SLOT_STATE_MASK =
-    (UINT64_C(1) << PASS_SLOT_STATE_BITS) - 1;
-
-static constexpr uint64_t pass_slot_lease(uint64_t generation,
-                                          uint32_t state) {
-    return (generation << PASS_SLOT_STATE_BITS) | state;
-}
-
-static constexpr uint32_t pass_slot_state(uint64_t lease) {
-    return static_cast<uint32_t>(lease & PASS_SLOT_STATE_MASK);
-}
-
-static constexpr uint64_t pass_slot_generation(uint64_t lease) {
-    return lease >> PASS_SLOT_STATE_BITS;
-}
 
 struct PassSlot;
 struct PassContinuationPermit;
@@ -632,14 +612,6 @@ using PassContinuation = void (*)(PassContinuationPermit *,
 struct alignas(ENGINE_CACHELINE) PassSlot {
     Engine *engine = nullptr;
     uint32_t index = 0;
-    /* Generation and state are one CAS authority. Keeping them in separate
-     * atomics permits a stale owner to validate an old generation and then
-     * transition a newly recycled RESERVED state. */
-    std::atomic<uint64_t> lease{pass_slot_lease(0, PASS_SLOT_FREE)};
-    /* Every successful FREE -> RESERVED transition gets a distinct owner
-     * generation. State alone is not an ownership proof: a stale route can
-     * observe the same physical slot RESERVED by a later continuation. */
-    std::atomic<uint64_t> reservation_sequence{0};
     KcSubmissionV1 submission{};
     KcCompletionV1 completion{};
     int request = REQ_NONE;
@@ -673,6 +645,8 @@ static_assert(alignof(PassSlot) >= ENGINE_CACHELINE,
               "pass-slot lease words require cache-line-aligned elements");
 static_assert(sizeof(PassSlot) % ENGINE_CACHELINE == 0,
               "pass-slot array stride must preserve lease-word isolation");
+using PassSlotPool =
+    kc::SlotPool<PassSlot, PASS_CAPACITY, ENGINE_CACHELINE>;
 
 /* Stack-scoped authority for the exact slot whose CQ record triggered a
  * continuation. The type never crosses a header or the product ABI. Keeping
@@ -685,21 +659,10 @@ struct PassContinuationPermit {
     bool consumed = false;
 };
 
-static uint32_t slot_state(const PassSlot *slot) {
-    return pass_slot_state(slot->lease.load(std::memory_order_acquire));
-}
-
-static uint64_t slot_generation(const PassSlot *slot) {
-    return pass_slot_generation(slot->lease.load(std::memory_order_acquire));
-}
-
+static uint32_t slot_state(const PassSlot *slot);
+static uint64_t slot_generation(const PassSlot *slot);
 static bool transition_slot(PassSlot *slot, uint64_t generation,
-                            uint32_t from, uint32_t to) {
-    uint64_t expected = pass_slot_lease(generation, from);
-    return slot->lease.compare_exchange_strong(
-        expected, pass_slot_lease(generation, to), std::memory_order_acq_rel,
-        std::memory_order_acquire);
-}
+                            uint32_t from, uint32_t to);
 
 struct LfmEngineSnapshotV1 {
     uint32_t size;
@@ -1048,11 +1011,10 @@ struct Engine {
     std::atomic<uint64_t> gang_lease{0};
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
-    std::atomic<bool> route_retire{false};
-    std::atomic<uint32_t> route_publishers{0};
+    kc::AdmissionGate<ROUTE_PUBLISHER_CAPACITY> route_admission;
     LfmKernelBridge *bridge = nullptr;
     AudioRoutePool *route_pool = nullptr;
-    std::array<PassSlot, PASS_CAPACITY> slots;
+    PassSlotPool slots;
     PassSlot *active_slot = nullptr;
     KcSubmissionV1 active_submission{};
     uint32_t bridge_phase = BRIDGE_SERVICE_IDLE;
@@ -1077,8 +1039,6 @@ struct Engine {
     uint64_t supervised_armed_ns = 0;
     uint64_t supervised_hard_budget_ns = 0;
     TeamWorkDescriptor supervised_work{};
-    std::atomic<uint64_t> deadline_sequence{0};
-    std::atomic<uint32_t> deadline_ticket_generation{0};
     std::atomic<uint32_t> fatal_ready{0};
     TeamFatalCapsule fatal_capsule{};
     TeamFatalSink fatal_sink{};
@@ -1087,13 +1047,10 @@ struct Engine {
     // Numerical publishers take a bounded, single-pass lease. Plan mutation
     // closes admission and succeeds only when every already-admitted publisher
     // has retired. No producer retries or waits for exclusivity.
-    std::atomic<bool> pass_closed{false};
-    std::atomic<uint32_t> pass_publishers{0};
+    kc::AdmissionGate<PASS_PUBLISHER_CAPACITY> pass_admission;
     std::atomic<bool> pass_claimed{false};
     std::atomic<int> active_status{0};
-    uint64_t runtime_epoch = 0;
-    std::atomic<uint64_t> submit_sequence{0};
-    std::atomic<uint32_t> ticket_generation{0};
+    kc::TicketSource tickets;
     std::atomic<uint64_t> pass_submissions{0};
     std::atomic<uint64_t> pass_completions{0};
     std::atomic<uint64_t> bridge_dispatches{0};
@@ -1158,6 +1115,25 @@ struct Engine {
     DepthScratch depth_scratch;
 };
 
+static uint32_t slot_state(const PassSlot *slot) {
+    return slot && slot->engine
+        ? slot->engine->slots.state(slot->index)
+        : PASS_SLOT_FREE;
+}
+
+static uint64_t slot_generation(const PassSlot *slot) {
+    return slot && slot->engine
+        ? slot->engine->slots.generation(slot->index)
+        : 0;
+}
+
+static bool transition_slot(PassSlot *slot, uint64_t generation,
+                            uint32_t from, uint32_t to) {
+    if (!slot || !slot->engine) return false;
+    return slot->engine->slots.transition(
+        {.index = slot->index, .generation = generation}, from, to);
+}
+
 static void publish_engine_diagnostics(Engine *engine,
                                        uint64_t activations) {
     if (!engine) return;
@@ -1187,6 +1163,10 @@ static void notify_service(kc_service_notifier_t *notifier) {
     if (!notifier) return;
     const int status = kc_service_notifier_notify(notifier);
     if (status != 0 && status != -ECANCELED) std::abort();
+}
+
+static void notify_admission(void *context) {
+    notify_service(static_cast<kc_service_notifier_t *>(context));
 }
 
 static void resume_bridge(Engine *engine) {
@@ -1223,49 +1203,21 @@ static void update_capacity_high_water(std::atomic<uint32_t> *counter,
 }
 
 static bool enter_pass_admission(Engine *e) {
-    if (e->pass_closed.load(std::memory_order_seq_cst)) return false;
-    /* One bounded RMW claims one publisher lease. A load+single-CAS here
-     * falsely turned ordinary simultaneous publishers into backpressure: both
-     * could observe the same count and one lost only because the other arrived.
-     * fetch_add gives each producer a distinct place without a retry loop. */
-    const uint32_t previous =
-        e->pass_publishers.fetch_add(1, std::memory_order_seq_cst);
-    if (previous >= PASS_PUBLISHER_CAPACITY) {
-        e->pass_publishers.fetch_sub(1, std::memory_order_seq_cst);
-        return false;
-    }
-    if (!e->pass_closed.load(std::memory_order_seq_cst)) return true;
-    e->pass_publishers.fetch_sub(1, std::memory_order_seq_cst);
-    return false;
+    return e && e->pass_admission.enter() == 0;
 }
 
 static void leave_pass_admission(Engine *e) {
-    const uint32_t previous =
-        e->pass_publishers.fetch_sub(1, std::memory_order_seq_cst);
-    if (previous == 0 || previous > PASS_PUBLISHER_CAPACITY) std::abort();
+    if (!e) std::abort();
+    e->pass_admission.leave();
 }
 
 static int enter_route_admission(Engine *e) {
-    if (e->route_retire.load(std::memory_order_seq_cst)) return -ECANCELED;
-    const uint32_t previous =
-        e->route_publishers.fetch_add(1, std::memory_order_seq_cst);
-    if (previous >= ROUTE_PUBLISHER_CAPACITY) {
-        e->route_publishers.fetch_sub(1, std::memory_order_seq_cst);
-        return -EBUSY;
-    }
-    if (!e->route_retire.load(std::memory_order_seq_cst)) return 0;
-    e->route_publishers.fetch_sub(1, std::memory_order_seq_cst);
-    return -ECANCELED;
+    return e ? e->route_admission.enter() : -EINVAL;
 }
 
 static void leave_route_admission(Engine *e) {
-    const uint32_t previous =
-        e->route_publishers.fetch_sub(1, std::memory_order_seq_cst);
-    if (previous == 0 || previous > ROUTE_PUBLISHER_CAPACITY) std::abort();
-    if (previous == 1 &&
-        e->route_retire.load(std::memory_order_seq_cst)) {
-        notify_service(e->route_notifier);
-    }
+    if (!e) std::abort();
+    e->route_admission.leave();
 }
 
 static void clear_slot_request(PassSlot *slot) {
@@ -1297,58 +1249,38 @@ static void clear_slot_request(PassSlot *slot) {
 static PassSlot *reserve_pass_slot(Engine *e) {
     if (!e) return nullptr;
     if (!enter_pass_admission(e)) return nullptr;
-    for (PassSlot &slot : e->slots) {
-        uint64_t expected = pass_slot_lease(0, PASS_SLOT_FREE);
-        if (!slot.lease.compare_exchange_strong(
-                expected, pass_slot_lease(0, PASS_SLOT_CLAIMING),
-                std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            continue;
-        }
-        constexpr uint64_t max_generation =
-            UINT64_MAX >> PASS_SLOT_STATE_BITS;
-        uint64_t generation =
-            (slot.reservation_sequence.fetch_add(1,
-                                                 std::memory_order_acq_rel) +
-             1) & max_generation;
-        if (generation == 0) {
-            generation =
-                slot.reservation_sequence.fetch_add(1,
-                                                    std::memory_order_acq_rel) + 1;
-            generation &= max_generation;
-        }
-        if (generation == 0) std::abort();
-        clear_slot_request(&slot);
-        /* CLAIMING is deliberately non-releasable. A stale owner cannot see a
-         * recycled RESERVED state until the new generation is published. */
-        slot.lease.store(pass_slot_lease(generation, PASS_SLOT_RESERVED),
-                         std::memory_order_release);
-        const uint32_t live =
-            e->pass_slots_live.fetch_add(1, std::memory_order_acq_rel) + 1;
-        update_slot_high_water(e, live);
-        return &slot;
+    const PassSlotPool::Lease lease = e->slots.acquire(
+        PASS_SLOT_RESERVED,
+        [](PassSlot &slot, uint32_t) { clear_slot_request(&slot); });
+    if (!lease) {
+        leave_pass_admission(e);
+        return nullptr;
     }
-    leave_pass_admission(e);
-    return nullptr;
+    PassSlot *slot = e->slots.get(lease);
+    if (!slot) std::abort();
+    const uint32_t live =
+        e->pass_slots_live.fetch_add(1, std::memory_order_acq_rel) + 1;
+    update_slot_high_water(e, live);
+    return slot;
 }
 
 static bool release_pass_slot(PassSlot *slot, uint64_t generation) {
     if (!slot || generation == 0) return false;
     Engine *e = slot->engine;
-    if (!transition_slot(slot, generation, PASS_SLOT_RESERVED,
-                         PASS_SLOT_RELEASING) &&
-        !transition_slot(slot, generation, PASS_SLOT_COMPLETE,
-                         PASS_SLOT_RELEASING)) {
+    const PassSlotPool::Lease lease = {
+        .index = slot->index,
+        .generation = generation,
+    };
+    if (!e->slots.begin_release(lease, PASS_SLOT_RESERVED) &&
+        !e->slots.begin_release(lease, PASS_SLOT_COMPLETE)) {
         return false;
     }
     clear_slot_request(slot);
     e->pass_slots_live.fetch_sub(1, std::memory_order_acq_rel);
+    /* FREE is published only after the old record and live accounting retire.
+     * Admission release then publishes the correlated capacity edge. */
+    e->slots.finish_release(lease);
     leave_pass_admission(e);
-    /* FREE is the final publication edge. Publishing it before the accounting
-     * decrements lets a recycler increment live 2 -> 3 on a two-slot engine. */
-    slot->lease.store(pass_slot_lease(0, PASS_SLOT_FREE),
-                      std::memory_order_release);
-    notify_service(e->route_notifier);
     return true;
 }
 
@@ -1445,24 +1377,19 @@ class PlanClaim {
                             std::memory_order_acquire)) {
             return;
         }
-        engine_->pass_closed.store(true, std::memory_order_seq_cst);
-        held_ = engine_->pass_publishers.load(std::memory_order_seq_cst) == 0;
+        held_ = engine_->pass_admission.try_seal() == 0;
         if (!held_) {
-            engine_->pass_closed.store(false, std::memory_order_seq_cst);
             engine_->pass_claimed.store(false, std::memory_order_release);
-            /* Reopening admission is the causal successor for a READY route
-             * that lost its one-shot claim while this control edge crossed. */
-            notify_service(engine_->route_notifier);
         }
     }
 
     ~PlanClaim() {
         if (!held_) return;
-        if (engine_->pass_publishers.load(std::memory_order_seq_cst) != 0)
+        if (engine_->pass_admission.active() != 0)
             std::abort();
-        engine_->pass_closed.store(false, std::memory_order_seq_cst);
         engine_->pass_claimed.store(false, std::memory_order_release);
-        notify_service(engine_->route_notifier);
+        const int status = engine_->pass_admission.unseal();
+        if (status != 0 && status != -ECANCELED) std::abort();
     }
 
     explicit operator bool() const { return held_; }
@@ -4125,12 +4052,9 @@ static void lane_member(void *context, uint32_t lane, uint32_t members,
 }
 
 static bool ticket_equal(const KcTicketIdV1 &a, const KcTicketIdV1 &b) {
-    return a.runtime_epoch == b.runtime_epoch && a.sequence == b.sequence &&
-           a.generation == b.generation && a.kind == b.kind;
+    return kc::ticket_equal(a, b);
 }
 
-static uint64_t next_sequence(std::atomic<uint64_t> *counter);
-static uint32_t next_generation(std::atomic<uint32_t> *counter);
 static void bridge_team_complete(void *context, uint64_t generation);
 static void process_team_completion(Engine *e, uint64_t generation);
 
@@ -4288,7 +4212,7 @@ static bool deadline_event_matches(const Engine *e,
            event.team_generation == e->supervised_team_generation &&
            event.scope_generation == e->supervised_scope_generation &&
            event.epoch == submission.epoch &&
-           event.domain == e->runtime_epoch &&
+           event.domain == e->tickets.epoch() &&
            ticket_equal(event.child, e->supervised_deadline) &&
            ticket_equal(event.parent, submission.ticket) &&
            submission.parent.runtime_epoch != 0 &&
@@ -4405,12 +4329,8 @@ static void begin_team_supervision(Engine *e, uint64_t generation) {
         e->supervised_armed_ns = 0;
         return;
     }
-    const KcTicketIdV1 child = {
-        .runtime_epoch = e->runtime_epoch,
-        .sequence = next_sequence(&e->deadline_sequence),
-        .generation = next_generation(&e->deadline_ticket_generation),
-        .kind = KC_TICKET_KIND_DEADLINE,
-    };
+    const KcTicketIdV1 child =
+        e->tickets.mint(KC_TICKET_KIND_DEADLINE);
     /* Publish every identity field before arming. If this control callback is
      * descheduled for the whole hard budget immediately after the native timer
      * is armed, its expiry still observes a complete pointer-free correlation
@@ -4424,7 +4344,7 @@ static void begin_team_supervision(Engine *e, uint64_t generation) {
         .parent = e->active_submission.ticket,
         .scope_generation = e->bridge_slot_owner,
         .epoch = e->active_submission.epoch,
-        .domain = e->runtime_epoch,
+        .domain = e->tickets.epoch(),
         .team_generation = generation,
     };
     kc_deadline_arm arm = {};
@@ -4676,8 +4596,10 @@ static bool bridge_step_once(Engine *e) {
         PassContinuation continuation = slot->continuation;
         void *continuation_context = slot->continuation_context;
         clear_slot_request(slot);
-        slot->lease.store(pass_slot_lease(slot_owner, PASS_SLOT_RESERVED),
-                          std::memory_order_release);
+        if (!transition_slot(slot, slot_owner, PASS_SLOT_COMPLETING,
+                             PASS_SLOT_RESERVED)) {
+            std::abort();
+        }
         PassContinuationPermit permit = {
             .engine = e,
             .slot = slot,
@@ -4718,7 +4640,7 @@ static bool bridge_step_once(Engine *e) {
     if (status != 0) std::abort();
 
     PassSlot *slot = submission.descriptor.slot < e->slots.size()
-        ? &e->slots[submission.descriptor.slot]
+        ? &e->slots.record(submission.descriptor.slot)
         : nullptr;
     const uint64_t slot_owner = slot ? slot_generation(slot) : 0;
     bool valid = slot && slot_state(slot) == PASS_SLOT_SUBMITTED;
@@ -4727,7 +4649,7 @@ static bool bridge_step_once(Engine *e) {
                 submission.command == KC_COORD_COMMAND_RUN_PASS &&
                 submission.pass_budget == 1 && submission.flags == 0 &&
                 submission.ticket.kind == KC_COORD_TICKET_PASS &&
-                submission.parent.runtime_epoch == e->runtime_epoch &&
+                submission.parent.runtime_epoch == e->tickets.epoch() &&
                 submission.parent.sequence != 0 &&
                 submission.parent.generation != 0 &&
                 submission.parent.kind == KC_COORD_TICKET_WORKFLOW &&
@@ -4855,22 +4777,6 @@ static void *bridge_continuation_step(koro_cont_t *continuation) {
     KORO_END(continuation);
 }
 
-static uint64_t next_sequence(std::atomic<uint64_t> *counter) {
-    uint64_t sequence = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
-    if (sequence == 0)
-        sequence = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
-    if (sequence == 0) std::abort();
-    return sequence;
-}
-
-static uint32_t next_generation(std::atomic<uint32_t> *counter) {
-    uint32_t generation = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
-    if (generation == 0)
-        generation = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
-    if (generation == 0) std::abort();
-    return generation;
-}
-
 static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
                        int request, uint64_t context_id,
                        const KcTicketIdV1 &parent,
@@ -4878,11 +4784,11 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
                        void *continuation_context) {
     if (!e || !slot || slot->engine != e ||
         !request_kind_valid(static_cast<uint32_t>(request)) || generation == 0 ||
-        !continuation || parent.runtime_epoch != e->runtime_epoch ||
+        !continuation || parent.runtime_epoch != e->tickets.epoch() ||
         parent.sequence == 0 || parent.generation == 0 ||
         parent.kind != KC_COORD_TICKET_WORKFLOW ||
-        slot->lease.load(std::memory_order_acquire) !=
-            pass_slot_lease(generation, PASS_SLOT_RESERVED)) {
+        slot_state(slot) != PASS_SLOT_RESERVED ||
+        slot_generation(slot) != generation) {
         return -EINVAL;
     }
     if (!transition_slot(slot, generation, PASS_SLOT_RESERVED,
@@ -4890,16 +4796,12 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
         return -ESTALE;
     }
 
-    const uint64_t sequence = next_sequence(&e->submit_sequence);
-    const uint32_t ticket_generation = next_generation(&e->ticket_generation);
+    const kc_ticket_id ticket = e->tickets.mint(KC_COORD_TICKET_PASS);
 
     KcSubmissionV1 submission{};
     submission.size = sizeof(submission);
     submission.abi_version = KC_COORD_ABI_VERSION;
-    submission.ticket.runtime_epoch = e->runtime_epoch;
-    submission.ticket.sequence = sequence;
-    submission.ticket.generation = ticket_generation;
-    submission.ticket.kind = KC_COORD_TICKET_PASS;
+    submission.ticket = ticket;
     submission.parent = parent;
     submission.conversation_id = context_id;
     submission.epoch = context_id == 0 ? 1 : context_id;
@@ -4908,7 +4810,7 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
     // exact ticket, while the slot lease guards the numerical payload.
     submission.descriptor = {
         .slot = slot->index,
-        .generation = ticket_generation,
+        .generation = ticket.generation,
     };
     submission.command = KC_COORD_COMMAND_RUN_PASS;
     submission.service_class = KC_COORD_SERVICE_INTERACTIVE;
@@ -4925,23 +4827,22 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
     slot->submission = submission;
     // This is the publication edge for every typed request field and its exact
     // ticket locator. The SQ consumer acquires this state before reading them.
-    slot->lease.store(pass_slot_lease(generation, PASS_SLOT_SUBMITTED),
-                      std::memory_order_release);
+    if (!transition_slot(slot, generation, PASS_SLOT_SUBMITTING,
+                         PASS_SLOT_SUBMITTED)) {
+        std::abort();
+    }
     const int rc = lfm_kernel_bridge_submit(e->bridge, &submission);
     if (rc != 0) {
-        slot->lease.store(pass_slot_lease(generation, PASS_SLOT_RESERVED),
-                          std::memory_order_release);
+        if (!transition_slot(slot, generation, PASS_SLOT_SUBMITTED,
+                             PASS_SLOT_RESERVED)) {
+            std::abort();
+        }
     }
     /* SQ/CQ are authoritative; this coalesced edge only resumes the retained
      * consumer. Notify after both success and failure so a stop racing the
      * final admitted producer can observe that admission has settled. */
     resume_bridge(e);
     if (rc != 0) {
-        if (slot_state(slot) == PASS_SLOT_SUBMITTING) {
-            slot->lease.store(pass_slot_lease(generation,
-                                              PASS_SLOT_RESERVED),
-                              std::memory_order_release);
-        }
         return rc;
     }
     e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
@@ -5189,7 +5090,7 @@ static void continue_audio_route(PassContinuationPermit *permit,
         }
     }
     if (completion.status == 0 &&
-        route->engine->route_retire.load(std::memory_order_acquire)) {
+        route->engine->route_admission.stopped()) {
         finish_audio_route(permit, route, -ECANCELED);
         return;
     }
@@ -5245,7 +5146,7 @@ static void continue_audio_route(PassContinuationPermit *permit,
 static AudioRouteInstance *claim_audio_route(Engine *engine,
                                              uint64_t *generation) {
     if (!engine || !generation ||
-        engine->route_retire.load(std::memory_order_acquire) ||
+        engine->route_admission.stopped() ||
         !enter_pass_admission(engine)) {
         return nullptr;
     }
@@ -5262,12 +5163,8 @@ static AudioRouteInstance *claim_audio_route(Engine *engine,
             next = route.generation.fetch_add(
                        1, std::memory_order_acq_rel) + 1;
         }
-        route.ticket = {
-            .runtime_epoch = engine->runtime_epoch,
-            .sequence = next_sequence(&engine->submit_sequence),
-            .generation = next_generation(&engine->ticket_generation),
-            .kind = KC_COORD_TICKET_WORKFLOW,
-        };
+        route.ticket =
+            engine->tickets.mint(KC_COORD_TICKET_WORKFLOW);
         *generation = next;
         return &route;
     }
@@ -5461,8 +5358,8 @@ static void audio_route_service_main(void *context) {
     engine->diagnostics.route_callbacks.fetch_add(
         1, std::memory_order_relaxed);
     AudioRoutePool *pool = engine->route_pool;
-    if (engine->route_retire.load(std::memory_order_acquire)) {
-        if (engine->route_publishers.load(std::memory_order_seq_cst) != 0) {
+    if (engine->route_admission.stopped()) {
+        if (engine->route_admission.active() != 0) {
             return;
         }
         for (AudioRouteInstance &route : pool->routes) {
@@ -5564,11 +5461,9 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     if (!e) return nullptr;
     e->manual_deadlines = manual_deadlines;
     if (fault) e->hard_timeout_probe = true;
-    e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
-    if (e->runtime_epoch == 0)
-        e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
     const int fatal_status = fatal_sink_create(
-        &e->fatal_sink, e->runtime_epoch, fault ? fault->fatal_path : nullptr);
+        &e->fatal_sink, e->tickets.epoch(),
+        fault ? fault->fatal_path : nullptr);
     if (fatal_status != 0) {
         if (out_status) *out_status = fatal_status;
         delete e;
@@ -5587,7 +5482,7 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         route.engine = e;
     }
     for (size_t index = 0; index < e->slots.size(); ++index) {
-        PassSlot &slot = e->slots[index];
+        PassSlot &slot = e->slots.record(index);
         slot.engine = e;
         slot.index = (uint32_t)index;
     }
@@ -5667,6 +5562,8 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         lfm_engine_free(e);
         return nullptr;
     }
+    e->pass_admission.bind(notify_admission, e->route_notifier);
+    e->route_admission.bind(notify_admission, e->route_notifier);
     const kc_deadline_source_config deadline_config = {
         .capacity = 1,
         .notify = deadline_supervisor_notify,
@@ -5727,7 +5624,7 @@ int lfm_internal_engine_trigger_hard_timeout_probe_for_test(void *ep) {
         e->team_terminal.load(std::memory_order_acquire) != 0) {
         return -EINVAL;
     }
-    PassSlot &slot = e->slots[0];
+    PassSlot &slot = e->slots.record(0);
     /* AUDIO_ENCODE/DONE is a valid closed-protocol request whose peers only
      * publish -EPROTO; it touches no model, PCM, or scratch view. The selected
      * member alone owns the injected liveness fault. */
@@ -5741,13 +5638,13 @@ int lfm_internal_engine_trigger_hard_timeout_probe_for_test(void *ep) {
         .size = sizeof(KcSubmissionV1),
         .abi_version = KC_COORD_ABI_VERSION,
         .ticket = {
-            .runtime_epoch = e->runtime_epoch,
+            .runtime_epoch = e->tickets.epoch(),
             .sequence = 2,
             .generation = 1,
             .kind = KC_COORD_TICKET_PASS,
         },
         .parent = {
-            .runtime_epoch = e->runtime_epoch,
+            .runtime_epoch = e->tickets.epoch(),
             .sequence = 1,
             .generation = 1,
             .kind = KC_COORD_TICKET_WORKFLOW,
@@ -5765,7 +5662,7 @@ int lfm_internal_engine_trigger_hard_timeout_probe_for_test(void *ep) {
 void lfm_engine_request_stop(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
-    e->route_retire.store(true, std::memory_order_seq_cst);
+    e->route_admission.stop();
     if (e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
     if (!e->team_deadlines && e->supervisor_service)
         kc_service_request_stop(e->supervisor_service);
@@ -6369,7 +6266,8 @@ int lfm_engine_depth_build(void *ep, const LfmDepthPlanV1 *plan, uint64_t *out_i
         const auto grow = [](auto &values, size_t count) {
             if (values.size() < count) values.resize(count);
         };
-        for (PassSlot &slot : e->slots) {
+        for (size_t index = 0; index < e->slots.size(); ++index) {
+            PassSlot &slot = e->slots.record(index);
             DepthScratch &scratch = slot.scratch.depth;
             grow(scratch.x, dim);
             grow(scratch.h, dim);
@@ -6871,7 +6769,8 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
         const auto grow = [](auto &values, size_t count) {
             if (values.size() < count) values.resize(count);
         };
-        for (PassSlot &slot : e->slots) {
+        for (size_t index = 0; index < e->slots.size(); ++index) {
+            PassSlot &slot = e->slots.record(index);
             ScratchBank &scratch = slot.scratch;
             grow(scratch.sc_partials, MAX_WORKERS);
             grow(scratch.sc_xn, h);
@@ -6932,7 +6831,8 @@ int lfm_ctx_set_heads(void *ep, uint64_t id, const uint8_t *embed_w,
          audio_embed_len < audio_rows * model->h))
         return -1;
     try {
-        for (PassSlot &slot : e->slots) {
+        for (size_t index = 0; index < e->slots.size(); ++index) {
+            PassSlot &slot = e->slots.record(index);
             if (slot.scratch.tk_logf.size() < vocab)
                 slot.scratch.tk_logf.resize(vocab);
             if (slot.scratch.sample_weights.size() < vocab)

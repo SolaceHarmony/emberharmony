@@ -4,7 +4,8 @@
 resident runtime, retained services, and fixed numerical teams. Computational
 progress comes only from publication: a producer edge, a completed fixed-team
 generation, released capacity, cancellation, or control. Exact product tickets
-and borrowed byte views live in Flashkern; kcoro does not duplicate them.
+and fixed coordination storage live in kcoro; numerical buffer views live in
+Flashkern and are never copied into the coordination layer.
 
 There are no channels, actors, work stealing, process-global runtimes, sleeps,
 interval-timer progress, WALs, workflows, or transport pumps in this production
@@ -52,6 +53,8 @@ producer callback
 ## Source map
 
 - `include/kcoro_arena.h`: canonical narrow C surface
+- `include/kc_coordination.hpp`: unversioned C++23 ticket, admission, and
+  generation-lease primitives
 - `core/src/kc_runtime.c`: bounded ready board, worker lifecycle, and callback delivery
 - `core/src/kcoro_stackless.c`: saved program counter/frame and exact-ticket resume
 - `core/src/kc_service.c`: retained stackless services and realtime edges
@@ -80,6 +83,9 @@ migration between eligible workers; one fixed OS-worker population with no
 per-operation threads; notify-during-execution handoff without a lost edge;
 sub-percent idle-worker CPU before and after work; and four logical team
 members completing one exact quorum generation over two physical workers.
+They also prove bounded admission publication, permanent-stop precedence over
+temporary sealing, unique canonical ticket minting, and stale fixed-slot lease
+rejection.
 Rust bindings are not the authority for the native kernel.
 
 ## License
