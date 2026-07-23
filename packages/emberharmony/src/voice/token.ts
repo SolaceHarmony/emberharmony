@@ -4,7 +4,6 @@ import z from "zod"
 import { NamedError } from "@thesolaceproject/emberharmony-util/error"
 import { Auth } from "../auth"
 import { Config } from "../config/config"
-import { Flag } from "../flag/flag"
 import { Log } from "../util/log"
 import { VoiceRegistry } from "./registry"
 import { VOICE_AGENT_NAME } from "./constants"
@@ -30,28 +29,23 @@ export namespace Voice {
     available: boolean
   }
 
-  /**
-   * Effective voice settings: config + credential store first, environment
-   * variables (EMBERHARMONY_LIVEKIT_* / LIVEKIT_* / EMBERHARMONY_VOICE_*) as
-   * fallback for CI and the standalone worker. Pass `override` to resolve
-   * against a just-written voice config instead of the instance cache.
-   */
+  /** Resolve only persisted configuration and the credential store. */
   export async function settings(override?: Config.Voice): Promise<Settings> {
     const voice: Config.Voice = override ?? (await Config.get()).voice ?? {}
     const auth = await Auth.get(AUTH_PROVIDER_ID)
     const credentials = auth?.type === "api" ? auth : undefined
-    const url = voice.livekit?.url ?? Flag.EMBERHARMONY_LIVEKIT_URL
-    const apiKey = credentials?.key ?? Flag.EMBERHARMONY_LIVEKIT_API_KEY
-    const apiSecret = credentials?.secret ?? Flag.EMBERHARMONY_LIVEKIT_API_SECRET
-    const disabled = voice.disabled ?? Flag.EMBERHARMONY_VOICE_DISABLE
+    const url = voice.livekit?.url
+    const apiKey = credentials?.key
+    const apiSecret = credentials?.secret
+    const disabled = voice.disabled ?? false
     return {
       disabled,
       url,
       apiKey,
       apiSecret,
-      stt: voice.stt ?? process.env["EMBERHARMONY_VOICE_STT_MODEL"] ?? VoiceRegistry.DEFAULT_STT,
-      tts: voice.tts ?? process.env["EMBERHARMONY_VOICE_TTS_MODEL"] ?? VoiceRegistry.DEFAULT_TTS,
-      intent: voice.intent ?? process.env["EMBERHARMONY_VOICE_INTENT_MODEL"] ?? VoiceRegistry.DEFAULT_INTENT,
+      stt: voice.stt ?? VoiceRegistry.DEFAULT_STT,
+      tts: voice.tts ?? VoiceRegistry.DEFAULT_TTS,
+      intent: voice.intent ?? VoiceRegistry.DEFAULT_INTENT,
       available: Boolean(!disabled && url && apiKey && apiSecret),
     }
   }

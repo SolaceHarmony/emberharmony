@@ -18,7 +18,6 @@
 extern "C" {
 #endif
 
-#define LFM_SESAME_DETECTOR_ABI 1u
 #define LFM_SESAME_FFT_SIZE 256u
 #define LFM_SESAME_MIC_THRESHOLD 50u
 #define LFM_SESAME_PLAYBACK_THRESHOLD 10u
@@ -31,30 +30,28 @@ typedef struct LfmSesameDetector LfmSesameDetector;
 /* A circular capture window is at most two physical spans. The descriptor is
  * stack metadata only: both pointers remain borrowed and the assembly leaf
  * consumes exactly 256 logical samples in first-then-second order. */
-typedef struct LfmSesameWindowV1 {
+typedef struct LfmSesameWindow {
     const float *first;
     size_t first_count;
     const float *second;
     size_t second_count;
-} LfmSesameWindowV1;
+} LfmSesameWindow;
 
 /* One borrowed fragment of a logical analyser window. Descriptors are stack
  * metadata only; samples remain in their owning capture/playback buffers. */
-typedef struct LfmSesameSpanV1 {
+typedef struct LfmSesameSpan {
     const float *samples;
     size_t count;
-} LfmSesameSpanV1;
+} LfmSesameSpan;
 
 /* An ordered scatter view of exactly 256 logical mono samples. The detector
  * accepts at most 256 nonempty spans and never flattens them. */
-typedef struct LfmSesameScatterWindowV1 {
-    const LfmSesameSpanV1 *spans;
+typedef struct LfmSesameScatterWindow {
+    const LfmSesameSpan *spans;
     size_t span_count;
-} LfmSesameScatterWindowV1;
+} LfmSesameScatterWindow;
 
-typedef struct LfmSesameDecisionV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmSesameDecision {
     uint32_t sample_rate;
     uint32_t stream;
     uint32_t first_bin;
@@ -62,12 +59,10 @@ typedef struct LfmSesameDecisionV1 {
     uint32_t selected_bins;
     uint32_t threshold;
     uint32_t voice;
-    uint32_t reserved0;
     double score;
     uint32_t adaptive_min;
     uint32_t adaptive_max;
-    uint64_t reserved[4];
-} LfmSesameDecisionV1;
+} LfmSesameDecision;
 
 // Build one immutable 256-point selected-DFT plan and two independent stream
 // states. sample_rate must leave the complete [600, 2400) Hz band inside the
@@ -98,30 +93,30 @@ lfm_sesame_detector_derived_bytes(const LfmSesameDetector *detector);
 LFM_INTERNAL_API int lfm_sesame_detector_process(
     LfmSesameDetector *detector, uint32_t stream, const float *latest_256,
     uint8_t *selected_bytes, size_t selected_capacity,
-    LfmSesameDecisionV1 *decision);
+    LfmSesameDecision *decision);
 
 /* Consume the same logical 256-sample window from one or two borrowed spans.
  * This is the circular-arena entry point; it never materializes a contiguous
  * window. A one-span view reaches the original SIMD leaf unchanged. */
 LFM_INTERNAL_API int lfm_sesame_detector_process_window(
     LfmSesameDetector *detector, uint32_t stream,
-    const LfmSesameWindowV1 *window, uint8_t *selected_bytes,
-    size_t selected_capacity, LfmSesameDecisionV1 *decision);
+    const LfmSesameWindow *window, uint8_t *selected_bytes,
+    size_t selected_capacity, LfmSesameDecision *decision);
 
 /* Consume an arbitrary-span logical window. One- and two-span inputs retain
  * the existing contiguous/circular fast leaves; fragmented inputs are read
  * directly from the descriptor sequence by the architecture assembly leaf. */
 LFM_INTERNAL_API int lfm_sesame_detector_process_scatter_window(
     LfmSesameDetector *detector, uint32_t stream,
-    const LfmSesameScatterWindowV1 *window, uint8_t *selected_bytes,
-    size_t selected_capacity, LfmSesameDecisionV1 *decision);
+    const LfmSesameScatterWindow *window, uint8_t *selected_bytes,
+    size_t selected_capacity, LfmSesameDecision *decision);
 
 // Feed already-quantized selected-bin evidence through the same sticky
 // adaptive classifier. This is used by browser-trace conformance and permits
-// direct state-machine tests without duplicating classifier logic in Rust.
+// direct state-machine tests without duplicating classifier logic.
 LFM_INTERNAL_API int lfm_sesame_detector_classify_bytes(
     LfmSesameDetector *detector, uint32_t stream, const uint8_t *bytes,
-    size_t count, LfmSesameDecisionV1 *decision);
+    size_t count, LfmSesameDecision *decision);
 
 #ifdef __cplusplus
 }

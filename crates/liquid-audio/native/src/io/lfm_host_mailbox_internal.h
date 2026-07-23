@@ -22,12 +22,12 @@ constexpr uint32_t kClientRetiring = 4;
 constexpr uint32_t kClientDead = 5;
 constexpr uint32_t kClientActivating = 6;
 constexpr uint32_t kMailboxEvicted = 1u << 0;
-constexpr uint8_t kMailboxMagic[8] = {'L', 'F', 'M', 'H', 'O', 'S', 'T', '1'};
+constexpr uint8_t kMailboxMagic[8] = {'L', 'F', 'M', 'H', 'O', 'S', 'T', 0};
 
 struct alignas(kCacheLine) Cursor {
     uint64_t value{0};
     uint64_t generation{0};
-    uint8_t reserved[112]{};
+    uint8_t padding[112]{};
 };
 static_assert(sizeof(Cursor) == kCacheLine);
 
@@ -41,7 +41,7 @@ struct alignas(kCacheLine) CompletionCell {
     uint64_t sequence{0};
     HostCompletion record{};
 };
-static_assert(sizeof(CompletionCell) == kCacheLine * 2);
+static_assert(sizeof(CompletionCell) == kCacheLine);
 
 struct alignas(kCacheLine) ClientControl {
     uint32_t state{0};
@@ -54,14 +54,12 @@ struct alignas(kCacheLine) ClientControl {
     uint64_t active_lease_generation{0};
     uint32_t lease_count{0};
     uint32_t registered{0};
-    uint64_t reserved[8]{};
+    uint64_t padding[8]{};
 };
 static_assert(sizeof(ClientControl) == kCacheLine);
 
 struct alignas(kCacheLine) MailboxHeader {
     uint8_t magic[8]{};
-    uint32_t size{0};
-    uint32_t layout_version{0};
     uint32_t state{0};
     uint32_t client_capacity{0};
     uint32_t ring_capacity{0};
@@ -76,7 +74,7 @@ struct alignas(kCacheLine) MailboxHeader {
     uint64_t active_clients{0};
     uint64_t active_leases{0};
     uint64_t client_events{0};
-    uint64_t reserved[12]{};
+    uint64_t padding[13]{};
 };
 static_assert(sizeof(MailboxHeader) == 256);
 

@@ -2,46 +2,39 @@
 
 Native LFM2.5-Audio engine used by the desktop voice stack. Native
 C++/kcoro/Flashkern and architecture kernels own the model image, inference,
-turn policy, CoreAudio callbacks, and PCM docks. Rust exposes opaque lifecycle,
-control, and bounded observation only. The former Rust/Candle LFM2 model and its
-callable oracle surface were deleted after native ownership landed.
+turn policy, CoreAudio callbacks, and PCM docks. The Rust crate contains desktop
+control records and checkpoint download support only; it has no native linkage
+or inference entry point.
 
 - Detailed architecture docs: `docs/`.
 - Native C/C++ sources: `native/`.
-- Public Rust API: `src/lib.rs`.
-- Tauri integration: `packages/desktop/src-tauri` depends on this crate by path.
+- Desktop Rust support: `src/lib.rs`.
+- Tauri UI/control integration: `packages/desktop/src-tauri`.
 
 Run from the repo root:
 
 ```sh
-cargo test -p liquid-audio --lib -- --nocapture
-cargo test -p liquid-audio --tests -- --test-threads=1
+cmake -S crates/kcoro-sys/vendor/kcoro_arena -B build/kcoro
+cmake --build build/kcoro
+ctest --test-dir build/kcoro
+make -C crates/liquid-audio/native/tools
 ```
 
-The complete native two-agent, memory-only speech gate is explicit because it
-opens the real checkpoint:
+The slow two-agent speech test is a native release-acceptance executable. It
+receives the checkpoint and output mode as ordinary arguments; no environment
+variable changes its implementation:
 
 ```sh
-LFM_MODEL_DIR=/absolute/LFM2.5-Audio-1.5B \
-  cargo test -p liquid-audio --test native_speech_to_speech \
-  -- --ignored --nocapture --test-threads=1
+crates/liquid-audio/native/tools/build/lfm-native-speech-test \
+  /absolute/LFM2.5-Audio-1.5B 8 silent
 ```
 
-Set `LFM_SPEECH_GATE_AUDIBLE=1` to prebuffer the first deterministic exchange
-and play it through the default CoreAudio speaker. Use
-`LFM_SPEECH_GATE_AUDIBLE=stream` to exercise live generation cadence and report
-hardware-buffer underruns. Both monitors are native, bounded, callback driven,
-and read the same in-memory PCM blocks without creating an audio file.
+Use `buffered` or `stream` in place of `silent` only for deliberate audible
+acceptance. All modes consume the same in-memory native PCM leases.
 
 On Apple Silicon, cross-build the Darwin x86_64 suites and let macOS execute
 the test binaries through Rosetta directly:
 
-```sh
-cargo test -p kcoro-sys -p liquid-audio \
-  --target x86_64-apple-darwin -- --test-threads=1
-```
-
-Feature-gated SIMD tests skip when Rosetta does not expose the required ISA;
-x86 compilation, linking, scalar assembly ABI, scheduler, and dispatch checks
-still run. Actual AVX2/AVX-512 instruction correctness requires a native x86
-runner that advertises those features.
+Configure the same CMake projects with
+`-DCMAKE_OSX_ARCHITECTURES=x86_64` for the Rosetta build. Unsupported
+instruction sets fail readiness; no scalar inference substitute is selected.

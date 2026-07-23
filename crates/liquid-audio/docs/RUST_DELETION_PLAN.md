@@ -253,26 +253,22 @@ offline/oracle-only and cannot serve as fallback.
   vocabulary/codebook mismatch.
 - `cargo check -p liquid-audio --no-default-features` passes. The default feature
   declaration does not enable Candle or Moshi.
-- The real-checkpoint `LFM_MODEL_DIR` gate is intentionally explicit. It checks
-  one complete main+detokenizer lifecycle image and
-  `compatibility_copied_bytes == 0`; reviews must not report it as run when the
-  checkpoint is unavailable.
+- The native real-checkpoint executable receives its checkpoint path as an
+  explicit argument. No environment variable selects a loader or inference
+  path.
 - Stop, interruption, reliable-event saturation, capture/playback backpressure,
   stale generations, callback failure, and exact join/release behavior have
   implementation-backed tests. No ignored test is silently counted as green.
 
-## Current default Rust surface
+## Current Rust surface
 
 ```text
 src/
-  lib.rs                    native-only exports
-  ffi.rs                    private opaque native declarations
-  native_voice.rs           RAII lifecycle + opaque callback endpoints/events
-  voice_api.rs              product VoiceEngine/VoiceEvent boundary
-  runtime/voice_runtime.rs  opaque native service/platform handles, control/telemetry
+  lib.rs                    desktop control/download exports
+  control.rs                bounded UI telemetry records
   utils.rs                  model location/download helpers
 ```
 
-`src/model/**`, processor/training code, direct numerical Rust rims, Candle, and
-Moshi are absent from the workspace model path. Git history is the reference
-for deleted Rust ownership, not an alternate inference or training runtime.
+The crate has no native linkage and owns no model, session, PCM, checkpoint
+interpretation, scheduler, or numerical operation. Git history is the
+reference for deleted Rust ownership, not an alternate runtime.

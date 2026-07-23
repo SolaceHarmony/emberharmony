@@ -20,11 +20,11 @@ extern "C" void lfm_sesame_selected_magnitudes(
     const float *pcm, const float *real_table, const float *imag_table,
     float *smoothed_magnitudes, size_t selected_bins);
 extern "C" void lfm_sesame_selected_magnitudes_window(
-    const LfmSesameWindowV1 *window, const float *real_table,
+    const LfmSesameWindow *window, const float *real_table,
     const float *imag_table, float *smoothed_magnitudes,
     size_t selected_bins);
 extern "C" void lfm_sesame_selected_magnitudes_scatter(
-    const LfmSesameScatterWindowV1 *window, const float *real_table,
+    const LfmSesameScatterWindow *window, const float *real_table,
     const float *imag_table, float *smoothed_magnitudes,
     size_t selected_bins);
 extern "C" void lfm_sesame_magnitudes_to_bytes(
@@ -85,10 +85,8 @@ StreamState *state_for(LfmSesameDetector *detector, uint32_t stream) {
 
 void fill_decision(const LfmSesameDetector &detector, uint32_t stream,
                    const StreamState &state, double score, uint32_t voice,
-                   LfmSesameDecisionV1 *decision) {
+                   LfmSesameDecision *decision) {
     *decision = {};
-    decision->size = sizeof(*decision);
-    decision->abi_version = LFM_SESAME_DETECTOR_ABI;
     decision->sample_rate = detector.sample_rate;
     decision->stream = stream;
     decision->first_bin = detector.first_bin;
@@ -103,7 +101,7 @@ void fill_decision(const LfmSesameDetector &detector, uint32_t stream,
 
 int classify(LfmSesameDetector *detector, uint32_t stream,
              const uint8_t *bytes, size_t count,
-             LfmSesameDecisionV1 *decision) {
+             LfmSesameDecision *decision) {
     StreamState *state = state_for(detector, stream);
     if (!state || !bytes || count == 0 || count > kFrequencyBins || !decision) {
         return -EINVAL;
@@ -120,7 +118,7 @@ int classify(LfmSesameDetector *detector, uint32_t stream,
 bool destination_valid(const LfmSesameDetector *detector,
                        const uint8_t *selected_bytes,
                        size_t selected_capacity,
-                       const LfmSesameDecisionV1 *decision) {
+                       const LfmSesameDecision *decision) {
     return detector && decision &&
            ((selected_bytes && selected_capacity >= detector->bins) ||
             (!selected_bytes && selected_capacity == 0));
@@ -128,7 +126,7 @@ bool destination_valid(const LfmSesameDetector *detector,
 
 int finish_process(LfmSesameDetector *detector, uint32_t stream,
                    StreamState *state, uint8_t *selected_bytes,
-                   LfmSesameDecisionV1 *decision) {
+                   LfmSesameDecision *decision) {
     std::array<uint8_t, kFrequencyBins> evidence{};
     lfm_sesame_magnitudes_to_bytes(
         state->magnitude.get(), detector->byte_thresholds.get(),
@@ -273,8 +271,8 @@ lfm_sesame_detector_derived_bytes(const LfmSesameDetector *detector) {
 extern "C" int lfm_sesame_detector_process(
     LfmSesameDetector *detector, uint32_t stream, const float *latest_256,
     uint8_t *selected_bytes, size_t selected_capacity,
-    LfmSesameDecisionV1 *decision) {
-    const LfmSesameWindowV1 window = {
+    LfmSesameDecision *decision) {
+    const LfmSesameWindow window = {
         .first = latest_256,
         .first_count = latest_256 ? kFft : 0,
         .second = nullptr,
@@ -287,8 +285,8 @@ extern "C" int lfm_sesame_detector_process(
 
 extern "C" int lfm_sesame_detector_process_window(
     LfmSesameDetector *detector, uint32_t stream,
-    const LfmSesameWindowV1 *window, uint8_t *selected_bytes,
-    size_t selected_capacity, LfmSesameDecisionV1 *decision) {
+    const LfmSesameWindow *window, uint8_t *selected_bytes,
+    size_t selected_capacity, LfmSesameDecision *decision) {
     StreamState *state = state_for(detector, stream);
     if (!state || !window || !window->first || !decision ||
         window->first_count == 0 || window->first_count > kFft ||
@@ -317,8 +315,8 @@ extern "C" int lfm_sesame_detector_process_window(
 
 extern "C" int lfm_sesame_detector_process_scatter_window(
     LfmSesameDetector *detector, uint32_t stream,
-    const LfmSesameScatterWindowV1 *window, uint8_t *selected_bytes,
-    size_t selected_capacity, LfmSesameDecisionV1 *decision) {
+    const LfmSesameScatterWindow *window, uint8_t *selected_bytes,
+    size_t selected_capacity, LfmSesameDecision *decision) {
     StreamState *state = state_for(detector, stream);
     if (!state || !window || !window->spans || window->span_count == 0 ||
         window->span_count > kFft ||
@@ -329,7 +327,7 @@ extern "C" int lfm_sesame_detector_process_scatter_window(
 
     size_t total = 0;
     for (size_t index = 0; index < window->span_count; ++index) {
-        const LfmSesameSpanV1 &span = window->spans[index];
+        const LfmSesameSpan &span = window->spans[index];
         if (!span.samples || span.count == 0 || span.count > kFft ||
             total > kFft - span.count) {
             return -EINVAL;
@@ -346,7 +344,7 @@ extern "C" int lfm_sesame_detector_process_scatter_window(
             detector->imag_table.get(), state->magnitude.get(),
             detector->bins);
     } else if (window->span_count == 2) {
-        const LfmSesameWindowV1 split = {
+        const LfmSesameWindow split = {
             .first = window->spans[0].samples,
             .first_count = window->spans[0].count,
             .second = window->spans[1].samples,
@@ -365,6 +363,6 @@ extern "C" int lfm_sesame_detector_process_scatter_window(
 
 extern "C" int lfm_sesame_detector_classify_bytes(
     LfmSesameDetector *detector, uint32_t stream, const uint8_t *bytes,
-    size_t count, LfmSesameDecisionV1 *decision) {
+    size_t count, LfmSesameDecision *decision) {
     return classify(detector, stream, bytes, count, decision);
 }

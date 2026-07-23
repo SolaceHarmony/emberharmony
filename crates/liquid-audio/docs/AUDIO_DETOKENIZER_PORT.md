@@ -156,7 +156,7 @@ proves the consumer can remain in the same register tile, but it may not cross
 an opaque AMX/vForce seam, conceal a cross-lane dependency, add a fallback, or
 change the fixed rounding contract merely to reduce a phase count.
 
-## Gates
+## Verification
 
 - Exact schema rejection: missing field, wrong dtype, wrong rank/shape,
   topology mismatch, or extra detokenizer view fails model readiness.
@@ -167,8 +167,8 @@ change the fixed rounding contract merely to reduce a phase count.
   Depthformer and this detokenizer in memory; transcript, PCM, ticket, epoch,
   deterministic seed, and complete retirement are checked.
 - Fixed-team invariance: the same released weights and audio-code trace must
-  produce byte-identical stateful PCM at three and eight lanes. The full gate
-  accepts `LFM_SPEECH_GATE_LANES` for an additional non-default team run.
+  produce byte-identical stateful PCM at three and eight lanes. The native test
+  receives the lane count as an explicit command-line argument.
 - Real speaker gate: the same in-memory stream is drained by the native device
   callback. Audible clarity does not waive underflow, overlap, truncation, or
   terminal-order failures.

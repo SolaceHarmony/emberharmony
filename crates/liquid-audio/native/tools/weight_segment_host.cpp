@@ -51,10 +51,8 @@ int open_image(const fs::path &root, LfmWeightImage **out,
 }
 
 int report(const LfmWeightImage *image,
-           LfmWeightLoadStatsV2 *evidence = nullptr) {
-    LfmWeightLoadStatsV2 stats{
-        .size = sizeof(stats),
-        .abi_version = LFM_WEIGHT_ABI_VERSION,
+           LfmWeightLoadStats *evidence = nullptr) {
+    LfmWeightLoadStats stats{
     };
     const int status = lfm_weights_load_stats(image, &stats);
     if (status != LFM_WEIGHT_OK) return status;
@@ -154,7 +152,7 @@ int main(int argc, char **argv) {
                      opened, error);
         return EXIT_FAILURE;
     }
-    LfmWeightLoadStatsV2 stats{};
+    LfmWeightLoadStats stats{};
     const int reported = report(keeper.image, &stats);
     if (reported != LFM_WEIGHT_OK) {
         lfm_weights_close(keeper.image);

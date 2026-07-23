@@ -5,7 +5,6 @@ import { Auth } from "../../auth"
 import { Config } from "../../config/config"
 import { Voice } from "../../voice/token"
 import { VoiceRegistry } from "../../voice/registry"
-import { VoiceWorker } from "../../voice/worker"
 import { Instance } from "../../project/instance"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
@@ -128,10 +127,6 @@ export const VoiceRoutes = lazy(() =>
       async (c) => {
         const body = c.req.valid("json")
         const merged = await Config.updateGlobal({ voice: body })
-        // pick up the new settings immediately when serve manages the worker
-        await VoiceWorker.restart(merged.voice ?? {})
-        // updateGlobal disposes instance caches asynchronously; respond from
-        // the merged result instead of racing the stale cache
         return c.json(await configInfo(merged.voice ?? {}))
       },
     )

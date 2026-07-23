@@ -39,18 +39,14 @@ class FatalStore final {
     static_assert(std::atomic_ref<std::uint32_t>::is_always_lock_free);
 
   public:
-    static constexpr std::uint32_t format = 1;
     static constexpr std::uint32_t committed = 1;
 
     struct alignas(Isolation) Header {
         std::uint64_t magic = 0;
-        std::uint32_t format_version = format;
-        std::uint32_t header_size = sizeof(Header);
-        std::uint32_t record_size = sizeof(Record);
         std::uint32_t publication = 0;
         std::uint64_t runtime_epoch = 0;
         std::uint64_t checksum = 0;
-        std::array<unsigned char, Isolation - 40> reserved{};
+        std::array<unsigned char, Isolation - 32> padding{};
     };
 
     static_assert(sizeof(Header) == Isolation);
@@ -89,11 +85,9 @@ class FatalStore final {
                 path_.data(),
                 O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         } else {
-            const char *directory = std::getenv("TMPDIR");
-            if (!directory || directory[0] == '\0') directory = "/tmp";
             const int length = std::snprintf(
                 path_.data(), path_.size(),
-                "%s/kcoro-fatal-XXXXXX", directory);
+                "/tmp/kcoro-fatal-XXXXXX");
             if (length <= 0 ||
                 static_cast<std::size_t>(length) >= path_.size()) {
                 return -ENAMETOOLONG;

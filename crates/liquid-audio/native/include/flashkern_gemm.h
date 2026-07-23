@@ -20,7 +20,7 @@ int lfm_bf16_gemm_available(void);
 
 // Architecture leaves. A ready engine has already established their ISA
 // contract.
-void lfm_bf16_gemm_f32_v2(const uint16_t *a, const uint16_t *b, float *c,
+void lfm_bf16_gemm_f32(const uint16_t *a, const uint16_t *b, float *c,
                           int m, int n, int k);
 void lfm_bf16_gemv_f32(const uint16_t *a, const uint16_t *b, float *c,
                        int n, int k);

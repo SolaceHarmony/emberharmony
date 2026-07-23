@@ -6,14 +6,12 @@
 #include "kc_deadline.h"
 #include "kc_fixed_scope.h"
 #include "kc_service.h"
-#include "lfm_capture_policy.h"
 #include "lfm_capture_format.h"
 #include "lfm_detokenizer.h"
 #include "lfm_model_internal.h"
 #include "lfm_sesame_detector.h"
 #include "lfm_platform_audio_internal.h"
 #include "lfm_runtime_internal.h"
-#include "lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
 
 #include <algorithm>
@@ -37,7 +35,6 @@
 
 extern "C" {
 void *lfm_engine_new_status(int workers, int *out_status);
-void *lfm_internal_engine_new_manual_deadlines_for_test(int workers);
 void lfm_engine_request_stop(void *engine);
 void lfm_engine_free(void *engine);
 }
@@ -45,14 +42,14 @@ void lfm_engine_free(void *engine);
 namespace {
 
 int playback_reserve(LfmSession *session, uint32_t frames,
-                     uint32_t sample_rate, LfmPcmLeaseV1 *out);
-int playback_resolve_mut(LfmSession *session, const LfmPcmLeaseV1 *lease,
+                     uint32_t sample_rate, LfmPcmLease *out);
+int playback_resolve_mut(LfmSession *session, const LfmPcmLease *lease,
                          float **out_samples, size_t *out_sample_capacity);
 int playback_resolve(const LfmSession *session,
-                     const LfmPcmLeaseV1 *lease,
+                     const LfmPcmLease *lease,
                      const float **out_samples, size_t *out_sample_count);
-int playback_publish(LfmSession *session, const LfmPcmLeaseV1 *lease);
-int playback_release(LfmSession *session, const LfmPcmLeaseV1 *lease);
+int playback_publish(LfmSession *session, const LfmPcmLease *lease);
+int playback_release(LfmSession *session, const LfmPcmLease *lease);
 
 constexpr uint32_t MAX_RUNTIME_SESSIONS = 64;
 constexpr uint32_t MAX_EVENT_CAPACITY = 64;
@@ -98,10 +95,10 @@ constexpr uint32_t CAPTURE_RANGE_RESERVED = 1;
 constexpr uint32_t CAPTURE_RANGE_PUBLISHED = 2;
 constexpr uint32_t CAPTURE_RANGE_CONSUMING = 3;
 constexpr uint32_t CAPTURE_RANGE_RETIRED = 4;
-constexpr uint32_t CAPTURE_POLICY_LISTENING = LFM_CAPTURE_LISTENING;
-constexpr uint32_t CAPTURE_POLICY_CANDIDATE = LFM_CAPTURE_CANDIDATE;
-constexpr uint32_t CAPTURE_POLICY_SPEAKING = LFM_CAPTURE_SPEAKING;
-constexpr uint32_t CAPTURE_POLICY_PAUSE = LFM_CAPTURE_PAUSE;
+constexpr uint32_t CAPTURE_POLICY_LISTENING = 0;
+constexpr uint32_t CAPTURE_POLICY_CANDIDATE = 1;
+constexpr uint32_t CAPTURE_POLICY_SPEAKING = 2;
+constexpr uint32_t CAPTURE_POLICY_PAUSE = 3;
 constexpr uint32_t CAPTURE_DEADLINE_PREPARE = 0;
 constexpr uint32_t CAPTURE_DEADLINE_COMMIT = 1;
 constexpr uint32_t CAPTURE_DEADLINE_FORCED = 2;
@@ -147,12 +144,12 @@ struct PcmSlot {
     uint32_t channels = 0;
     uint32_t sample_rate = 0;
     uint64_t stream_epoch = 0;
-    LfmTicketIdV1 ticket{};
+    LfmTicketId ticket{};
 };
 
 struct alignas(HOT_ATOMIC_BYTES) PcmRecordCell {
     std::atomic<uint64_t> sequence{0};
-    LfmPcmLeaseV1 lease{};
+    LfmPcmLease lease{};
 };
 static_assert(alignof(PcmRecordCell) == HOT_ATOMIC_BYTES);
 
@@ -169,7 +166,7 @@ struct PlaybackPool {
 struct PlaybackEvidenceRecord {
     uint64_t session_id = 0;
     uint64_t stream_epoch = 0;
-    LfmTicketIdV1 ticket{};
+    LfmTicketId ticket{};
     uint64_t lease_id = 0;
     uint64_t buffer_generation = 0;
     uint32_t source_offset_frames = 0;
@@ -194,18 +191,12 @@ struct PlaybackEvidenceHistory {
     uint64_t tail = 0;
 };
 
-struct alignas(HOT_ATOMIC_BYTES) PlaybackPolicySnapshotSlot {
-    mutable std::atomic<uint32_t> state{0};
-    LfmPlaybackPolicySnapshotV1 value{};
-};
-static_assert(alignof(PlaybackPolicySnapshotSlot) == HOT_ATOMIC_BYTES);
-
 struct PlaybackPolicy {
     LfmSesameDetector *detector = nullptr;
     PlaybackEvidenceRing incoming;
     PlaybackEvidenceHistory history;
-    LfmSesameDecisionV1 decision{};
-    LfmTicketIdV1 last_ticket{};
+    LfmSesameDecision decision{};
+    LfmTicketId last_ticket{};
     uint64_t last_epoch = 0;
     uint64_t last_capture_cursor = 0;
     uint64_t next_evidence_cursor = 0;
@@ -218,18 +209,15 @@ struct PlaybackPolicy {
     uint64_t last_voice_capture_cursor = 0;
     uint64_t echo_tail_capture_cursor = 0;
     uint64_t echo_epoch = 0;
-    LfmTicketIdV1 echo_ticket{};
+    LfmTicketId echo_ticket{};
     uint32_t cadence_remainder = 49;
-    std::atomic<uint32_t> published_snapshot{0};
-    std::atomic<uint32_t> snapshot_pending{0};
-    PlaybackPolicySnapshotSlot snapshots[2]{};
 };
 
 struct CaptureChunkRing {
     /* PCM stays in the fixed circular arena. This ring contains identity and
      * absolute bounds only, and its one producer/one consumer cursors are
      * structural. */
-    LfmCaptureChunkV1 *records = nullptr;
+    LfmCaptureChunk *records = nullptr;
     uint32_t capacity = 0;
     Cursor<uint64_t> head;
     Cursor<uint64_t> tail;
@@ -241,7 +229,7 @@ struct alignas(HOT_ATOMIC_BYTES) CaptureWriter {
      * immutable through reader-floor reclamation, so callback and model work
      * can proceed concurrently without rotating storage ownership. */
     std::atomic<uint32_t> gate{CAPTURE_WRITER_IDLE};
-    LfmCaptureChunkV1 pending{};
+    LfmCaptureChunk pending{};
 };
 static_assert(alignof(CaptureWriter) == HOT_ATOMIC_BYTES);
 
@@ -250,7 +238,7 @@ struct CaptureRangeLease {
     uint64_t buffer_generation = 0;
     uint64_t first_sample_cursor = 0;
     uint64_t stream_epoch = 0;
-    LfmTicketIdV1 ticket{};
+    LfmTicketId ticket{};
     uint32_t frames = 0;
     uint32_t sample_rate = 0;
     uint32_t slot = 0;
@@ -368,21 +356,13 @@ struct CaptureDeadlineRole {
     bool terminal = false;
 };
 
-constexpr uint32_t CAPTURE_SNAPSHOT_WRITING = UINT32_C(1) << 31;
-
-struct alignas(HOT_ATOMIC_BYTES) CaptureSupervisionSnapshotSlot {
-    mutable std::atomic<uint32_t> state{0};
-    LfmCaptureSupervisionSnapshotV1 value{};
-};
-static_assert(alignof(CaptureSupervisionSnapshotSlot) == HOT_ATOMIC_BYTES);
-
 struct CaptureSupervision {
     kc_deadline_source_t *source = nullptr;
     kc_fixed_scope_t *scope = nullptr;
     kc_service_notifier_t *notifier = nullptr;
     CaptureDeadlineRole roles[CAPTURE_DEADLINE_COUNT]{};
-    LfmTicketIdV1 parent{};
-    LfmTicketIdV1 restart_parent{};
+    LfmTicketId parent{};
+    LfmTicketId restart_parent{};
     uint64_t scope_generation = 0;
     uint64_t next_scope_generation = 1;
     uint64_t epoch = 0;
@@ -390,7 +370,6 @@ struct CaptureSupervision {
     uint64_t pause_generation = 0;
     uint64_t commit_cursor = 0;
     uint64_t commit_lease_id = 0;
-    bool manual = false;
     bool cycle_active = false;
     bool restart_after_cancel = false;
     bool commit_after_cancel = false;
@@ -398,20 +377,17 @@ struct CaptureSupervision {
     std::atomic<bool> device_loss_pending{false};
     bool device_loss_after_cancel = false;
     bool device_loss_ready = false;
-    LfmTicketIdV1 device_loss_parent{};
+    LfmTicketId device_loss_parent{};
     uint64_t device_loss_epoch = 0;
     bool stop_requested = false;
     bool source_stop_requested = false;
-    std::atomic<uint32_t> published_snapshot{0};
-    std::atomic<uint32_t> snapshot_pending{0};
-    CaptureSupervisionSnapshotSlot snapshots[2]{};
 };
 
 struct CapturePolicy {
     LfmSesameDetector *detector = nullptr;
-    LfmCaptureChunkV1 chunk{};
-    LfmSesameDecisionV1 decision{};
-    LfmTicketIdV1 turn_ticket{};
+    LfmCaptureChunk chunk{};
+    LfmSesameDecision decision{};
+    LfmTicketId turn_ticket{};
     uint64_t segment_cursor = 0;
     uint64_t next_evidence_cursor = 0;
     uint64_t last_evidence_cursor = 0;
@@ -436,8 +412,8 @@ struct CapturePolicy {
     uint64_t barge_source_epoch = 0;
     uint64_t barge_interrupt_epoch = 0;
     uint64_t barge_interrupts = 0;
-    LfmTicketIdV1 barge_candidate_ticket{};
-    LfmTicketIdV1 barge_playback_ticket{};
+    LfmTicketId barge_candidate_ticket{};
+    LfmTicketId barge_playback_ticket{};
     uint64_t segment_epoch = 0;
     uint32_t cadence_remainder = 49;
     uint32_t state = CAPTURE_POLICY_LISTENING;
@@ -450,7 +426,7 @@ struct EventRecord {
     uint32_t kind = 0;
     uint32_t flags = 0;
     uint64_t epoch = 0;
-    LfmTicketIdV1 ticket{};
+    LfmTicketId ticket{};
     int32_t status = 0;
     uint32_t payload_bytes = 0;
     uint8_t payload[EVENT_PAYLOAD_CAPACITY]{};
@@ -464,7 +440,7 @@ struct EventRing {
 };
 
 struct TextCommand {
-    LfmTicketIdV1 ticket{};
+    LfmTicketId ticket{};
     uint64_t epoch = 0;
     uint32_t bytes = 0;
     char text[LFM_TEXT_COMMAND_MAX_BYTES]{};
@@ -487,8 +463,8 @@ struct TextRing {
  * callback or a detector record. The source model's terminal edge seals the
  * immutable sample range before this command is published. */
 struct PcmViewCommand {
-    LfmTicketIdV1 ticket{};
-    LfmTicketIdV1 parent{};
+    LfmTicketId ticket{};
+    LfmTicketId parent{};
     uint64_t epoch = 0;
     uint32_t sample_rate = 0;
     LfmF32SpanChain pcm{};
@@ -533,12 +509,12 @@ bool decode_playback_lease_id(uint64_t id, uint32_t *index) {
     return true;
 }
 
-bool ticket_equal(const LfmTicketIdV1 &a, const LfmTicketIdV1 &b) {
+bool ticket_equal(const LfmTicketId &a, const LfmTicketId &b) {
     return a.runtime_epoch == b.runtime_epoch && a.sequence == b.sequence &&
            a.generation == b.generation && a.kind == b.kind;
 }
 
-void pool_push(PlaybackPool *pool, const LfmPcmLeaseV1 &lease) {
+void pool_push(PlaybackPool *pool, const LfmPcmLease &lease) {
     /* Slot reservation is the capacity lease: at most `capacity` records can
      * be published or retained at once. Publication therefore needs no second
      * contested admission gate. fetch_add gives every producer one unique FIFO
@@ -558,7 +534,7 @@ void pool_push(PlaybackPool *pool, const LfmPcmLeaseV1 &lease) {
     cell->sequence.store(tail * 2 + 1, std::memory_order_release);
 }
 
-bool pool_peek(const PlaybackPool *pool, LfmPcmLeaseV1 *out,
+bool pool_peek(const PlaybackPool *pool, LfmPcmLease *out,
                uint64_t *out_head) {
     if (!pool || pool->capacity == 0) return false;
     const uint64_t head = pool->head.value.load(std::memory_order_relaxed);
@@ -624,11 +600,9 @@ int pool_create(PlaybackPool *pool, uint32_t capacity,
     return 0;
 }
 
-int pool_slot(PlaybackPool *pool, const LfmPcmLeaseV1 *lease, PcmSlot **out,
+int pool_slot(PlaybackPool *pool, const LfmPcmLease *lease, PcmSlot **out,
               uint32_t *out_index) {
-    if (!lease || lease->size != sizeof(*lease) ||
-        lease->abi_version != LFM_RUNTIME_ABI_VERSION || lease->reserved != 0 ||
-        lease->format != LFM_PCM_FORMAT_F32) {
+    if (!lease || lease->format != LFM_PCM_FORMAT_F32) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     uint32_t index = 0;
@@ -708,7 +682,7 @@ void retire_slot_observer(PcmSlot *slot,
     if (prior == 1) (void)finalize_slot(slot, consumed);
 }
 
-int release_slot(PlaybackPool *pool, const LfmPcmLeaseV1 *lease,
+int release_slot(PlaybackPool *pool, const LfmPcmLease *lease,
                  std::atomic<uint64_t> *consumed,
                  uint32_t allowed_states = UINT32_MAX) {
     PcmSlot *slot = nullptr;
@@ -727,17 +701,15 @@ int release_slot(PlaybackPool *pool, const LfmPcmLeaseV1 *lease,
             std::memory_order_acquire)) {
         return LFM_STATUS_STALE;
     }
-    /* `playback_consumed` is the retirement side of
-     * `playback_published`; an unused reservation never entered that
-     * accounting domain. Generation can reserve one final detokenizer buffer and
-     * release it when no PCM remains, so counting SLOT_RESERVED here makes a
-     * clean turn report consumed > published. */
+    /* An unused reservation never entered the device FIFO. Generation can
+     * reserve one final detokenizer buffer and release it when no PCM remains,
+     * so only published/consuming slots advance the retirement cursor. */
     const bool published = state == SLOT_PUBLISHED || state == SLOT_CONSUMING;
     (void)finalize_slot(slot, published ? consumed : nullptr);
     return 0;
 }
 
-int claim_published(PlaybackPool *pool, const LfmPcmLeaseV1 *lease,
+int claim_published(PlaybackPool *pool, const LfmPcmLease *lease,
                     PcmSlot **out) {
     PcmSlot *slot = nullptr;
     int rc = pool_slot(pool, lease, &slot, nullptr);
@@ -839,7 +811,6 @@ struct LfmRuntime {
     uint32_t kernel_lanes = 0;
     uint32_t event_capacity = 0;
     uint32_t session_capacity = 0;
-    bool manual_deadlines = false;
     std::atomic<uint32_t> state{LFM_RUNTIME_CREATED};
     mutable std::mutex children_mutex;
     LfmModel *model = nullptr;
@@ -848,7 +819,7 @@ struct LfmRuntime {
 };
 
 struct PreparedPlayback {
-    LfmPcmLeaseV1 lease{};
+    LfmPcmLease lease{};
     size_t samples = 0;
     bool active = false;
 };
@@ -859,8 +830,8 @@ struct SessionAction {
     LfmConversationAdmissionHandle admission{};
     PreparedPlayback playback{};
     CaptureRangeLease capture_range{};
-    LfmTicketIdV1 ticket{};
-    LfmTicketIdV1 parent{};
+    LfmTicketId ticket{};
+    LfmTicketId parent{};
     uint64_t epoch = 0;
     uint64_t playback_retire_base = 0;
     uint32_t playback_count = 0;
@@ -894,8 +865,8 @@ struct LfmSession {
     LfmRuntime *runtime = nullptr;
     LfmModel *model = nullptr;
     LfmConversation *conversation = nullptr;
-    LfmCallbacksV1 callbacks{};
-    LfmPlatformAudioBindingV1 platform_audio{};
+    LfmCallbacks callbacks{};
+    LfmPlatformAudioBinding platform_audio{};
     uint64_t id = 0;
     uint32_t capture_rate = 0;
     uint32_t capture_callback_frames = 0;
@@ -905,8 +876,6 @@ struct LfmSession {
     uint32_t channels = 0;
     uint32_t max_new_tokens = 0;
     uint32_t generation = 1;
-    bool dock_only = false;
-    bool manual_deadlines = false;
     std::atomic<uint32_t> state{LFM_SESSION_CREATED};
     LfmRouteEpoch epoch{};
     std::atomic<bool> stop{false};
@@ -919,21 +888,9 @@ struct LfmSession {
     std::atomic<bool> sink_failed{false};
     std::atomic<int32_t> terminal_status{0};
     std::atomic<uint64_t> callbacks_entered{0};
-    std::atomic<uint64_t> capture_consumed{0};
-    std::atomic<uint64_t> capture_stale{0};
-    std::atomic<uint64_t> playback_published{0};
     std::atomic<uint64_t> playback_consumed{0};
-    std::atomic<uint64_t> text_commands_accepted{0};
-    std::atomic<uint64_t> text_commands_consumed{0};
-    std::atomic<uint64_t> text_commands_stale{0};
-    std::atomic<uint64_t> capture_evidence_updates{0};
     std::atomic<uint64_t> capture_evidence_cursor{0};
-    std::atomic<uint64_t> playback_evidence_records{0};
-    std::atomic<uint64_t> playback_evidence_updates{0};
-    std::atomic<uint64_t> playback_evidence_cursor{0};
     std::atomic<uint64_t> playback_sample_cursor{0};
-    std::atomic<uint32_t> playback_evidence_voice{0};
-    std::atomic<uint32_t> playback_evidence_backlog{0};
     std::atomic<uint32_t> playback_retained_observers{0};
     uint64_t playback_flush_observed_epoch = 0;
     PlaybackPool playback;
@@ -972,10 +929,6 @@ struct LfmSession {
     bool delivery_done = false;
     bool services_joined = false;
     bool start_cleanup = false;
-    /* Coordinator-owned, setup-time resident control evidence. Numerical and
-     * PCM state remain in their owner buffers; the truth gate receives only a
-     * pointer view of these atomics. */
-    LfmSessionDiagnosticState diagnostics;
     std::atomic<uint32_t> capture_producers{0};
     std::atomic<uint32_t> playback_consumers{0};
     std::atomic<bool> platform_retirement_ready{false};
@@ -1035,8 +988,8 @@ struct LfmCaptureProducer {
 
 struct LfmPlaybackConsumer {
     LfmSession *session = nullptr;
-    LfmPcmLeaseV1 lease{};
-    LfmPcmLeaseV1 lineage{};
+    LfmPcmLease lease{};
+    LfmPcmLease lineage{};
     uint64_t sample_cursor = 0;
     bool active = false;
     bool faulted = false;
@@ -1049,7 +1002,7 @@ struct LfmSessionControl {
 namespace {
 
 bool capture_chunk_push(CaptureChunkRing *ring,
-                        const LfmCaptureChunkV1 &chunk) {
+                        const LfmCaptureChunk &chunk) {
     const uint64_t tail = ring->tail.value.load(std::memory_order_relaxed);
     const uint64_t head = ring->head.value.load(std::memory_order_acquire);
     if (tail - head == ring->capacity) return false;
@@ -1058,7 +1011,7 @@ bool capture_chunk_push(CaptureChunkRing *ring,
     return true;
 }
 
-bool capture_chunk_pop(CaptureChunkRing *ring, LfmCaptureChunkV1 *out) {
+bool capture_chunk_pop(CaptureChunkRing *ring, LfmCaptureChunk *out) {
     const uint64_t head = ring->head.value.load(std::memory_order_relaxed);
     const uint64_t tail = ring->tail.value.load(std::memory_order_acquire);
     if (head == tail) return false;
@@ -1149,7 +1102,7 @@ int capture_arena_spans(const CaptureArena &arena, uint64_t start,
 
 int capture_arena_mutable_spans(CaptureArena &arena, uint64_t start,
                                 uint32_t frames,
-                                LfmMutableF32SpanV1 out[2],
+                                LfmMutableF32Span out[2],
                                 uint32_t *out_count) {
     LfmF32Span spans[2]{};
     const int status = capture_arena_spans(
@@ -1160,16 +1113,16 @@ int capture_arena_mutable_spans(CaptureArena &arena, uint64_t start,
         .count = static_cast<size_t>(spans[0].length),
     };
     out[1] = *out_count == 2
-        ? LfmMutableF32SpanV1{
+        ? LfmMutableF32Span{
               .data = const_cast<float *>(spans[1].data),
               .count = static_cast<size_t>(spans[1].length),
           }
-        : LfmMutableF32SpanV1{};
+        : LfmMutableF32Span{};
     return 0;
 }
 
-bool chunk_equal(const LfmCaptureChunkV1 &a,
-                 const LfmCaptureChunkV1 &b) {
+bool chunk_equal(const LfmCaptureChunk &a,
+                 const LfmCaptureChunk &b) {
     return a.stream == b.stream && a.lane == b.lane &&
            a.flags == b.flags && a.chunk_sequence == b.chunk_sequence &&
            a.first_sample_cursor == b.first_sample_cursor &&
@@ -1181,12 +1134,8 @@ bool chunk_equal(const LfmCaptureChunkV1 &a,
            a.channels == b.channels && a.sample_rate == b.sample_rate;
 }
 
-bool valid_chunk(const LfmCaptureChunkV1 *chunk) {
-    if (!chunk || chunk->size != sizeof(*chunk) ||
-        chunk->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return false;
-    }
-    return chunk->reserved[0] == 0 && chunk->reserved[1] == 0;
+bool valid_chunk(const LfmCaptureChunk *chunk) {
+    return chunk != nullptr;
 }
 
 void request_stop(LfmSession *session, int32_t status);
@@ -1229,23 +1178,20 @@ int add_gap_debt(LfmCaptureProducer *producer, uint32_t frames,
     return 0;
 }
 
-void capture_write_result(LfmCaptureWriteV1 *out, uint32_t admitted,
+void capture_write_result(LfmCaptureWrite *out, uint32_t admitted,
                           uint32_t dropped, uint32_t flags, int32_t status) {
     *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
         .admitted_frames = admitted,
         .dropped_frames = dropped,
         .flags = flags,
         .status = status,
-        .reserved = {},
     };
 }
 
 int capture_write_drop(LfmCaptureProducer *producer, uint32_t frames,
                        uint32_t channels, int32_t status,
-                       LfmCaptureWriteV1 *out) {
-    LfmCaptureChunkV1 gap{};
+                       LfmCaptureWrite *out) {
+    LfmCaptureChunk gap{};
     const int published = frames == 0
         ? LFM_STATUS_INVALID_ARGUMENT
         : lfm_capture_producer_publish_gap(
@@ -1258,7 +1204,7 @@ int capture_write_drop(LfmCaptureProducer *producer, uint32_t frames,
 }
 
 bool consumer_matches(const LfmPlaybackConsumer *consumer,
-                      const LfmPcmLeaseV1 *lease) {
+                      const LfmPcmLease *lease) {
     return consumer && consumer->active && lease && consumer->session &&
            consumer->lease.lease_id == lease->lease_id &&
            consumer->lease.buffer_generation == lease->buffer_generation &&
@@ -1300,10 +1246,8 @@ uint64_t playback_capture_cursor_snapshot(const LfmSession *session) {
 }
 
 void fill_playback_render(const PlaybackEvidenceRecord &record,
-                          LfmPlaybackRenderV1 *out) {
+                          LfmPlaybackRender *out) {
     *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
         .session_id = record.session_id,
         .stream_epoch = record.stream_epoch,
         .ticket = record.ticket,
@@ -1316,15 +1260,13 @@ void fill_playback_render(const PlaybackEvidenceRecord &record,
         .capture_sample_cursor_snapshot =
             record.capture_sample_cursor_snapshot,
         .flags = record.flags,
-        .reserved0 = 0,
-        .reserved = {},
     };
 }
 
 int publish_playback_evidence(LfmPlaybackConsumer *consumer,
-                              const LfmPcmLeaseV1 *lease,
+                              const LfmPcmLease *lease,
                               uint32_t source_offset_frames, uint32_t frames,
-                              uint32_t flags, LfmPlaybackRenderV1 *out) {
+                              uint32_t flags, LfmPlaybackRender *out) {
     if (!consumer || !consumer->session || !out) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
@@ -1347,7 +1289,7 @@ int publish_playback_evidence(LfmPlaybackConsumer *consumer,
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     const bool rendered = (flags & LFM_PLAYBACK_EVIDENCE_RENDERED) != 0;
-    const LfmPcmLeaseV1 *lineage = lease;
+    const LfmPcmLease *lineage = lease;
     if (!lineage) {
         lineage = consumer->lineage.lease_id == 0 ? nullptr
                                                   : &consumer->lineage;
@@ -1423,12 +1365,12 @@ using PlaybackFanout = int (*)(const float *, void *, size_t, uint32_t,
                                size_t);
 
 int render_playback_evidence(LfmPlaybackConsumer *consumer,
-                             const LfmPcmLeaseV1 *lease,
+                             const LfmPcmLease *lease,
                              uint32_t source_offset_frames, void *destination,
                              uint32_t frames, uint32_t channels,
                              size_t destination_capacity,
                              PlaybackFanout fanout,
-                             LfmPlaybackRenderV1 *out) {
+                             LfmPlaybackRender *out) {
     if (!consumer || !consumer->session || !lease || !destination ||
         !fanout || !out || frames == 0 || channels == 0 ||
         source_offset_frames > lease->frames ||
@@ -1486,7 +1428,7 @@ int fanout_u16_erased(const float *source, void *destination, size_t frames,
         capacity);
 }
 
-LfmTicketIdV1 next_ticket(LfmSession *session, uint32_t kind) {
+LfmTicketId next_ticket(LfmSession *session, uint32_t kind) {
     const uint64_t sequence = session->runtime->ticket_sequence.fetch_add(
         1, std::memory_order_relaxed);
     if (sequence == 0) std::abort();
@@ -1498,7 +1440,7 @@ LfmTicketIdV1 next_ticket(LfmSession *session, uint32_t kind) {
     };
 }
 
-LfmTicketIdV1 capture_ticket_from_sequence(
+LfmTicketId capture_ticket_from_sequence(
     const LfmCaptureProducer *producer, uint64_t sequence) {
     if (!producer || !producer->session || sequence == 0) std::abort();
     return {
@@ -1509,10 +1451,10 @@ LfmTicketIdV1 capture_ticket_from_sequence(
     };
 }
 
-LfmTicketIdV1 rotate_capture_ticket(LfmCaptureProducer *producer,
+LfmTicketId rotate_capture_ticket(LfmCaptureProducer *producer,
                                     uint64_t epoch) {
     if (!producer || !producer->session || epoch == 0) std::abort();
-    const LfmTicketIdV1 ticket =
+    const LfmTicketId ticket =
         next_ticket(producer->session, LFM_TICKET_TURN);
     producer->transport_epoch.store(epoch, std::memory_order_relaxed);
     producer->transport_sequence.store(ticket.sequence,
@@ -1520,7 +1462,7 @@ LfmTicketIdV1 rotate_capture_ticket(LfmCaptureProducer *producer,
     return ticket;
 }
 
-LfmTicketIdV1 current_capture_ticket(LfmCaptureProducer *producer,
+LfmTicketId current_capture_ticket(LfmCaptureProducer *producer,
                                      uint64_t epoch) {
     const uint64_t sequence = producer->transport_sequence.load(
         std::memory_order_acquire);
@@ -1561,7 +1503,7 @@ int prepare_reservation(LfmSession *session, uint32_t frames,
 
 int reserve_slot_at(LfmSession *session, PlaybackPool *pool,
                     uint32_t frames, uint32_t rate, size_t samples,
-                    uint32_t index, LfmPcmLeaseV1 *out) {
+                    uint32_t index, LfmPcmLease *out) {
     PcmSlot &slot = pool->slots[index];
     uint32_t expected = SLOT_FREE;
     if (!slot.state.compare_exchange_strong(expected, SLOT_RESERVED,
@@ -1582,8 +1524,6 @@ int reserve_slot_at(LfmSession *session, PlaybackPool *pool,
     slot.stream_epoch = session->epoch.load(std::memory_order_acquire);
     slot.ticket = {};
     *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
         .lease_id = identity,
         .stream_epoch = slot.stream_epoch,
         .buffer_generation = slot.generation.load(std::memory_order_acquire),
@@ -1595,7 +1535,6 @@ int reserve_slot_at(LfmSession *session, PlaybackPool *pool,
         .offset_bytes = 0,
         .length_bytes = static_cast<uint32_t>(samples * sizeof(float)),
         .flags = LFM_PCM_LEASE_PLAYBACK,
-        .reserved = 0,
     };
     return 0;
 }
@@ -1610,9 +1549,7 @@ void set_error(char *error, size_t error_length, const char *message) {
 
 int validate_voice_model(const LfmModel *model, char *error,
                          size_t error_length) {
-    LfmModelInfoV1 info = {
-        .size = sizeof(LfmModelInfoV1),
-        .abi_version = LFM_MODEL_ABI_VERSION,
+    LfmModelInfo info = {
     };
     int rc = lfm_model_info(model, &info);
     if (rc != 0) {
@@ -1629,9 +1566,7 @@ int validate_voice_model(const LfmModel *model, char *error,
         return LFM_STATUS_INVALID_ARGUMENT;
     }
 
-    LfmModelMemoryV2 memory = {
-        .size = sizeof(LfmModelMemoryV2),
-        .abi_version = LFM_MODEL_ABI_VERSION,
+    LfmModelMemory memory = {
     };
     rc = lfm_model_memory(model, &memory);
     if (rc != 0) {
@@ -1652,35 +1587,12 @@ void close_publications(LfmSession *session) {
                                              std::memory_order_acq_rel);
 }
 
-enum SessionTerminalCause : uint32_t {
-    SESSION_TERMINAL_NONE = 0,
-    SESSION_TERMINAL_COORDINATOR_NOTIFY = 1,
-    SESSION_TERMINAL_DELIVERY_NOTIFY = 2,
-    SESSION_TERMINAL_REQUEST_STOP = 3,
-    SESSION_TERMINAL_PLATFORM_RETIRE = 4,
-    SESSION_TERMINAL_CAPTURE_RETIRE = 5,
-    SESSION_TERMINAL_CONVERSATION_INTERRUPT = 6,
-    SESSION_TERMINAL_PLAYBACK_RETIRE = 7,
-};
-
-void record_terminal_failure(LfmSession *session, int32_t status,
-                             SessionTerminalCause cause) {
+void record_terminal_failure(LfmSession *session, int32_t status) {
     if (!session || status == 0) return;
     int32_t expected = 0;
-    if (!session->terminal_status.compare_exchange_strong(
-            expected, status, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        return;
-    }
-    const std::atomic<uint32_t> *operation =
-        lfm_conversation_operation_view_native(session->conversation);
-    session->diagnostics.terminal_cause.store(cause,
-                                              std::memory_order_relaxed);
-    session->diagnostics.terminal_operation.store(
-        operation ? operation->load(std::memory_order_acquire) : 0,
-        std::memory_order_relaxed);
-    session->diagnostics.terminal_status.store(status,
-                                               std::memory_order_release);
+    (void)session->terminal_status.compare_exchange_strong(
+        expected, status, std::memory_order_acq_rel,
+        std::memory_order_acquire);
 }
 
 void notify_session(LfmSession *session) {
@@ -1688,8 +1600,7 @@ void notify_session(LfmSession *session) {
     const int status =
         kc_service_notifier_notify(session->coordinator_notifier);
     if (status != 0 && status != -ECANCELED) {
-        record_terminal_failure(session, status,
-                                SESSION_TERMINAL_COORDINATOR_NOTIFY);
+        record_terminal_failure(session, status);
         close_publications(session);
         session->stop.store(true, std::memory_order_release);
     }
@@ -1702,8 +1613,7 @@ int notify_delivery(LfmSession *session) {
     const int status =
         kc_service_notifier_notify(session->delivery_notifier);
     if (status != 0 && status != -ECANCELED) {
-        record_terminal_failure(session, status,
-                                SESSION_TERMINAL_DELIVERY_NOTIFY);
+        record_terminal_failure(session, status);
         close_publications(session);
         session->stop.store(true, std::memory_order_release);
         notify_session(session);
@@ -1712,7 +1622,7 @@ int notify_delivery(LfmSession *session) {
 }
 
 void request_stop(LfmSession *session, int32_t status) {
-    record_terminal_failure(session, status, SESSION_TERMINAL_REQUEST_STOP);
+    record_terminal_failure(session, status);
     close_publications(session);
     bool first = !session->stop.exchange(true, std::memory_order_acq_rel);
     if (first) {
@@ -1757,13 +1667,10 @@ void capture_scope_cancel(void *context,
     capture_supervision_notify(role->owner->notifier);
 }
 
-void publish_capture_supervision_snapshot(LfmSession *session);
-
 int capture_supervision_create(LfmSession *session) {
     CaptureSupervision &supervision = session->capture_supervision;
     if (supervision.scope || supervision.source) return LFM_STATUS_BUSY;
     supervision.notifier = session->coordinator_notifier;
-    supervision.manual = session->manual_deadlines;
     for (uint32_t slot = 0; slot < CAPTURE_DEADLINE_COUNT; ++slot) {
         supervision.roles[slot].owner = &supervision;
         supervision.roles[slot].slot = slot;
@@ -1802,185 +1709,13 @@ int capture_supervision_create(LfmSession *session) {
         .notify = capture_supervision_notify,
         .context = supervision.notifier,
     };
-    status = supervision.manual
-                 ? kc_deadline_source_create_manual_test(
-                       &source_config, &supervision.source)
-                 : kc_deadline_source_create(
-                       &source_config, &supervision.source);
+    status = kc_deadline_source_create(&source_config, &supervision.source);
     if (status != 0) {
         (void)kc_fixed_scope_destroy(supervision.scope);
         supervision.scope = nullptr;
         return status;
     }
-    publish_capture_supervision_snapshot(session);
     return 0;
-}
-
-int build_capture_supervision_snapshot(
-    const LfmSession *session, LfmCaptureSupervisionSnapshotV1 *out) {
-    if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
-    const CaptureSupervision &supervision = session->capture_supervision;
-    kc_fixed_scope_snapshot scope = {
-    };
-    kc_deadline_source_snapshot source = {
-    };
-    if (supervision.scope) {
-        const int status = kc_fixed_scope_snapshot_get(
-            supervision.scope, &scope);
-        if (status != 0) return status;
-    }
-    if (supervision.source) {
-        const int status = kc_deadline_source_snapshot_get(
-            supervision.source, &source);
-        if (status != 0) return status;
-    }
-    *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
-        .cycle_active = supervision.cycle_active ? 1u : 0u,
-        .scope_phase = scope.phase,
-        .source_phase = source.phase,
-        .source_pending_events = source.pending_events,
-        .policy_state = session->capture_policy.state,
-        .reserved0 = 0,
-        .scope_generation = supervision.scope_generation,
-        .epoch = supervision.epoch,
-        .domain = supervision.domain,
-        .pause_generation = session->capture_policy.pause_generation,
-        .prepare_ready_generation =
-            session->capture_policy.prepare_ready_generation,
-        .commit_ready_generation =
-            session->capture_policy.commit_ready_generation,
-        .forced_ready_generation =
-            session->capture_policy.forced_ready_generation,
-        .prepare_sample_generation =
-            session->capture_policy.prepare_sample_generation,
-        .commit_sample_generation =
-            session->capture_policy.commit_sample_generation,
-        .forced_sample_generation =
-            session->capture_policy.forced_sample_generation,
-        .turn_start_cursor = session->capture_policy.turn_start_cursor,
-        .last_evidence_cursor =
-            session->capture_policy.last_evidence_cursor,
-        .silence_frames = session->capture_policy.silence_frames,
-        .parent = supervision.parent,
-        .slots = {},
-    };
-    for (uint32_t slot = 0; slot < CAPTURE_DEADLINE_COUNT; ++slot) {
-        const CaptureDeadlineRole &role = supervision.roles[slot];
-        out->slots[slot] = {
-            .slot = slot,
-            .armed = role.arm.arm_generation != 0 ? 1u : 0u,
-            .terminal = role.terminal ? 1u : 0u,
-            .cancel_cause = role.cancel_cause.load(
-                std::memory_order_acquire),
-            .arm_generation = role.arm.arm_generation,
-            .expiry_generation = role.expiry_generation,
-            .scope_generation = role.lease.scope_generation,
-            .epoch = supervision.epoch,
-            .domain = supervision.domain,
-            .pause_generation = role.domain_generation,
-            .child = role.lease.child,
-            .parent = role.lease.parent,
-        };
-    }
-    return 0;
-}
-
-template <typename Slot>
-bool claim_snapshot_writer(std::atomic<uint32_t> *pending, uint32_t index,
-                           Slot *slot) {
-    uint32_t expected = 0;
-    if (slot->state.compare_exchange_strong(
-            expected, CAPTURE_SNAPSHOT_WRITING,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        pending->store(0, std::memory_order_release);
-        return true;
-    }
-
-    /* A reader owns the inactive generation. Publish the deferred edge before
-     * rechecking the slot so either ordering has a successor: a reader that
-     * releases after this store rings the coordinator, while a reader that
-     * released just before it lets this second claim complete immediately. */
-    pending->store(index + 1, std::memory_order_release);
-    expected = 0;
-    if (!slot->state.compare_exchange_strong(
-            expected, CAPTURE_SNAPSHOT_WRITING,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return false;
-    }
-    pending->store(0, std::memory_order_release);
-    return true;
-}
-
-template <typename Slot>
-void release_snapshot_reader(LfmSession *session,
-                             std::atomic<uint32_t> *, uint32_t,
-                             Slot *slot) {
-    const uint32_t prior =
-        slot->state.fetch_sub(1, std::memory_order_acq_rel);
-    if (prior == 0 || (prior & CAPTURE_SNAPSHOT_WRITING) != 0) std::abort();
-    if (prior == 1) {
-        /* The final reader always publishes the capacity-release edge. A
-         * pending hint lives in a different atomic object and therefore
-         * cannot prove that its store is visible here on weak memory. This
-         * harmless edge makes the 1 -> 0 transition itself the successor. */
-        notify_session(session);
-    }
-}
-
-void publish_capture_supervision_snapshot(LfmSession *session) {
-    if (!session) return;
-    CaptureSupervision &supervision = session->capture_supervision;
-    const uint32_t current = supervision.published_snapshot.load(
-        std::memory_order_relaxed);
-    const uint32_t target = current ^ 1u;
-    CaptureSupervisionSnapshotSlot &slot = supervision.snapshots[target];
-    if (!claim_snapshot_writer(&supervision.snapshot_pending, target, &slot)) {
-        return;
-    }
-    LfmCaptureSupervisionSnapshotV1 snapshot{};
-    const int status = build_capture_supervision_snapshot(
-        session, &snapshot);
-    if (status == 0) slot.value = snapshot;
-    slot.state.store(0, std::memory_order_release);
-    if (status == 0) {
-        supervision.published_snapshot.store(target,
-                                              std::memory_order_release);
-    }
-}
-
-int read_capture_supervision_snapshot(
-    const LfmSession *session, LfmCaptureSupervisionSnapshotV1 *out) {
-    LfmSession *owner = const_cast<LfmSession *>(session);
-    CaptureSupervision &supervision = owner->capture_supervision;
-    /* There are exactly two immutable snapshot generations. Once this reader
-     * pins a generation, it owns a coherent snapshot with a linearization
-     * point at the published-index load; a later publication does not
-     * invalidate that record. Re-read only when the selected generation was
-     * already being rewritten. This is a bounded two-generation transaction,
-     * not a progress wait. */
-    for (uint32_t attempt = 0; attempt < 2; ++attempt) {
-        const uint32_t index = supervision.published_snapshot.load(
-            std::memory_order_acquire);
-        const CaptureSupervisionSnapshotSlot &slot =
-            supervision.snapshots[index];
-        uint32_t readers = slot.state.load(std::memory_order_acquire);
-        if ((readers & CAPTURE_SNAPSHOT_WRITING) != 0 ||
-            readers == CAPTURE_SNAPSHOT_WRITING - 1) {
-            continue;
-        }
-        if (!slot.state.compare_exchange_strong(
-                readers, readers + 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            continue;
-        }
-        *out = slot.value;
-        release_snapshot_reader(owner, &supervision.snapshot_pending, index,
-                                &slot);
-        return 0;
-    }
-    return LFM_STATUS_WOULD_BLOCK;
 }
 
 uint64_t capture_delay_ns(uint64_t frames, uint32_t sample_rate) {
@@ -2031,7 +1766,7 @@ int capture_supervision_begin(LfmSession *session, uint64_t cursor) {
     if (!producer) return LFM_STATUS_STALE;
     const bool same_lease_restart =
         supervision.restart_parent.sequence != 0;
-    const LfmTicketIdV1 expected_parent = same_lease_restart
+    const LfmTicketId expected_parent = same_lease_restart
         ? supervision.restart_parent
         : policy.turn_ticket;
     const uint64_t epoch = session->epoch.load(std::memory_order_acquire);
@@ -2041,8 +1776,8 @@ int capture_supervision_begin(LfmSession *session, uint64_t cursor) {
 
     const uint64_t generation = supervision.next_scope_generation++;
     if (supervision.next_scope_generation == 0) return -EOVERFLOW;
-    LfmTicketIdV1 tickets[CAPTURE_DEADLINE_COUNT]{};
-    for (LfmTicketIdV1 &ticket : tickets) {
+    LfmTicketId tickets[CAPTURE_DEADLINE_COUNT]{};
+    for (LfmTicketId &ticket : tickets) {
         ticket = next_ticket(session, LFM_TICKET_DEADLINE);
     }
     kc_scope_child_lease leases[CAPTURE_DEADLINE_COUNT]{};
@@ -2538,7 +2273,7 @@ void leave_publication(LfmSession *session) {
     }
 }
 
-EventRecord make_event(uint32_t kind, uint64_t epoch, LfmTicketIdV1 ticket,
+EventRecord make_event(uint32_t kind, uint64_t epoch, LfmTicketId ticket,
                        int32_t status, const void *payload,
                        size_t payload_bytes, uint32_t flags = 0) {
     EventRecord record{};
@@ -2552,12 +2287,10 @@ EventRecord make_event(uint32_t kind, uint64_t epoch, LfmTicketIdV1 ticket,
     return record;
 }
 
-EventRecord make_turn(uint64_t epoch, LfmTicketIdV1 ticket,
+EventRecord make_turn(uint64_t epoch, LfmTicketId ticket,
                       uint32_t playback_count, uint32_t emitted,
                       uint32_t flags, int32_t status) {
-    const LfmTurnEventV1 turn = {
-        .size = sizeof(LfmTurnEventV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
+    const LfmTurnEvent turn = {
         .playback_leases = playback_count,
         .emitted_items = emitted,
     };
@@ -2586,7 +2319,7 @@ bool stage_results(LfmSession *session, const EventRecord *records,
 }
 
 bool stage_event(LfmSession *session, uint32_t kind, uint64_t epoch,
-                 LfmTicketIdV1 ticket, int32_t status, const void *payload,
+                 LfmTicketId ticket, int32_t status, const void *payload,
                  size_t payload_bytes, uint32_t flags = 0,
                  bool gate_epoch = false, int32_t stop_after = 0) {
     if (payload_bytes > EVENT_PAYLOAD_CAPACITY) {
@@ -2599,7 +2332,7 @@ bool stage_event(LfmSession *session, uint32_t kind, uint64_t epoch,
 }
 
 bool stage_turn(LfmSession *session, uint64_t action_epoch,
-                LfmTicketIdV1 ticket, uint32_t playback_count,
+                LfmTicketId ticket, uint32_t playback_count,
                 uint32_t emitted, uint32_t flags, int32_t status = 0,
                 int32_t stop_after = 0) {
     const EventRecord record = make_turn(action_epoch, ticket, playback_count,
@@ -2610,16 +2343,14 @@ bool stage_turn(LfmSession *session, uint64_t action_epoch,
 }
 
 bool stage_playback_ready(LfmSession *session,
-                          const LfmPcmLeaseV1 &lease) {
+                          const LfmPcmLease &lease) {
     if (session->platform_audio.context &&
         session->platform_audio.playback_ready) {
         const int status = session->platform_audio.playback_ready(
             session->platform_audio.context, &lease);
         return status == 0;
     }
-    const LfmPlaybackReadyEventV1 ready = {
-        .size = sizeof(LfmPlaybackReadyEventV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
+    const LfmPlaybackReadyEvent ready = {
         .lease_id = lease.lease_id,
         .buffer_generation = lease.buffer_generation,
     };
@@ -2652,7 +2383,7 @@ bool stage_action_terminal(LfmSession *session, int32_t status,
 }
 
 bool stage_action_failure(LfmSession *session, uint64_t action_epoch,
-                          LfmTicketIdV1 ticket, int32_t status,
+                          LfmTicketId ticket, int32_t status,
                           const char *message, uint32_t playback_count = 0,
                           uint32_t emitted = 0, bool stop_after = true) {
     if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
@@ -2687,7 +2418,7 @@ void release_prepared(LfmSession *session, PreparedPlayback *playback) {
 }
 
 int reserve_playback(LfmSession *session, uint64_t action_epoch,
-                     LfmPcmLeaseV1 *out) {
+                     LfmPcmLease *out) {
     if (session->stop.load(std::memory_order_acquire)) {
         return LFM_STATUS_CANCELLED;
     }
@@ -2792,9 +2523,6 @@ ResultProgress drain_result(LfmSession *session) {
             return RESULT_DRAINED;
         }
     }
-    /* Any outward record may be the host's causal observation edge. Publish
-     * the coordinator-owned diagnostic image before making that edge visible. */
-    publish_capture_supervision_snapshot(session);
     while (result.next < result.count) {
         const EventRecord &record = result.records[result.next];
         if (!event_push(&session->events, record)) {
@@ -3026,7 +2754,7 @@ ActionProgress advance_action(LfmSession *session) {
                                     "playback publication failed");
                         return ACTION_PROGRESS;
                     }
-                    const LfmPcmLeaseV1 published = action.playback.lease;
+                    const LfmPcmLease published = action.playback.lease;
                     action.playback.active = false;
                     action.playback.samples = 0;
                     if (!stage_playback_ready(session, published)) {
@@ -3153,7 +2881,7 @@ ActionProgress advance_action(LfmSession *session) {
 }
 
 SessionAction *prepare_action(LfmSession *session, uint64_t action_epoch,
-                              LfmTicketIdV1 ticket,
+                              LfmTicketId ticket,
                               bool turn_started_required) {
     if (session->action.active) {
         if (!turn_started_required) {
@@ -3216,7 +2944,7 @@ int refresh_capture_reclaim(LfmSession *session) {
 }
 
 int claim_capture_range(LfmSession *session, uint64_t start, uint64_t end,
-                        uint64_t epoch, const LfmTicketIdV1 &ticket,
+                        uint64_t epoch, const LfmTicketId &ticket,
                         CaptureRangeLease *out) {
     CaptureArena &arena = session->capture_arena;
     if (!out || end <= start || end - start > session->capture_turn_frames ||
@@ -3355,7 +3083,7 @@ int retire_unstarted_capture_producer(LfmSession *session) {
      * accepted before setup failed. The hardware endpoint is already joined,
      * publication admission is closed with no active publisher, and the ring
      * is fixed-size, so administrative join owns this bounded retirement. */
-    LfmCaptureChunkV1 discarded{};
+    LfmCaptureChunk discarded{};
     for (uint32_t index = 0; index < CAPTURE_CHUNK_CAPACITY; ++index) {
         if (!capture_chunk_pop(&session->capture_chunks, &discarded)) break;
     }
@@ -3384,7 +3112,7 @@ int freeze_capture_turn(LfmSession *session) {
     if (claimed == LFM_STATUS_WOULD_BLOCK) return CAPTURE_FREEZE_CAPACITY;
     if (claimed != 0) return claimed;
 
-    LfmCaptureChunkV1 suffix = policy.chunk;
+    LfmCaptureChunk suffix = policy.chunk;
     const bool suffix_pending = policy.chunk_pending &&
         suffix.stream_epoch == supervision.epoch &&
         suffix.stream_epoch == session->epoch.load(std::memory_order_acquire) &&
@@ -3394,7 +3122,7 @@ int freeze_capture_turn(LfmSession *session) {
     supervision.commit_lease_id = 0;
     supervision.parent = {};
     reset_capture_policy(session, end, false);
-    const LfmTicketIdV1 next = rotate_capture_ticket(
+    const LfmTicketId next = rotate_capture_ticket(
         producer, session->epoch.load(std::memory_order_acquire));
     policy.turn_ticket = next;
     if (suffix_pending) {
@@ -3563,7 +3291,7 @@ int trigger_barge_interrupt(LfmSession *session) {
 
 int apply_barge_decision(LfmSession *session, uint64_t cursor,
                          uint64_t interval,
-                         const LfmSesameDecisionV1 &decision) {
+                         const LfmSesameDecision &decision) {
     CapturePolicy &policy = session->capture_policy;
     const PlaybackPolicy &playback = session->playback_policy;
     if (decision.voice == 0 || !playback_echo_window(session, cursor)) {
@@ -3597,7 +3325,7 @@ int apply_barge_decision(LfmSession *session, uint64_t cursor,
 }
 
 int apply_capture_decision(LfmSession *session, uint64_t cursor,
-                           const LfmSesameDecisionV1 &decision) {
+                           const LfmSesameDecision &decision) {
     CapturePolicy &policy = session->capture_policy;
     const uint32_t prior_state = policy.state;
     const uint64_t interval = cursor - policy.last_evidence_cursor;
@@ -3717,15 +3445,13 @@ int apply_capture_decision(LfmSession *session, uint64_t cursor,
     const int barge = apply_barge_decision(
         session, cursor, interval, decision);
     if (barge != 0) return barge;
-    session->capture_evidence_cursor.store(cursor, std::memory_order_relaxed);
-    session->capture_evidence_updates.store(
-        policy.evidence_updates, std::memory_order_release);
+    session->capture_evidence_cursor.store(cursor, std::memory_order_release);
     return 0;
 }
 
 int resolve_capture_window(LfmSession *session,
-                           const LfmCaptureChunkV1 &chunk,
-                           uint64_t cursor, LfmSesameWindowV1 *out) {
+                           const LfmCaptureChunk &chunk,
+                           uint64_t cursor, LfmSesameWindow *out) {
     LfmCaptureProducer *producer =
         session->chunk_producer.load(std::memory_order_acquire);
     if (!producer || !out || cursor < LFM_SESAME_FFT_SIZE) {
@@ -3787,11 +3513,11 @@ int advance_capture_policy(LfmSession *session) {
         return CAPTURE_POLICY_PROGRESS;
     }
 
-    LfmSesameWindowV1 window{};
+    LfmSesameWindow window{};
     const int resolved = resolve_capture_window(
         session, policy.chunk, policy.next_evidence_cursor, &window);
     if (resolved != 0) return resolved;
-    LfmSesameDecisionV1 decision{};
+    LfmSesameDecision decision{};
     const int detected = lfm_sesame_detector_process_window(
         policy.detector, LFM_SESAME_STREAM_MIC, &window, nullptr, 0,
         &decision);
@@ -3810,7 +3536,7 @@ int advance_capture_policy(LfmSession *session) {
 }
 
 int process_capture_chunk(LfmSession *session,
-                          const LfmCaptureChunkV1 &chunk) {
+                          const LfmCaptureChunk &chunk) {
     LfmCaptureProducer *producer =
         session->chunk_producer.load(std::memory_order_acquire);
     if (!producer) return CAPTURE_POLICY_PROGRESS;
@@ -3857,7 +3583,7 @@ int step_capture_policy(LfmSession *session, uint32_t *budget) {
         return advance_capture_policy(session);
     }
     if (!budget || *budget == 0) return CAPTURE_POLICY_EMPTY;
-    LfmCaptureChunkV1 chunk{};
+    LfmCaptureChunk chunk{};
     if (!capture_chunk_pop(&session->capture_chunks, &chunk)) {
         return CAPTURE_POLICY_EMPTY;
     }
@@ -3982,7 +3708,7 @@ int append_playback_history(LfmSession *session,
 }
 
 struct PlaybackWindowBuilder {
-    LfmSesameSpanV1 *spans = nullptr;
+    LfmSesameSpan *spans = nullptr;
     size_t capacity = 0;
     size_t count = 0;
     size_t filled = 0;
@@ -3998,7 +3724,7 @@ bool append_playback_window_span(PlaybackWindowBuilder *builder,
         return false;
     }
     if (builder->count != 0) {
-        LfmSesameSpanV1 &prior = builder->spans[builder->count - 1];
+        LfmSesameSpan &prior = builder->spans[builder->count - 1];
         if ((zero && prior.samples == playback_zeros) ||
             (!zero && prior.samples != playback_zeros &&
              prior.samples + prior.count == data)) {
@@ -4018,7 +3744,7 @@ bool append_playback_window_span(PlaybackWindowBuilder *builder,
 }
 
 int resolve_playback_window(LfmSession *session, uint64_t cursor,
-                            LfmSesameSpanV1 *spans, size_t capacity,
+                            LfmSesameSpan *spans, size_t capacity,
                             size_t *out_count) {
     if (!spans || capacity == 0 || !out_count ||
         cursor > session->playback_policy.available_cursor) {
@@ -4108,16 +3834,16 @@ enum PlaybackPolicyProgress : int {
 int step_playback_policy(LfmSession *session, uint32_t *budget) {
     PlaybackPolicy &policy = session->playback_policy;
     if (policy.next_evidence_cursor <= policy.available_cursor) {
-        LfmSesameSpanV1 spans[LFM_SESAME_FFT_SIZE];
+        LfmSesameSpan spans[LFM_SESAME_FFT_SIZE];
         size_t span_count = 0;
         const int resolved = resolve_playback_window(
             session, policy.next_evidence_cursor, spans,
             LFM_SESAME_FFT_SIZE, &span_count);
         if (resolved != 0) return resolved;
-        LfmSesameDecisionV1 decision{};
+        LfmSesameDecision decision{};
         int detected = 0;
         if (span_count <= 2) {
-            const LfmSesameWindowV1 window = {
+            const LfmSesameWindow window = {
                 .first = spans[0].samples,
                 .first_count = spans[0].count,
                 .second = span_count == 2 ? spans[1].samples : nullptr,
@@ -4127,7 +3853,7 @@ int step_playback_policy(LfmSession *session, uint32_t *budget) {
                 policy.detector, LFM_SESAME_STREAM_PLAYBACK, &window,
                 nullptr, 0, &decision);
         } else {
-            const LfmSesameScatterWindowV1 window = {
+            const LfmSesameScatterWindow window = {
                 .spans = spans,
                 .span_count = span_count,
             };
@@ -4159,12 +3885,6 @@ int step_playback_policy(LfmSession *session, uint32_t *budget) {
         policy.decision = decision;
         policy.last_evidence_cursor = policy.next_evidence_cursor;
         policy.evidence_updates++;
-        session->playback_evidence_updates.store(
-            policy.evidence_updates, std::memory_order_relaxed);
-        session->playback_evidence_cursor.store(
-            policy.last_evidence_cursor, std::memory_order_relaxed);
-        session->playback_evidence_voice.store(decision.voice,
-                                               std::memory_order_relaxed);
         if (!advance_playback_cadence(&policy, session->playback_rate)) {
             return -EOVERFLOW;
         }
@@ -4179,8 +3899,6 @@ int step_playback_policy(LfmSession *session, uint32_t *budget) {
     }
     PlaybackEvidenceRecord record{};
     if (!playback_evidence_pop(&policy.incoming, &record)) {
-        session->playback_evidence_backlog.store(0,
-                                                std::memory_order_release);
         return PLAYBACK_POLICY_EMPTY;
     }
     --*budget;
@@ -4195,8 +3913,6 @@ int step_playback_policy(LfmSession *session, uint32_t *budget) {
     policy.last_ticket = record.ticket;
     policy.last_epoch = record.stream_epoch;
     policy.last_capture_cursor = record.capture_sample_cursor_snapshot;
-    session->playback_evidence_records.store(
-        policy.evidence_records, std::memory_order_relaxed);
     const uint64_t current_epoch =
         session->epoch.load(std::memory_order_acquire);
     const bool control =
@@ -4224,87 +3940,7 @@ int step_playback_policy(LfmSession *session, uint32_t *budget) {
         (void)retire_playback_record(session, record);
         return appended;
     }
-    session->playback_evidence_backlog.store(
-        static_cast<uint32_t>(policy.history.tail - policy.history.head),
-        std::memory_order_release);
     return PLAYBACK_POLICY_PROGRESS;
-}
-
-void publish_playback_policy_snapshot(LfmSession *session) {
-    PlaybackPolicy &policy = session->playback_policy;
-    const uint32_t current = policy.published_snapshot.load(
-        std::memory_order_relaxed);
-    const uint32_t target = current ^ 1u;
-    PlaybackPolicySnapshotSlot &slot = policy.snapshots[target];
-    if (!claim_snapshot_writer(&policy.snapshot_pending, target, &slot)) {
-        return;
-    }
-    const uint64_t incoming_head = policy.incoming.head.value.load(
-        std::memory_order_acquire);
-    const uint64_t incoming_tail = policy.incoming.tail.value.load(
-        std::memory_order_acquire);
-    slot.value = {
-        .size = sizeof(LfmPlaybackPolicySnapshotV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
-        .sample_rate = session->playback_rate,
-        .last_voice = policy.decision.voice,
-        .detector_backlog = static_cast<uint32_t>(
-            std::min<uint64_t>(UINT32_MAX,
-                               incoming_tail - incoming_head +
-                                   policy.history.tail - policy.history.head)),
-        .retained_observers = session->playback_retained_observers.load(
-            std::memory_order_acquire),
-        .evidence_records = policy.evidence_records,
-        .evidence_updates = policy.evidence_updates,
-        .last_evidence_cursor = policy.last_evidence_cursor,
-        .discontinuities = policy.discontinuities,
-        .stream_epoch = policy.last_epoch,
-        .ticket = policy.last_ticket,
-        .capture_sample_cursor_snapshot = policy.last_capture_cursor,
-        .last_score = policy.decision.score,
-        .adaptive_min = policy.decision.adaptive_min,
-        .adaptive_max = policy.decision.adaptive_max,
-        .echo_start_capture_cursor = policy.echo_start_capture_cursor,
-        .last_voice_capture_cursor = policy.last_voice_capture_cursor,
-        .echo_tail_capture_cursor = policy.echo_tail_capture_cursor,
-        .barge_voiced_frames = session->capture_policy.barge_voiced_frames,
-        .barge_interrupts = session->capture_policy.barge_interrupts,
-        .barge_source_epoch =
-            session->capture_policy.barge_source_epoch,
-        .barge_interrupt_epoch =
-            session->capture_policy.barge_interrupt_epoch,
-        .barge_playback_ticket =
-            session->capture_policy.barge_playback_ticket,
-        .reserved = {},
-    };
-    slot.state.store(0, std::memory_order_release);
-    policy.published_snapshot.store(target, std::memory_order_release);
-}
-
-int read_playback_policy_snapshot(
-    const LfmSession *session, LfmPlaybackPolicySnapshotV1 *out) {
-    LfmSession *owner = const_cast<LfmSession *>(session);
-    PlaybackPolicy &policy = owner->playback_policy;
-    for (uint32_t attempt = 0; attempt < 2; ++attempt) {
-        const uint32_t index = policy.published_snapshot.load(
-            std::memory_order_acquire);
-        const PlaybackPolicySnapshotSlot &slot = policy.snapshots[index];
-        uint32_t readers = slot.state.load(std::memory_order_acquire);
-        if ((readers & CAPTURE_SNAPSHOT_WRITING) != 0 ||
-            readers == CAPTURE_SNAPSHOT_WRITING - 1) {
-            continue;
-        }
-        if (!slot.state.compare_exchange_strong(
-                readers, readers + 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            continue;
-        }
-        *out = slot.value;
-        release_snapshot_reader(owner, &policy.snapshot_pending, index,
-                                &slot);
-        return 0;
-    }
-    return LFM_STATUS_WOULD_BLOCK;
 }
 
 void flush_published(LfmSession *session) {
@@ -4321,7 +3957,6 @@ void flush_published(LfmSession *session) {
 }
 
 int drive_conversation_interrupt(LfmSession *session) {
-    if (session->dock_only) return 0;
     if (!session->interrupt_pending) {
         session->interrupt_route = {};
         const int rc = lfm_conversation_interrupt_submit_native(
@@ -4386,22 +4021,9 @@ void process_capture_range(LfmSession *session,
     const uint64_t current_epoch =
         session->epoch.load(std::memory_order_acquire);
     if (range.stream_epoch != current_epoch) {
-        session->capture_stale.fetch_add(1, std::memory_order_relaxed);
         (void)release_capture_range(session, range);
         return;
     }
-    session->capture_consumed.fetch_add(1, std::memory_order_relaxed);
-    if (session->dock_only) {
-        (void)release_capture_range(session, range);
-        const EventRecord records[2] = {
-            make_event(LFM_EVENT_TURN_STARTED, current_epoch, range.ticket,
-                       0, nullptr, 0),
-            make_turn(current_epoch, range.ticket, 0, 0, 0, 0),
-        };
-        (void)stage_results(session, records, 2);
-        return;
-    }
-
     LfmF32Span spans[2]{};
     uint32_t span_count = 0;
     int rc = capture_arena_spans(
@@ -4437,15 +4059,6 @@ void process_pcm_view(LfmSession *session, const PcmViewCommand &command) {
                          LFM_STATUS_STALE);
         return;
     }
-    if (session->dock_only) {
-        const EventRecord records[2] = {
-            make_event(LFM_EVENT_TURN_STARTED, current_epoch, command.ticket,
-                       0, nullptr, 0),
-            make_turn(current_epoch, command.ticket, 0, 0, 0, 0),
-        };
-        (void)stage_results(session, records, 2);
-        return;
-    }
     SessionAction *action = prepare_action(
         session, current_epoch, command.ticket, true);
     if (!action) return;
@@ -4463,14 +4076,8 @@ void process_pcm_view(LfmSession *session, const PcmViewCommand &command) {
 void process_text(LfmSession *session, const TextCommand &command) {
     uint64_t current_epoch = session->epoch.load(std::memory_order_acquire);
     if (command.epoch != current_epoch) {
-        session->text_commands_stale.fetch_add(1, std::memory_order_relaxed);
         stage_turn(session, command.epoch, command.ticket, 0, 0, 0,
                      LFM_STATUS_STALE);
-        return;
-    }
-    session->text_commands_consumed.fetch_add(1, std::memory_order_relaxed);
-    if (session->dock_only) {
-        stage_turn(session, current_epoch, command.ticket, 0, 0, 0);
         return;
     }
     SessionAction *action = prepare_action(
@@ -4519,8 +4126,7 @@ SessionProgress session_step(LfmSession *session) {
                 session->platform_audio.context);
             if (retired == LFM_STATUS_WOULD_BLOCK) return SESSION_IDLE;
             if (retired != 0) {
-                record_terminal_failure(session, retired,
-                                        SESSION_TERMINAL_PLATFORM_RETIRE);
+                record_terminal_failure(session, retired);
             }
             continue;
         }
@@ -4729,15 +4335,14 @@ SessionProgress session_step(LfmSession *session) {
                     std::memory_order_acquire) != PUBLICATION_CLOSED) {
                 return SESSION_IDLE;
             }
-            LfmCaptureChunkV1 chunk{};
+            LfmCaptureChunk chunk{};
             if (capture_chunk_pop(&session->capture_chunks, &chunk)) {
                 continue;
             }
             const int retire = retire_closed_capture_producer(session);
             if (retire == CAPTURE_RETIRE_PROGRESS) continue;
             if (retire < 0) {
-                record_terminal_failure(session, retire,
-                                        SESSION_TERMINAL_CAPTURE_RETIRE);
+                record_terminal_failure(session, retire);
                 continue;
             }
             if (session->command_pending) {
@@ -4780,16 +4385,12 @@ SessionProgress session_step(LfmSession *session) {
                 (void)release_capture_range(session, range);
                 continue;
             }
-            if (!session->dock_only) {
-                const int teardown = drive_conversation_interrupt(session);
-                if (teardown == -EINPROGRESS) {
-                    return SESSION_BLOCKED_ROUTE;
-                }
-                if (teardown != 0) {
-                    record_terminal_failure(
-                        session, teardown,
-                        SESSION_TERMINAL_CONVERSATION_INTERRUPT);
-                }
+            const int teardown = drive_conversation_interrupt(session);
+            if (teardown == -EINPROGRESS) {
+                return SESSION_BLOCKED_ROUTE;
+            }
+            if (teardown != 0) {
+                record_terminal_failure(session, teardown);
             }
             if (!playback_evidence_empty(
                     session->playback_policy.incoming)) {
@@ -4797,8 +4398,7 @@ SessionProgress session_step(LfmSession *session) {
             }
             const int playback_retired = retire_playback_history(session);
             if (playback_retired != 0) {
-                record_terminal_failure(session, playback_retired,
-                                        SESSION_TERMINAL_PLAYBACK_RETIRE);
+                record_terminal_failure(session, playback_retired);
                 continue;
             }
             flush_published(session);
@@ -4921,64 +4521,6 @@ SessionProgress session_step(LfmSession *session) {
     return SESSION_READY;
 }
 
-void publish_session_diagnostics(LfmSession *session,
-                                 SessionProgress progress) {
-    if (!session) return;
-    LfmSessionDiagnosticState &state = session->diagnostics;
-    const uint64_t event_head =
-        session->events.head.value.load(std::memory_order_acquire);
-    const uint64_t event_tail =
-        session->events.tail.value.load(std::memory_order_acquire);
-    const uint64_t command_head =
-        session->commands.head.value.load(std::memory_order_acquire);
-    const uint64_t command_tail =
-        session->commands.tail.value.load(std::memory_order_acquire);
-    const uint64_t pcm_head =
-        session->pcm_views.head.value.load(std::memory_order_acquire);
-    const uint64_t pcm_tail =
-        session->pcm_views.tail.value.load(std::memory_order_acquire);
-    state.action_ticket_sequence.store(session->action.ticket.sequence,
-                                       std::memory_order_relaxed);
-    state.action_route_sequence.store(session->action.route.ticket.sequence,
-                                      std::memory_order_relaxed);
-    state.event_depth.store(event_tail - event_head,
-                            std::memory_order_relaxed);
-    state.command_depth.store(command_tail - command_head,
-                              std::memory_order_relaxed);
-    state.pcm_depth.store(pcm_tail - pcm_head, std::memory_order_relaxed);
-    state.progress.store(progress, std::memory_order_relaxed);
-    state.coordinator_phase.store(session->coordinator_phase,
-                                  std::memory_order_relaxed);
-    state.action_phase.store(session->action.phase,
-                             std::memory_order_relaxed);
-    state.action_active.store(session->action.active ? 1u : 0u,
-                              std::memory_order_relaxed);
-    state.admission_pending.store(
-        session->action.admission_pending ? 1u : 0u,
-        std::memory_order_relaxed);
-    state.route_pending.store(session->action.route_pending ? 1u : 0u,
-                              std::memory_order_relaxed);
-    state.playback_active.store(session->action.playback.active ? 1u : 0u,
-                               std::memory_order_relaxed);
-    state.result_active.store(session->result.active ? 1u : 0u,
-                             std::memory_order_relaxed);
-    state.result_next.store(session->result.next, std::memory_order_relaxed);
-    state.result_count.store(session->result.count, std::memory_order_relaxed);
-    state.delivery_pending.store(session->delivery_pending ? 1u : 0u,
-                                 std::memory_order_relaxed);
-    state.stop.store(session->stop.load(std::memory_order_acquire) ? 1u : 0u,
-                     std::memory_order_relaxed);
-    state.event_done.store(
-        session->event_done.load(std::memory_order_acquire) ? 1u : 0u,
-        std::memory_order_relaxed);
-    const std::atomic<uint32_t> *operation =
-        lfm_conversation_operation_view_native(session->conversation);
-    state.conversation_operation.store(
-        operation ? operation->load(std::memory_order_acquire) : 0,
-        std::memory_order_relaxed);
-    state.publications.fetch_add(1, std::memory_order_release);
-}
-
 void coordinator_main(void *context) {
     LfmSession *session = static_cast<LfmSession *>(context);
     /* kc_service_start publishes its retained continuation once so owner
@@ -4994,20 +4536,7 @@ void coordinator_main(void *context) {
         return;
     }
     const SessionProgress progress = session_step(session);
-    publish_session_diagnostics(session, progress);
-    publish_playback_policy_snapshot(session);
-    publish_capture_supervision_snapshot(session);
     if (progress == SESSION_DONE) {
-        /* DONE is retained continuation state until both terminal diagnostic
-         * images are published. A reader pinning either inactive generation
-         * owns the only successor edge; release rings this service and the
-         * DONE re-entry retries publication without replaying teardown. */
-        if (session->playback_policy.snapshot_pending.load(
-                std::memory_order_acquire) != 0 ||
-            session->capture_supervision.snapshot_pending.load(
-                std::memory_order_acquire) != 0) {
-            return;
-        }
         kc_service_request_stop(session->coordinator);
         {
             std::lock_guard<std::mutex> guard(session->lifecycle_mutex);
@@ -5025,9 +4554,7 @@ void coordinator_main(void *context) {
 
 int invoke_callback(LfmSession *session, const EventRecord &record) {
     if (!session->callbacks.on_event) return 0;
-    LfmEventV1 event = {
-        .size = sizeof(LfmEventV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
+    LfmEvent event = {
         .kind = record.kind,
         .flags = record.flags,
         .session_id = session->id,
@@ -5165,7 +4692,7 @@ void unregister_session(LfmRuntime *runtime, LfmSession *session) {
 }
 
 int submit_text(LfmSession *session, const char *utf8, size_t utf8_bytes,
-                LfmTicketIdV1 *out_ticket) {
+                LfmTicketId *out_ticket) {
     if (!session || !utf8 || utf8_bytes == 0 ||
         utf8_bytes > LFM_TEXT_COMMAND_MAX_BYTES || !out_ticket) {
         return LFM_STATUS_INVALID_ARGUMENT;
@@ -5193,7 +4720,6 @@ int submit_text(LfmSession *session, const char *utf8, size_t utf8_bytes,
                        ? 0
                        : LFM_STATUS_WOULD_BLOCK;
     if (rc != 0) return finish(rc);
-    session->text_commands_accepted.fetch_add(1, std::memory_order_relaxed);
     *out_ticket = command.ticket;
     notify_session(session);
     return finish(0);
@@ -5201,8 +4727,8 @@ int submit_text(LfmSession *session, const char *utf8, size_t utf8_bytes,
 
 int submit_pcm_view(LfmSession *session, const LfmF32Span *spans,
                     uint32_t span_count, uint32_t sample_rate,
-                    const LfmTicketIdV1 *parent,
-                    LfmTicketIdV1 *out_ticket) {
+                    const LfmTicketId *parent,
+                    LfmTicketId *out_ticket) {
     if (!session || !spans || span_count == 0 || sample_rate == 0 ||
         !parent || !out_ticket || parent->runtime_epoch == 0 ||
         parent->sequence == 0 || parent->generation == 0 ||
@@ -5252,8 +4778,8 @@ kc_runtime_t *lfm_internal_runtime_coordination(LfmRuntime *runtime) {
 
 int lfm_internal_session_submit_pcm_spans(
     LfmSession *session, const LfmF32Span *spans, uint32_t span_count,
-    uint32_t sample_rate, const LfmTicketIdV1 *parent,
-    LfmTicketIdV1 *out_ticket) {
+    uint32_t sample_rate, const LfmTicketId *parent,
+    LfmTicketId *out_ticket) {
     return submit_pcm_view(session, spans, span_count, sample_rate, parent,
                            out_ticket);
 }
@@ -5279,20 +4805,15 @@ int lfm_native_emission_needs_pcm(const LfmNativeEmission *emission) {
     return 1;
 }
 
-static int runtime_create_impl(const LfmRuntimeConfigV1 *config,
-                               LfmRuntime **out, bool manual_deadlines) {
+static int runtime_create_impl(const LfmRuntimeConfig *config,
+                               LfmRuntime **out) {
     if (!config || !out) return LFM_STATUS_INVALID_ARGUMENT;
     *out = nullptr;
-    if (config->size != sizeof(*config) ||
-        config->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
     if (config->coordination_workers == 0 ||
         config->coordination_workers > 64 || config->kernel_lanes == 0 ||
         config->kernel_lanes > MAX_KERNEL_LANES || config->event_capacity < 2 ||
         config->event_capacity > MAX_EVENT_CAPACITY || config->session_capacity == 0 ||
-        config->session_capacity > MAX_RUNTIME_SESSIONS || config->reserved0 != 0 ||
-        config->reserved1 != 0) {
+        config->session_capacity > MAX_RUNTIME_SESSIONS) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     LfmRuntime *runtime = new (std::nothrow) LfmRuntime();
@@ -5304,13 +4825,9 @@ static int runtime_create_impl(const LfmRuntimeConfigV1 *config,
     runtime->kernel_lanes = config->kernel_lanes;
     runtime->event_capacity = config->event_capacity;
     runtime->session_capacity = config->session_capacity;
-    runtime->manual_deadlines = manual_deadlines;
     int engine_status = 0;
-    runtime->engine = manual_deadlines
-        ? lfm_internal_engine_new_manual_deadlines_for_test(
-              static_cast<int>(config->kernel_lanes))
-        : lfm_engine_new_status(static_cast<int>(config->kernel_lanes),
-                                &engine_status);
+    runtime->engine = lfm_engine_new_status(
+        static_cast<int>(config->kernel_lanes), &engine_status);
     if (!runtime->engine) {
         delete runtime;
         if (engine_status == -ENOTSUP) return LFM_STATUS_UNSUPPORTED;
@@ -5329,16 +4846,8 @@ static int runtime_create_impl(const LfmRuntimeConfigV1 *config,
     return 0;
 }
 
-int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
-    return runtime_create_impl(config, out, false);
-}
-
-/* Private deterministic construction for non-Apple lifecycle tests. The
- * product ABI never exposes this symbol and production callers cannot select
- * a clock that only advances under test control. */
-int lfm_internal_runtime_create_manual_deadlines_for_test(
-    const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
-    return runtime_create_impl(config, out, true);
+int lfm_runtime_create(const LfmRuntimeConfig *config, LfmRuntime **out) {
+    return runtime_create_impl(config, out);
 }
 
 int lfm_runtime_start(LfmRuntime *runtime) {
@@ -5399,21 +4908,15 @@ int lfm_runtime_join(LfmRuntime *runtime) {
     return 0;
 }
 
-int lfm_runtime_snapshot(const LfmRuntime *runtime, LfmRuntimeSnapshotV1 *out) {
+int lfm_runtime_snapshot(const LfmRuntime *runtime, LfmRuntimeSnapshot *out) {
     if (!runtime || !out) return LFM_STATUS_INVALID_ARGUMENT;
-    if (out->size != sizeof(*out) || out->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
     std::lock_guard<std::mutex> guard(runtime->children_mutex);
     *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
         .runtime_epoch = runtime->epoch,
         .state = runtime->state.load(std::memory_order_acquire),
         .kernel_lanes = runtime->kernel_lanes,
         .live_models = runtime->model ? 1u : 0u,
         .live_sessions = runtime->session_count,
-        .reserved = {},
     };
     return 0;
 }
@@ -5465,7 +4968,7 @@ int lfm_runtime_model_open(LfmRuntime *runtime, const char *path,
 
 int lfm_runtime_model_memory(const LfmRuntime *runtime,
                              const LfmModel *model,
-                             LfmModelMemoryV2 *out) {
+                             LfmModelMemory *out) {
     if (!runtime || !model || !out) return LFM_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(runtime->children_mutex);
     if (runtime->model != model) return LFM_STATUS_INVALID_ARGUMENT;
@@ -5482,59 +4985,41 @@ int lfm_runtime_model_close(LfmRuntime *runtime, LfmModel *model) {
 }
 
 int lfm_runtime_conversation_create(LfmRuntime *runtime, LfmModel *model,
-                                    const LfmConversationOptionsV1 *options,
+                                    const LfmConversationOptions *options,
                                     LfmConversation **out, char *error,
                                     size_t error_length) {
     if (!runtime || !model || !options || !out) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     *out = nullptr;
-    if (options->size != sizeof(*options) ||
-        options->abi_version != LFM_RUNTIME_ABI_VERSION ||
-        options->reserved0 != 0 ||
-        (options->flags & ~LFM_CONVERSATION_SEED_SYSTEM) != 0 ||
-        options->text.size != sizeof(options->text) ||
-        options->text.abi_version != LFM_RUNTIME_ABI_VERSION ||
-        options->audio.size != sizeof(options->audio) ||
-        options->audio.abi_version != LFM_RUNTIME_ABI_VERSION ||
+    if ((options->flags & ~LFM_CONVERSATION_SEED_SYSTEM) != 0 ||
         (options->text.flags & ~LFM_SAMPLING_GREEDY) != 0 ||
-        (options->audio.flags & ~LFM_SAMPLING_GREEDY) != 0 ||
-        options->text.reserved != 0 || options->audio.reserved != 0) {
-        return LFM_STATUS_ABI_MISMATCH;
+        (options->audio.flags & ~LFM_SAMPLING_GREEDY) != 0) {
+        return LFM_STATUS_INVALID_ARGUMENT;
     }
-    for (uint64_t reserved : options->reserved) {
-        if (reserved != 0) return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    const auto policy_valid = [](const LfmSamplingPolicyV1 &policy) {
+    const auto policy_valid = [](const LfmSamplingPolicy &policy) {
         return (policy.flags & LFM_SAMPLING_GREEDY) != 0 ||
                (std::isfinite(policy.temperature) && policy.temperature > 0.0);
     };
     if (!policy_valid(options->text) || !policy_valid(options->audio)) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
-    const auto policy = [](const LfmSamplingPolicyV1 &source) {
-        return LfmSamplerConfigV1{
-            .size = sizeof(LfmSamplerConfigV1),
-            .abi_version = LFM_SAMPLE_ABI_VERSION,
+    const auto policy = [](const LfmSamplingPolicy &source) {
+        return LfmSamplerConfig{
             .flags = (source.flags & LFM_SAMPLING_GREEDY) != 0
                          ? LFM_SAMPLE_FLAG_GREEDY
                          : 0u,
             .top_k = source.top_k,
             .temperature = source.temperature,
-            .reserved = 0,
         };
     };
-    const LfmConversationConfigV1 config = {
-        .size = sizeof(LfmConversationConfigV1),
-        .abi_version = LFM_MODEL_ABI_VERSION,
+    const LfmConversationConfig config = {
         .flags = (options->flags & LFM_CONVERSATION_SEED_SYSTEM) != 0
                      ? LFM_CONVERSATION_SEED_SYSTEM
                      : 0u,
-        .reserved0 = 0,
         .seed = options->seed,
         .text_sampler = policy(options->text),
         .audio_sampler = policy(options->audio),
-        .reserved = {},
     };
 
     std::lock_guard<std::mutex> guard(runtime->children_mutex);
@@ -5564,27 +5049,14 @@ int lfm_runtime_conversation_close(LfmRuntime *runtime,
 
 int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
                        LfmConversation *conversation,
-                       const LfmSessionConfigV1 *config,
-                       const LfmCallbacksV1 *callbacks, LfmSession **out) {
+                       const LfmSessionConfig *config,
+                       const LfmCallbacks *callbacks, LfmSession **out) {
     if (!runtime || !config || !out) return LFM_STATUS_INVALID_ARGUMENT;
     *out = nullptr;
-    if (config->size != sizeof(*config) ||
-        config->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
-    const bool dock_only =
-        (config->flags & LFM_SESSION_FLAG_DOCK_ONLY) != 0;
-    const bool requested_manual_deadlines =
-        (config->flags & LFM_SESSION_FLAG_MANUAL_DEADLINES) != 0;
-    const bool manual_deadlines =
-        runtime->manual_deadlines || requested_manual_deadlines;
     if (runtime->state.load(std::memory_order_acquire) >= LFM_RUNTIME_STOPPING ||
-        (config->flags & ~(LFM_SESSION_FLAG_DOCK_ONLY |
-                           LFM_SESSION_FLAG_MANUAL_DEADLINES)) != 0 ||
-        (requested_manual_deadlines && !dock_only) ||
+        config->flags != 0 ||
         config->playback_slots == 0 || config->playback_slots > MAX_PCM_SLOTS ||
         config->capture_max_callback_frames == 0 ||
-        (dock_only && config->playback_frames_per_slot == 0) ||
         config->pcm_channels != 1 ||
         config->capture_sample_rate < 8000 ||
         config->capture_sample_rate > 192000 ||
@@ -5594,12 +5066,7 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
         config->max_new_tokens == 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
-    if (dock_only && (model || conversation)) return LFM_STATUS_INVALID_ARGUMENT;
-    if (!dock_only && (!model || !conversation)) return LFM_STATUS_INVALID_ARGUMENT;
-    if (callbacks && (callbacks->size != sizeof(*callbacks) ||
-                      callbacks->abi_version != LFM_RUNTIME_ABI_VERSION)) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
+    if (!model || !conversation) return LFM_STATUS_INVALID_ARGUMENT;
     const uint64_t cadence_frames =
         (static_cast<uint64_t>(config->capture_sample_rate) + 49) / 50;
     const uint64_t callback_frames = config->capture_max_callback_frames;
@@ -5627,16 +5094,14 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
     if (runtime->state.load(std::memory_order_acquire) >= LFM_RUNTIME_STOPPING) {
         return LFM_STATUS_CANCELLED;
     }
-    if (!dock_only) {
-        if (runtime->model != model ||
-            lfm_conversation_belongs_to(conversation, model) != 1) {
-            return LFM_STATUS_INVALID_ARGUMENT;
-        }
-        for (uint32_t i = 0; i < runtime->session_capacity; ++i) {
-            if (runtime->sessions[i] &&
-                runtime->sessions[i]->conversation == conversation) {
-                return LFM_STATUS_BUSY;
-            }
+    if (runtime->model != model ||
+        lfm_conversation_belongs_to(conversation, model) != 1) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint32_t i = 0; i < runtime->session_capacity; ++i) {
+        if (runtime->sessions[i] &&
+            runtime->sessions[i]->conversation == conversation) {
+            return LFM_STATUS_BUSY;
         }
     }
     if (runtime->session_count >= runtime->session_capacity) {
@@ -5644,18 +5109,16 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
     }
     size_t playback_frames = config->playback_frames_per_slot;
     size_t playback_capacity = config->playback_frames_per_slot;
-    if (!dock_only) {
-        int prepare = lfm_conversation_prepare_pcm_native(
-            conversation, capture_prepare_samples,
-            config->capture_sample_rate,
-            config->playback_sample_rate, &playback_frames);
-        if (prepare != 0) return prepare;
-        if (playback_frames == 0 || playback_frames > UINT32_MAX ||
-            (playback_capacity != 0 && playback_frames > playback_capacity)) {
-            return LFM_STATUS_INVALID_ARGUMENT;
-        }
-        if (playback_capacity == 0) playback_capacity = playback_frames;
+    int prepare = lfm_conversation_prepare_pcm_native(
+        conversation, capture_prepare_samples,
+        config->capture_sample_rate,
+        config->playback_sample_rate, &playback_frames);
+    if (prepare != 0) return prepare;
+    if (playback_frames == 0 || playback_frames > UINT32_MAX ||
+        (playback_capacity != 0 && playback_frames > playback_capacity)) {
+        return LFM_STATUS_INVALID_ARGUMENT;
     }
+    if (playback_capacity == 0) playback_capacity = playback_frames;
     size_t playback_samples = 0;
     if (!checked_samples(static_cast<uint32_t>(playback_capacity),
                          config->pcm_channels,
@@ -5668,8 +5131,6 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
     session->runtime = runtime;
     session->model = model;
     session->conversation = conversation;
-    session->dock_only = dock_only;
-    session->manual_deadlines = manual_deadlines;
     session->id = config->session_id == 0
                       ? next_session_id.fetch_add(1, std::memory_order_relaxed)
                       : config->session_id;
@@ -5694,7 +5155,7 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
         new (std::nothrow) PcmViewRecordCell[config->command_capacity];
     int rc = capture_arena_create(&session->capture_arena, arena_frames);
     session->capture_chunks.records =
-        new (std::nothrow) LfmCaptureChunkV1[CAPTURE_CHUNK_CAPACITY];
+        new (std::nothrow) LfmCaptureChunk[CAPTURE_CHUNK_CAPACITY];
     session->capture_chunks.capacity = CAPTURE_CHUNK_CAPACITY;
     session->playback_policy.incoming.records =
         new (std::nothrow) PlaybackEvidenceRecord[PLAYBACK_EVIDENCE_CAPACITY];
@@ -5726,7 +5187,6 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
                                   session->playback_rate)) {
         rc = -EOVERFLOW;
     }
-    if (rc == 0) publish_playback_policy_snapshot(session);
     if (rc == 0) {
         for (uint32_t index = 0; index < config->command_capacity; ++index) {
             session->commands.ring[index].sequence.store(
@@ -5808,30 +5268,21 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
 }
 
 int lfm_internal_session_bind_platform_audio(
-    LfmSession *session, const LfmPlatformAudioConfigV1 *config,
-    const LfmPlatformAudioBindingV1 *binding) {
+    LfmSession *session, const LfmPlatformAudioConfig *config,
+    const LfmPlatformAudioBinding *binding) {
     if (!session || !config || !binding || !binding->context ||
         !binding->playback_ready || !binding->playback_flush ||
         !binding->retire_context || !binding->finish_retirement ||
         !binding->destroy_context) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
-    if (config->size != sizeof(*config) ||
-        config->abi_version != LFM_RUNTIME_ABI_VERSION ||
-        binding->size != sizeof(*binding) ||
-        binding->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
-    if (config->flags != 0 || config->reserved0 != 0 ||
+    if (config->flags != 0 ||
         config->capture_sample_rate != session->capture_rate ||
         config->playback_sample_rate != session->playback_rate ||
         config->capture_callback_frames !=
             session->capture_callback_frames ||
         config->playback_callback_frames == 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    for (uint64_t reserved : config->reserved) {
-        if (reserved != 0) return LFM_STATUS_INVALID_ARGUMENT;
     }
     std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
     if (session->state.load(std::memory_order_acquire) !=
@@ -5914,7 +5365,7 @@ int lfm_session_start(LfmSession *session) {
 }
 
 int lfm_session_submit_text(LfmSession *session, const char *utf8,
-                            size_t utf8_bytes, LfmTicketIdV1 *out_ticket) {
+                            size_t utf8_bytes, LfmTicketId *out_ticket) {
     return submit_text(session, utf8, utf8_bytes, out_ticket);
 }
 
@@ -6129,157 +5580,6 @@ int lfm_session_join(LfmSession *session) {
     return session->terminal_status.load(std::memory_order_acquire);
 }
 
-int lfm_session_snapshot(const LfmSession *session, LfmSessionSnapshotV1 *out) {
-    if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
-    if (out->size != sizeof(*out) || out->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
-    *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
-        .session_id = session->id,
-        .epoch = session->epoch.load(std::memory_order_acquire),
-        .state = session->state.load(std::memory_order_acquire),
-        .terminal_status = session->terminal_status.load(std::memory_order_acquire),
-        .reserved_coordinator = {},
-        .reserved_delivery = 0,
-        .callbacks_entered = session->callbacks_entered.load(std::memory_order_relaxed),
-        .capture_consumed = session->capture_consumed.load(std::memory_order_relaxed),
-        .capture_stale = session->capture_stale.load(std::memory_order_relaxed),
-        .playback_published = session->playback_published.load(std::memory_order_relaxed),
-        .playback_consumed = session->playback_consumed.load(std::memory_order_relaxed),
-        .text_commands_accepted =
-            session->text_commands_accepted.load(std::memory_order_relaxed),
-        .text_commands_consumed =
-            session->text_commands_consumed.load(std::memory_order_relaxed),
-        .text_commands_stale =
-            session->text_commands_stale.load(std::memory_order_relaxed),
-        .live_playback_leases = pool_live(session->playback),
-        .reliable_event_depth = event_depth(session->events),
-        .reliable_event_capacity = session->events.capacity,
-        .reserved = {},
-    };
-    return 0;
-}
-
-int lfm_session_capture_policy_snapshot(
-    const LfmSession *session, LfmCapturePolicySnapshotV1 *out) {
-    if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
-    if (out->size != sizeof(*out) ||
-        out->abi_version != LFM_CAPTURE_POLICY_ABI) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
-    const uint32_t state = session->state.load(std::memory_order_acquire);
-    if (state != LFM_SESSION_JOINED) {
-        /* A live diagnostic exposes only the release-published progress edge;
-         * the compact classifier state remains coordinator-owned and lockless. */
-        *out = {
-            .size = sizeof(*out),
-            .abi_version = LFM_CAPTURE_POLICY_ABI,
-            .sample_rate = session->capture_rate,
-            .evidence_updates = session->capture_evidence_updates.load(
-                std::memory_order_acquire),
-            .last_evidence_cursor = session->capture_evidence_cursor.load(
-                std::memory_order_relaxed),
-        };
-        return 0;
-    }
-    const CapturePolicy &policy = session->capture_policy;
-    *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_CAPTURE_POLICY_ABI,
-        .sample_rate = session->capture_rate,
-        .state = policy.state,
-        .last_voice = policy.decision.voice,
-        .detector_backlog = policy.chunk_pending ? 1u : 0u,
-        .evidence_updates = policy.evidence_updates,
-        .last_evidence_cursor = policy.last_evidence_cursor,
-        .turn_start_cursor = policy.turn_start_cursor,
-        .last_voiced_cursor = policy.last_voiced_cursor,
-        .voiced_frames = policy.voiced_frames,
-        .silence_frames = policy.silence_frames,
-        .pause_generation = policy.pause_generation,
-        .prepare_sample_generation = policy.prepare_sample_generation,
-        .commit_sample_generation = policy.commit_sample_generation,
-        .forced_sample_generation = policy.forced_sample_generation,
-        .last_score = policy.decision.score,
-        .adaptive_min = policy.decision.adaptive_min,
-        .adaptive_max = policy.decision.adaptive_max,
-        .discarded_silence_frames = policy.discarded_silence_frames,
-        .reserved = {},
-    };
-    return 0;
-}
-
-int lfm_session_playback_policy_snapshot(
-    const LfmSession *session, LfmPlaybackPolicySnapshotV1 *out) {
-    if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
-    if (out->size != sizeof(*out) ||
-        out->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
-    return read_playback_policy_snapshot(session, out);
-}
-
-int lfm_session_capture_supervision_snapshot(
-    const LfmSession *session, LfmCaptureSupervisionSnapshotV1 *out) {
-    if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
-    if (out->size != sizeof(*out) ||
-        out->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
-    return read_capture_supervision_snapshot(session, out);
-}
-
-int lfm_session_capture_deadline_advance_manual_test(
-    LfmSession *session, uint64_t elapsed_ns) {
-    if (!session || !session->capture_supervision.manual ||
-        !session->capture_supervision.source) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    return kc_deadline_source_advance_manual_test(
-        session->capture_supervision.source, elapsed_ns);
-}
-
-int lfm_session_capture_deadline_fire_manual_test(
-    LfmSession *session, uint32_t slot) {
-    if (!session || !session->capture_supervision.manual ||
-        !session->capture_supervision.source ||
-        slot >= CAPTURE_DEADLINE_COUNT) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    return kc_deadline_source_fire_manual_test(
-        session->capture_supervision.source, slot);
-}
-
-int lfm_session_capture_deadline_identity_test(
-    const LfmSession *session, uint32_t slot,
-    const LfmCaptureDeadlineSlotSnapshotV1 *identity) {
-    if (!session || !identity || slot >= CAPTURE_DEADLINE_COUNT ||
-        identity->slot != slot) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    LfmCaptureSupervisionSnapshotV1 snapshot = {
-        .size = sizeof(LfmCaptureSupervisionSnapshotV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
-    };
-    const int status = read_capture_supervision_snapshot(
-        session, &snapshot);
-    if (status != 0) return status;
-    const LfmCaptureDeadlineSlotSnapshotV1 &published =
-        snapshot.slots[slot];
-    return published.slot == identity->slot &&
-                   published.arm_generation == identity->arm_generation &&
-                   published.scope_generation == identity->scope_generation &&
-                   published.epoch == identity->epoch &&
-                   published.domain == identity->domain &&
-                   published.pause_generation == identity->pause_generation &&
-                   ticket_equal(published.child, identity->child) &&
-                   ticket_equal(published.parent, identity->parent)
-               ? 0
-               : LFM_STATUS_STALE;
-}
-
 int lfm_session_destroy(LfmSession *session) {
     if (!session) return LFM_STATUS_INVALID_ARGUMENT;
     std::unique_lock<std::mutex> lifecycle(session->lifecycle_mutex);
@@ -6351,7 +5651,7 @@ int lfm_capture_producer_claim_chunk(LfmCaptureProducer *producer,
                                      uint32_t frames,
                                      uint32_t sample_rate,
                                      uint32_t source_channels, uint32_t flags,
-                                     LfmCaptureChunkV1 *out) {
+                                     LfmCaptureChunk *out) {
     if (!producer || !producer->session || !out || frames == 0 ||
         source_channels == 0 || flags != 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
@@ -6405,10 +5705,8 @@ int lfm_capture_producer_claim_chunk(LfmCaptureProducer *producer,
         return -EOVERFLOW;
     }
     const uint64_t epoch = session->epoch.load(std::memory_order_acquire);
-    const LfmTicketIdV1 transport = current_capture_ticket(producer, epoch);
+    const LfmTicketId transport = current_capture_ticket(producer, epoch);
     producer->writer.pending = {
-        .size = sizeof(LfmCaptureChunkV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
         .stream = producer->stream,
         .lane = producer->lane,
         .flags = flags,
@@ -6423,15 +5721,14 @@ int lfm_capture_producer_claim_chunk(LfmCaptureProducer *producer,
         .frames = frames,
         .channels = source_channels,
         .sample_rate = rate,
-        .reserved = {},
     };
     *out = producer->writer.pending;
     return 0;
 }
 
 int lfm_capture_producer_resolve_chunk(LfmCaptureProducer *producer,
-                                       const LfmCaptureChunkV1 *chunk,
-                                       LfmMutableF32SpanV1 out_spans[2],
+                                       const LfmCaptureChunk *chunk,
+                                       LfmMutableF32Span out_spans[2],
                                        uint32_t *out_span_count) {
     if (!producer || !producer->session || !out_spans ||
         !out_span_count || !valid_chunk(chunk) ||
@@ -6450,7 +5747,7 @@ int lfm_capture_producer_resolve_chunk(LfmCaptureProducer *producer,
 }
 
 int lfm_capture_producer_commit_chunk(LfmCaptureProducer *producer,
-                                      const LfmCaptureChunkV1 *chunk) {
+                                      const LfmCaptureChunk *chunk) {
     if (!producer || !producer->session || !valid_chunk(chunk)) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
@@ -6475,7 +5772,7 @@ int lfm_capture_producer_commit_chunk(LfmCaptureProducer *producer,
     producer->chunk_sequence++;
     const uint64_t end = chunk->first_sample_cursor + chunk->frames;
     producer->sample_cursor.store(end, std::memory_order_release);
-    const LfmCaptureChunkV1 published = producer->writer.pending;
+    const LfmCaptureChunk published = producer->writer.pending;
     producer->writer.pending = {};
     if (!capture_chunk_push(&session->capture_chunks, published)) {
         std::abort();
@@ -6488,7 +5785,7 @@ int lfm_capture_producer_commit_chunk(LfmCaptureProducer *producer,
 int lfm_capture_producer_write_interleaved(
     LfmCaptureProducer *producer, const void *samples, size_t sample_count,
     uint32_t channels, uint32_t sample_rate, uint32_t format, uint32_t flags,
-    LfmCaptureWriteV1 *out) {
+    LfmCaptureWrite *out) {
     if (!out) return LFM_STATUS_INVALID_ARGUMENT;
     capture_write_result(out, 0, 0, 0, LFM_STATUS_INVALID_ARGUMENT);
     if (!producer || !producer->session || channels == 0 ||
@@ -6523,14 +5820,14 @@ int lfm_capture_producer_write_interleaved(
                                   LFM_STATUS_INVALID_ARGUMENT, out);
     }
 
-    LfmCaptureChunkV1 chunk{};
+    LfmCaptureChunk chunk{};
     int status = lfm_capture_producer_claim_chunk(
         producer, frames, sample_rate, channels, flags, &chunk);
     if (status != 0) {
         return capture_write_drop(producer, frames, channels, status, out);
     }
 
-    LfmMutableF32SpanV1 spans[2]{};
+    LfmMutableF32Span spans[2]{};
     uint32_t span_count = 0;
     status = lfm_capture_producer_resolve_chunk(
         producer, &chunk, spans, &span_count);
@@ -6585,7 +5882,7 @@ int lfm_capture_producer_write_interleaved(
 }
 
 int lfm_capture_producer_abort_chunk(LfmCaptureProducer *producer,
-                                     const LfmCaptureChunkV1 *chunk) {
+                                     const LfmCaptureChunk *chunk) {
     if (!producer || !producer->session || !valid_chunk(chunk)) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
@@ -6602,7 +5899,7 @@ int lfm_capture_producer_abort_chunk(LfmCaptureProducer *producer,
 int lfm_capture_producer_publish_gap(LfmCaptureProducer *producer,
                                      uint32_t dropped_frames,
                                      uint32_t source_channels, uint32_t flags,
-                                     LfmCaptureChunkV1 *out) {
+                                     LfmCaptureChunk *out) {
     if (!producer || !producer->session || !out || dropped_frames == 0 ||
         source_channels == 0 ||
         (flags & LFM_CAPTURE_CHUNK_GAP) == 0 ||
@@ -6653,10 +5950,8 @@ int lfm_capture_producer_publish_gap(LfmCaptureProducer *producer,
         return -EOVERFLOW;
     }
     const uint64_t epoch = session->epoch.load(std::memory_order_acquire);
-    const LfmTicketIdV1 transport = current_capture_ticket(producer, epoch);
-    const LfmCaptureChunkV1 gap = {
-        .size = sizeof(LfmCaptureChunkV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
+    const LfmTicketId transport = current_capture_ticket(producer, epoch);
+    const LfmCaptureChunk gap = {
         .stream = producer->stream,
         .lane = producer->lane,
         .flags = debt_flags,
@@ -6671,7 +5966,6 @@ int lfm_capture_producer_publish_gap(LfmCaptureProducer *producer,
         .frames = total_frames,
         .channels = debt_channels,
         .sample_rate = producer->sample_rate,
-        .reserved = {},
     };
     producer->chunk_sequence++;
     producer->sample_cursor.store(start + total_frames,
@@ -6748,230 +6042,18 @@ int lfm_playback_consumer_create(LfmSession *session,
     return 0;
 }
 
-int lfm_session_publish_playback_f32_test(LfmSession *session,
-                                          const float *samples,
-                                          uint32_t frames,
-                                          LfmPcmLeaseV1 *out) {
-    if (!session || !samples || !out || !session->dock_only || frames == 0 ||
-        frames > session->playback_frames) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    LfmPcmLeaseV1 lease{};
-    int status = playback_reserve(session, frames, session->playback_rate,
-                                  &lease);
-    if (status != 0) return status;
-    float *destination = nullptr;
-    size_t capacity = 0;
-    status = playback_resolve_mut(session, &lease, &destination, &capacity);
-    if (status != 0 || !destination || capacity < frames) {
-        (void)playback_release(session, &lease);
-        return status == 0 ? LFM_STATUS_INTERNAL : status;
-    }
-    std::memcpy(destination, samples, static_cast<size_t>(frames) *
-                                      sizeof(float));
-    lease.ticket = next_ticket(session, LFM_TICKET_TURN);
-    status = playback_publish(session, &lease);
-    if (status != 0) {
-        (void)playback_release(session, &lease);
-        return status;
-    }
-    *out = lease;
-    return 0;
-}
-
-int lfm_internal_session_release_unpublished_playback_for_test(
-    LfmSession *session, uint32_t frames) {
-    if (!session || !session->dock_only || frames == 0 ||
-        frames > session->playback_frames) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    LfmPcmLeaseV1 lease{};
-    const int status = playback_reserve(session, frames,
-                                        session->playback_rate, &lease);
-    if (status != 0) return status;
-    return playback_release(session, &lease);
-}
-
-int lfm_internal_session_seed_capture_range_capacity_for_test(
-    LfmSession *session) {
-    if (!session || !session->dock_only) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
-    if (session->state.load(std::memory_order_acquire) !=
-            LFM_SESSION_CREATED ||
-        session->action.active || session->result.active ||
-        session->range_pending ||
-        capture_range_live(session->capture_arena) != 0 ||
-        !capture_range_empty(session->capture_arena.ready)) {
-        return LFM_STATUS_BUSY;
-    }
-    LfmCaptureProducer *producer =
-        session->chunk_producer.load(std::memory_order_acquire);
-    if (!producer || producer->closing.load(std::memory_order_acquire)) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-
-    const uint64_t epoch = session->epoch.load(std::memory_order_acquire);
-    const LfmTicketIdV1 first = next_ticket(session, LFM_TICKET_TURN);
-    const LfmTicketIdV1 second = next_ticket(session, LFM_TICKET_TURN);
-    const LfmTicketIdV1 third = next_ticket(session, LFM_TICKET_TURN);
-    CaptureRangeLease lease{};
-    int status = claim_capture_range(session, 0, 8, epoch, first, &lease);
-    if (status != 0) return status;
-    CaptureRangeLease completed{};
-    status = take_capture_range(session, &completed);
-    if (status != 0) return status;
-    session->action = {};
-    session->action.active = true;
-    session->action.phase = ACTION_PHASE_TERMINAL_PUBLISHED;
-    session->action.epoch = epoch;
-    session->action.ticket = first;
-    session->action.capture_range = completed;
-    session->action.capture_range_active = true;
-    status = claim_capture_range(session, 8, 16, epoch, second, &lease);
-    if (status != 0) {
-        clear_action(session);
-        return status;
-    }
-
-    producer->sample_cursor.store(24, std::memory_order_release);
-    producer->transport_epoch.store(epoch, std::memory_order_relaxed);
-    producer->transport_sequence.store(third.sequence,
-                                       std::memory_order_release);
-    CapturePolicy &policy = session->capture_policy;
-    policy.state = CAPTURE_POLICY_PAUSE;
-    policy.turn_active = true;
-    policy.segment_cursor = 16;
-    policy.next_evidence_cursor = 24;
-    policy.last_evidence_cursor = 24;
-    policy.turn_start_cursor = 16;
-    policy.turn_ticket = third;
-    CaptureSupervision &supervision = session->capture_supervision;
-    supervision.epoch = epoch;
-    supervision.parent = third;
-    supervision.commit_cursor = 24;
-    supervision.freeze_pending = true;
-    return 0;
-}
-
-int lfm_internal_session_snapshot_pin_inactive_for_test(
-    LfmSession *session, uint32_t kind, uint64_t *out_pin) {
-    if (!session || !out_pin ||
-        session->state.load(std::memory_order_acquire) !=
-            LFM_SESSION_RUNNING) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    for (uint32_t attempt = 0; attempt < 4; ++attempt) {
-        std::atomic<uint32_t> *published = nullptr;
-        std::atomic<uint32_t> *pending = nullptr;
-        if (kind == 1) {
-            PlaybackPolicy &policy = session->playback_policy;
-            published = &policy.published_snapshot;
-            pending = &policy.snapshot_pending;
-        } else if (kind == 2) {
-            CaptureSupervision &supervision =
-                session->capture_supervision;
-            published = &supervision.published_snapshot;
-            pending = &supervision.snapshot_pending;
-        } else {
-            return LFM_STATUS_INVALID_ARGUMENT;
-        }
-
-        const uint32_t current = published->load(std::memory_order_acquire);
-        const uint32_t target = current ^ 1u;
-        std::atomic<uint32_t> *state = kind == 1
-            ? &session->playback_policy.snapshots[target].state
-            : &session->capture_supervision.snapshots[target].state;
-        uint32_t expected = 0;
-        if (!state->compare_exchange_strong(
-                expected, 1, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            continue;
-        }
-        if (published->load(std::memory_order_acquire) != current) {
-            if (kind == 1) {
-                release_snapshot_reader(
-                    session, pending, target,
-                    &session->playback_policy.snapshots[target]);
-            } else {
-                release_snapshot_reader(
-                    session, pending, target,
-                    &session->capture_supervision.snapshots[target]);
-            }
-            continue;
-        }
-        *out_pin = (static_cast<uint64_t>(kind) << 32) |
-                   static_cast<uint64_t>(target + 1);
-        return 0;
-    }
-    return LFM_STATUS_WOULD_BLOCK;
-}
-
-int lfm_internal_session_snapshot_unpin_for_test(
-    LfmSession *session, uint64_t pin) {
-    if (!session) return LFM_STATUS_INVALID_ARGUMENT;
-    const uint32_t kind = static_cast<uint32_t>(pin >> 32);
-    const uint32_t encoded = static_cast<uint32_t>(pin);
-    if (encoded == 0 || encoded > 2) return LFM_STATUS_INVALID_ARGUMENT;
-    const uint32_t index = encoded - 1;
-    if (kind == 1) {
-        const bool stale =
-            session->playback_policy.published_snapshot.load(
-                std::memory_order_acquire) == index;
-        release_snapshot_reader(
-            session, &session->playback_policy.snapshot_pending, index,
-            &session->playback_policy.snapshots[index]);
-        return stale ? LFM_STATUS_STALE : 0;
-    }
-    if (kind == 2) {
-        const bool stale =
-            session->capture_supervision.published_snapshot.load(
-                std::memory_order_acquire) == index;
-        release_snapshot_reader(
-            session, &session->capture_supervision.snapshot_pending, index,
-            &session->capture_supervision.snapshots[index]);
-        return stale ? LFM_STATUS_STALE : 0;
-    }
-    return LFM_STATUS_INVALID_ARGUMENT;
-}
-
-int lfm_internal_session_snapshot_state_for_test(
-    const LfmSession *session, uint32_t kind, uint32_t *out_published,
-    uint32_t *out_pending) {
-    if (!session || !out_published || !out_pending) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    if (kind == 1) {
-        *out_published = session->playback_policy.published_snapshot.load(
-            std::memory_order_acquire);
-        *out_pending = session->playback_policy.snapshot_pending.load(
-            std::memory_order_acquire);
-        return 0;
-    }
-    if (kind == 2) {
-        *out_published =
-            session->capture_supervision.published_snapshot.load(
-                std::memory_order_acquire);
-        *out_pending = session->capture_supervision.snapshot_pending.load(
-            std::memory_order_acquire);
-        return 0;
-    }
-    return LFM_STATUS_INVALID_ARGUMENT;
-}
-
 int lfm_playback_consumer_claim(LfmPlaybackConsumer *consumer,
-                                const LfmTicketIdV1 *ticket,
+                                const LfmTicketId *ticket,
                                 uint64_t stream_epoch, uint64_t lease_id,
                                 uint64_t buffer_generation,
-                                LfmPcmLeaseV1 *out) {
+                                LfmPcmLease *out) {
     if (!consumer || !consumer->session || !ticket || !out ||
         stream_epoch == 0 || lease_id == 0 || buffer_generation == 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     if (consumer->active) return LFM_STATUS_WOULD_BLOCK;
 
-    LfmPcmLeaseV1 lease{};
+    LfmPcmLease lease{};
     uint64_t head = 0;
     if (!pool_peek(&consumer->session->playback, &lease, &head)) {
         return consumer->session->stop.load(std::memory_order_acquire)
@@ -7006,40 +6088,40 @@ int lfm_playback_consumer_claim(LfmPlaybackConsumer *consumer,
 }
 
 int lfm_playback_consumer_render_f32(
-    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    LfmPlaybackConsumer *consumer, const LfmPcmLease *lease,
     uint32_t source_offset_frames, float *destination, uint32_t frames,
     uint32_t channels, size_t destination_capacity,
-    LfmPlaybackRenderV1 *out) {
+    LfmPlaybackRender *out) {
     return render_playback_evidence(
         consumer, lease, source_offset_frames, destination, frames, channels,
         destination_capacity, fanout_f32_erased, out);
 }
 
 int lfm_playback_consumer_render_i16(
-    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    LfmPlaybackConsumer *consumer, const LfmPcmLease *lease,
     uint32_t source_offset_frames, int16_t *destination, uint32_t frames,
     uint32_t channels, size_t destination_capacity,
-    LfmPlaybackRenderV1 *out) {
+    LfmPlaybackRender *out) {
     return render_playback_evidence(
         consumer, lease, source_offset_frames, destination, frames, channels,
         destination_capacity, fanout_i16_erased, out);
 }
 
 int lfm_playback_consumer_render_u16(
-    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    LfmPlaybackConsumer *consumer, const LfmPcmLease *lease,
     uint32_t source_offset_frames, uint16_t *destination, uint32_t frames,
     uint32_t channels, size_t destination_capacity,
-    LfmPlaybackRenderV1 *out) {
+    LfmPlaybackRender *out) {
     return render_playback_evidence(
         consumer, lease, source_offset_frames, destination, frames, channels,
         destination_capacity, fanout_u16_erased, out);
 }
 
 int lfm_playback_consumer_observe(LfmPlaybackConsumer *consumer,
-                                  const LfmPcmLeaseV1 *lease,
+                                  const LfmPcmLease *lease,
                                   uint32_t source_offset_frames,
                                   uint32_t frames, uint32_t flags,
-                                  LfmPlaybackRenderV1 *out) {
+                                  LfmPlaybackRender *out) {
     if ((flags & LFM_PLAYBACK_EVIDENCE_RENDERED) != 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
@@ -7049,7 +6131,7 @@ int lfm_playback_consumer_observe(LfmPlaybackConsumer *consumer,
 
 int lfm_internal_playback_consumer_publish_flush(
     LfmPlaybackConsumer *consumer, uint64_t stream_epoch,
-    LfmPlaybackRenderV1 *out) {
+    LfmPlaybackRender *out) {
     if (!consumer || !consumer->session || !out || stream_epoch == 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
@@ -7072,7 +6154,7 @@ int lfm_internal_playback_consumer_publish_flush(
         request_stop(session, LFM_STATUS_INTERNAL);
         return finish(LFM_STATUS_INTERNAL);
     }
-    const LfmTicketIdV1 ticket = consumer->lineage.lease_id == 0
+    const LfmTicketId ticket = consumer->lineage.lease_id == 0
         ? next_ticket(session, LFM_TICKET_CONTROL)
         : consumer->lineage.ticket;
     const PlaybackEvidenceRecord record = {
@@ -7097,7 +6179,7 @@ int lfm_internal_playback_consumer_publish_flush(
 }
 
 int lfm_playback_consumer_release(LfmPlaybackConsumer *consumer,
-                                  const LfmPcmLeaseV1 *lease) {
+                                  const LfmPcmLease *lease) {
     if (!consumer_matches(consumer, lease)) return LFM_STATUS_STALE;
     const int status = playback_release(consumer->session, lease);
     if (status == 0 || status == LFM_STATUS_STALE ||
@@ -7117,7 +6199,7 @@ int lfm_internal_playback_consumer_discard_all(
 
     uint64_t frames = 0;
     for (;;) {
-        LfmPcmLeaseV1 lease{};
+        LfmPcmLease lease{};
         uint64_t head = 0;
         if (!pool_peek(&consumer->session->playback, &lease, &head)) {
             *out_frames = frames;
@@ -7211,7 +6293,7 @@ int lfm_session_control_destroy(LfmSessionControl *control) {
 namespace {
 
 int playback_reserve(LfmSession *session, uint32_t frames,
-                     uint32_t sample_rate, LfmPcmLeaseV1 *out) {
+                     uint32_t sample_rate, LfmPcmLease *out) {
     if (!out) return LFM_STATUS_INVALID_ARGUMENT;
     PlaybackPool *pool = nullptr;
     uint32_t rate = 0;
@@ -7231,7 +6313,7 @@ int playback_reserve(LfmSession *session, uint32_t frames,
     return LFM_STATUS_WOULD_BLOCK;
 }
 
-int playback_resolve_mut(LfmSession *session, const LfmPcmLeaseV1 *lease,
+int playback_resolve_mut(LfmSession *session, const LfmPcmLease *lease,
                          float **out_samples,
                          size_t *out_sample_capacity) {
     if (!session || !lease || !out_samples || !out_sample_capacity) {
@@ -7254,7 +6336,7 @@ int playback_resolve_mut(LfmSession *session, const LfmPcmLeaseV1 *lease,
 }
 
 int playback_resolve(const LfmSession *session,
-                     const LfmPcmLeaseV1 *lease,
+                     const LfmPcmLease *lease,
                      const float **out_samples,
                      size_t *out_sample_count) {
     if (!session || !lease || !out_samples || !out_sample_count) {
@@ -7279,7 +6361,7 @@ int playback_resolve(const LfmSession *session,
     return 0;
 }
 
-int playback_publish(LfmSession *session, const LfmPcmLeaseV1 *lease) {
+int playback_publish(LfmSession *session, const LfmPcmLease *lease) {
     if (!session || !lease) return LFM_STATUS_INVALID_ARGUMENT;
     if (!enter_publication(session)) return LFM_STATUS_CANCELLED;
     const auto finish = [session](int status) {
@@ -7308,11 +6390,10 @@ int playback_publish(LfmSession *session, const LfmPcmLeaseV1 *lease) {
     }
     slot->ticket = lease->ticket;
     pool_push(pool, *lease);
-    session->playback_published.fetch_add(1, std::memory_order_relaxed);
     return finish(0);
 }
 
-int playback_release(LfmSession *session, const LfmPcmLeaseV1 *lease) {
+int playback_release(LfmSession *session, const LfmPcmLease *lease) {
     if (!session || !lease) return LFM_STATUS_INVALID_ARGUMENT;
     uint32_t index = 0;
     if (!decode_playback_lease_id(lease->lease_id, &index)) {
@@ -7330,33 +6411,3 @@ int playback_release(LfmSession *session, const LfmPcmLeaseV1 *lease) {
 }
 
 } // namespace
-
-int lfm_internal_runtime_diagnostic_view(LfmRuntime *runtime,
-                                         LfmSession *first,
-                                         LfmSession *second,
-                                         LfmRuntimeDiagnosticView *out) {
-    if (!runtime || !first || !second || !out || !runtime->engine ||
-        first->runtime != runtime || second->runtime != runtime ||
-        !first->coordinator || !first->delivery || !second->coordinator ||
-        !second->delivery) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    LfmRuntimeDiagnosticView view = {
-        .coordination = runtime->coordination,
-        .first = {
-            .state = &first->diagnostics,
-            .coordinator = first->coordinator,
-            .delivery = first->delivery,
-        },
-        .second = {
-            .state = &second->diagnostics,
-            .coordinator = second->coordinator,
-            .delivery = second->delivery,
-        },
-    };
-    const int status =
-        lfm_internal_engine_diagnostic_view(runtime->engine, &view.engine);
-    if (status != 0) return status;
-    *out = view;
-    return 0;
-}

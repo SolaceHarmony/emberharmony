@@ -41,7 +41,7 @@
 // INVARIANT, and it is gated: `lfm_rope_range_f32` with pos0 == 0 must produce
 // bit-identical output to `lfm_rope_table_f32`. Proven by
 // `absolute_rope_range_is_bit_exact_with_the_zero_based_table` in
-// tests/native_context_rollover.rs — that is what keeps KV rollover from
+// Context-rollover acceptance keeps KV rollover from
 // silently re-phasing the cache against a differently-built table.
 
 #include "lfm_asm_visibility.h"

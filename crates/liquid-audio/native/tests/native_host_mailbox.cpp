@@ -783,7 +783,7 @@ void *gate_step(koro_cont_t *continuation) {
         }
         std::printf(
             "{\"state\":\"verified\",\"native_only\":true,"
-            "\"shared_layout\":%u,\"ring_capacity\":%u,"
+            "\"ring_capacity\":%u,"
             "\"capacity_dehydrations\":%u,"
             "\"multi_client_attach\":true,"
             "\"client_death_reclaimed\":true,"
@@ -793,7 +793,7 @@ void *gate_step(koro_cont_t *continuation) {
             "\"frame_marker\":\"%llx\","
             "\"first_worker\":%u,\"last_worker\":%u,"
             "\"resumes\":%u}\n",
-            lfm::host::kLayoutVersion, lfm::host::kRingCapacity,
+            lfm::host::kRingCapacity,
             gate->capacity_edges,
             static_cast<unsigned long long>(frame->marker),
             frame->first_worker, frame->last_worker, frame->resumes);

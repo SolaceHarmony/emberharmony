@@ -142,29 +142,27 @@ Similarly, the former `RealtimePipeline` worker, `crossbeam-channel` event path,
 Rust RMS VAD, and Rust model-owned cancellation loop are historical. Current
 source of truth is:
 
-- `src/runtime/voice_runtime.rs` for the platform callback/service rim;
-- `src/native_voice.rs` for opaque runtime/session and PCM endpoint bindings;
+- `native/src/runtime/lfm_platform_audio.cpp` for CoreAudio callbacks and
+  direct capture/playback lease access;
 - `native/src/runtime/voice_session.cpp` for sessions, PCM docks, Sesame policy,
   and delivery;
 - `native/src/engine/flashkern_engine.cpp` for route/pass continuations and team
   supervision;
 - `crates/kcoro-sys/vendor/kcoro_arena` for runtime, service, scope, deadline,
-  team, and doorbell ownership.
+  team, and doorbell ownership;
+- `packages/desktop/src-tauri/src/voice/runtime.rs` for UI/control state only.
 
-## Gates
+## Verification
 
 ```bash
-cargo test -p kcoro-sys
-cargo test -p liquid-audio --lib
-cargo test -p liquid-audio --tests
+cmake -S crates/kcoro-sys/vendor/kcoro_arena -B build/kcoro
+cmake --build build/kcoro
+ctest --test-dir build/kcoro
+make -C crates/liquid-audio/native/tools
+cargo test -p kcoro-sys --lib --test rust_service
 git diff --check
 ```
 
-The ignored real-checkpoint truth gate must be executed explicitly with the
-model image. It runs two native LFM2 conversations entirely in memory: typed
-input produces audio-token/Mimi playback for Agent A, and hardware-sized native
-PCM reservations drive Agent B through Sesame and the full speech path. The
-fixed-seed exchange is repeated and must match. Release additionally requires
-the product linkage audit, zero post-readiness allocation/model reads,
-calibrated supervision, observable fatal evidence, real-device rate/geometry
-coverage, and AArch64 plus x86_64/Rosetta coverage.
+The slow real-checkpoint speech test is a separate release acceptance step. It
+is not part of routine cleanup verification and no ignored or Rust-shadow test
+counts as native evidence.

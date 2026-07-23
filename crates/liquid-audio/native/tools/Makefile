@@ -29,7 +29,7 @@ KCORO_CORE := kcoro_stackless kc_runtime kc_service kc_doorbell kc_team kc_fixed
 KCORO_OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(KCORO_CORE))) $(BUILD)/kc_port_posix.o
 HOST_OBJECTS := $(BUILD)/host_mailbox.o $(BUILD)/safetensors.o $(KCORO_OBJECTS)
 OBJECTS := $(BUILD)/weight_segment_host.o $(HOST_OBJECTS)
-HOST_GATE_OBJECTS := $(BUILD)/native_host_mailbox.o $(HOST_OBJECTS)
+HOST_TEST_OBJECTS := $(BUILD)/native_host_mailbox.o $(HOST_OBJECTS)
 
 PRODUCT_CXX_SOURCES := \
 	src/runtime/voice_session.cpp \
@@ -48,10 +48,8 @@ PRODUCT_CXX_SOURCES := \
 	src/mimi/mimi_seanet.cpp \
 	src/mimi/mimi_transformer.cpp \
 	src/mimi/mimi_decode.cpp \
-	tests/native_speech_to_speech.cpp \
 	$(KERNEL_CPP)
-PRODUCT_C_SOURCES := \
-	src/runtime/voice_protocol_c.c
+PRODUCT_C_SOURCES :=
 KERNEL_ASM_SOURCES := \
 	kernels/$(KERNEL_ARCH)/flashkern_prng.S \
 	kernels/$(KERNEL_ARCH)/flashkern_rope.S \
@@ -65,11 +63,15 @@ KERNEL_ASM_SOURCES := \
 PRODUCT_CXX_OBJECTS := $(patsubst %.cpp,$(BUILD)/product/%.o,$(PRODUCT_CXX_SOURCES))
 PRODUCT_C_OBJECTS := $(patsubst %.c,$(BUILD)/product/%.o,$(PRODUCT_C_SOURCES))
 KERNEL_ASM_OBJECTS := $(patsubst %.S,$(BUILD)/product/%.o,$(KERNEL_ASM_SOURCES))
-SPEECH_OBJECTS := $(BUILD)/native_speech_gate_main.o $(BUILD)/safetensors.o \
+SPEECH_OBJECTS := $(BUILD)/product/tests/native_speech_to_speech.o \
+	$(BUILD)/safetensors.o \
 	$(PRODUCT_CXX_OBJECTS) $(PRODUCT_C_OBJECTS) $(KERNEL_ASM_OBJECTS) \
 	$(KCORO_OBJECTS)
+WEIGHT_TEST_OBJECTS := $(BUILD)/product/tests/native_weight_segment.o \
+	$(BUILD)/safetensors.o $(KCORO_OBJECTS)
 
 ifeq ($(SYSTEM),Darwin)
+ARCH_FLAGS := -arch $(MACHINE)
 SPEECH_LIBS := -framework Accelerate -framework Security -framework AudioUnit \
 	-framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 HOST_LIBS := -lbsm
@@ -78,18 +80,21 @@ SPEECH_LIBS := -lm
 HOST_LIBS :=
 endif
 
+CXXFLAGS += $(ARCH_FLAGS)
+CFLAGS += $(ARCH_FLAGS)
+PRODUCT_CXXFLAGS += $(ARCH_FLAGS)
+PRODUCT_CFLAGS += $(ARCH_FLAGS)
+KERNEL_FLAGS += $(ARCH_FLAGS)
+
 .PHONY: all clean
-all: $(BUILD)/lfm-weight-segment $(BUILD)/lfm-host-mailbox-gate \
-	$(BUILD)/lfm-native-speech-gate
+all: $(BUILD)/lfm-weight-segment $(BUILD)/lfm-host-mailbox-test \
+	$(BUILD)/lfm-native-weight-test $(BUILD)/lfm-native-speech-test
 
 $(BUILD):
 	mkdir -p $@
 
 $(BUILD)/weight_segment_host.o: weight_segment_host.cpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
-
-$(BUILD)/native_speech_gate_main.o: native_speech_gate_main.cpp | $(BUILD)
-	$(CXX) $(PRODUCT_CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/safetensors.o: $(ROOT)/src/io/safetensors.cpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
@@ -125,14 +130,17 @@ $(BUILD)/product/%.o: $(ROOT)/%.S
 $(BUILD)/lfm-weight-segment: $(OBJECTS)
 	$(CXX) $(CXXFLAGS) $^ $(HOST_LIBS) -o $@
 
-$(BUILD)/lfm-host-mailbox-gate: $(HOST_GATE_OBJECTS)
+$(BUILD)/lfm-host-mailbox-test: $(HOST_TEST_OBJECTS)
 	$(CXX) $(CXXFLAGS) $^ $(HOST_LIBS) -o $@
 
-$(BUILD)/lfm-native-speech-gate: $(SPEECH_OBJECTS)
+$(BUILD)/lfm-native-weight-test: $(WEIGHT_TEST_OBJECTS)
+	$(CXX) $(CXXFLAGS) $^ $(HOST_LIBS) -o $@
+
+$(BUILD)/lfm-native-speech-test: $(SPEECH_OBJECTS)
 	$(CXX) $(PRODUCT_CXXFLAGS) $^ $(SPEECH_LIBS) -o $@
 
 clean:
 	rm -rf $(BUILD)
 
--include $(OBJECTS:.o=.d) $(HOST_GATE_OBJECTS:.o=.d) \
-	$(SPEECH_OBJECTS:.o=.d)
+-include $(OBJECTS:.o=.d) $(HOST_TEST_OBJECTS:.o=.d) \
+	$(WEIGHT_TEST_OBJECTS:.o=.d) $(SPEECH_OBJECTS:.o=.d)

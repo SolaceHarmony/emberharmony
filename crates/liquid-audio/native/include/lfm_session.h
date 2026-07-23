@@ -11,9 +11,7 @@
 extern "C" {
 #endif
 
-typedef struct LfmSessionConfigV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmSessionConfig {
     uint64_t session_id;
     uint32_t playback_slots;
     /* Maximum complete frame block promised by the platform capture device.
@@ -32,10 +30,9 @@ typedef struct LfmSessionConfigV1 {
     uint32_t command_capacity;
     uint32_t max_new_tokens;
     uint64_t flags;
-    uint64_t reserved[4];
-} LfmSessionConfigV1;
+} LfmSessionConfig;
 
-typedef enum LfmEventKindV1 {
+typedef enum LfmEventKind {
     LFM_EVENT_STATE = 1,
     LFM_EVENT_TEXT = 2,
     LFM_EVENT_TURN = 3,
@@ -46,80 +43,46 @@ typedef enum LfmEventKindV1 {
      * exact ticket only to correlate outward records; it never creates or
      * advances the turn. */
     LFM_EVENT_TURN_STARTED = 7,
-} LfmEventKindV1;
+} LfmEventKind;
 
 #define LFM_EVENT_FLAG_HAS_AUDIO (1u << 0)
 #define LFM_EVENT_FLAG_TRUNCATED (1u << 1)
 
-typedef struct LfmTurnEventV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmTurnEvent {
     uint32_t playback_leases;
     uint32_t emitted_items;
-} LfmTurnEventV1;
+} LfmTurnEvent;
 
 /* Identity carried by one reliable PLAYBACK_READY edge. The corresponding
  * lease remains native-owned until the session's sole PlaybackConsumer claims
  * the complete {event ticket, epoch, lease_id, buffer_generation} identity. */
-typedef struct LfmPlaybackReadyEventV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmPlaybackReadyEvent {
     uint64_t lease_id;
     uint64_t buffer_generation;
-} LfmPlaybackReadyEventV1;
+} LfmPlaybackReadyEvent;
 
-typedef struct LfmEventV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmEvent {
     uint32_t kind;
     uint32_t flags;
     uint64_t session_id;
     uint64_t epoch;
-    LfmTicketIdV1 ticket;
+    LfmTicketId ticket;
     const void *payload;
     uint32_t payload_bytes;
     int32_t status;
-} LfmEventV1;
+} LfmEvent;
 
 /* The callback must copy the bounded record and return immediately. Returning
  * WOULD_BLOCK retains the exact record in the native output continuation;
  * after freeing host capacity, call lfm_session_host_capacity once. No pointer
  * in the callback remains valid after a successful return. Any other nonzero
  * status is a terminal host-sink failure. */
-typedef int (*LfmOnEventV1)(void *context, const LfmEventV1 *event);
+typedef int (*LfmOnEvent)(void *context, const LfmEvent *event);
 
-typedef struct LfmCallbacksV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmCallbacks {
     void *context;
-    LfmOnEventV1 on_event;
-} LfmCallbacksV1;
-
-typedef struct LfmSessionSnapshotV1 {
-    uint32_t size;
-    uint32_t abi_version;
-    uint64_t session_id;
-    uint64_t epoch;
-    uint32_t state;
-    int32_t terminal_status;
-    uint64_t reserved_coordinator[2];
-    uint64_t reserved_delivery;
-    uint64_t callbacks_entered;
-    uint64_t capture_consumed;
-    uint64_t capture_stale;
-    /* Published counts leases admitted to the device FIFO. Consumed counts
-     * those same published leases after both the device and native observers
-     * retire; an unused reservation belongs to neither counter. */
-    uint64_t playback_published;
-    uint64_t playback_consumed;
-    uint64_t text_commands_accepted;
-    uint64_t text_commands_consumed;
-    uint64_t text_commands_stale;
-    uint32_t live_playback_leases;
-    uint32_t reliable_event_depth;
-    uint32_t reliable_event_capacity;
-    uint64_t reserved[4];
-} LfmSessionSnapshotV1;
+    LfmOnEvent on_event;
+} LfmCallbacks;
 
 #define LFM_SESSION_CREATED 0u
 #define LFM_SESSION_RUNNING 1u
@@ -129,7 +92,7 @@ typedef struct LfmSessionSnapshotV1 {
 
 LFM_PUBLIC_API int lfm_session_create(
     LfmRuntime *runtime, LfmModel *model, LfmConversation *conversation,
-    const LfmSessionConfigV1 *config, const LfmCallbacksV1 *callbacks,
+    const LfmSessionConfig *config, const LfmCallbacks *callbacks,
     LfmSession **out);
 LFM_PUBLIC_API int lfm_session_start(LfmSession *session);
 /* Copies one bounded UTF-8 command into the fixed control ring and returns its
@@ -138,7 +101,7 @@ LFM_PUBLIC_API int lfm_session_start(LfmSession *session);
 LFM_PUBLIC_API int lfm_session_submit_text(LfmSession *session,
                                            const char *utf8,
                                            size_t utf8_bytes,
-                                           LfmTicketIdV1 *out_ticket);
+                                           LfmTicketId *out_ticket);
 LFM_PUBLIC_API int lfm_session_interrupt(LfmSession *session,
                                          uint64_t *out_epoch);
 /* Nonblocking host-capacity edge for a callback that previously returned
@@ -147,8 +110,6 @@ LFM_PUBLIC_API int lfm_session_interrupt(LfmSession *session,
 LFM_PUBLIC_API int lfm_session_host_capacity(LfmSession *session);
 LFM_PUBLIC_API void lfm_session_request_stop(LfmSession *session);
 LFM_PUBLIC_API int lfm_session_join(LfmSession *session);
-LFM_PUBLIC_API int lfm_session_snapshot(const LfmSession *session,
-                                        LfmSessionSnapshotV1 *out);
 LFM_PUBLIC_API int lfm_session_destroy(LfmSession *session);
 
 #ifdef __cplusplus

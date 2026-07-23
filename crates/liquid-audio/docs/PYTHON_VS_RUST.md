@@ -316,8 +316,11 @@ code path runs the faithful regime on CPU and Metal.
 ## Current verification
 
 ```sh
-cargo test -p kcoro-sys -p liquid-audio -- --test-threads=1
-LFM_MODEL_DIR=/absolute/LFM2.5-Audio-1.5B \
-  cargo test -p liquid-audio --test native_speech_to_speech \
-  -- --ignored --nocapture --test-threads=1
+cmake -S crates/kcoro-sys/vendor/kcoro_arena -B build/kcoro
+cmake --build build/kcoro
+ctest --test-dir build/kcoro
+make -C crates/liquid-audio/native/tools
 ```
+
+The comparisons above are historical formula evidence. They are not a
+callable Python/Rust/Candle path and cannot select production behavior.

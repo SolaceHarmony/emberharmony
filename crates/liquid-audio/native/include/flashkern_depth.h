@@ -14,39 +14,36 @@ extern "C" {
 #define LFM_DEPTH_STATIC_ASSERT(test, message) _Static_assert(test, message)
 #endif
 
-#define LFM_DEPTH_ABI_VERSION 1u
 
 /* Counted immutable view into the resident checkpoint image. The build call
  * copies descriptors only; payload bytes remain at their original addresses. */
-typedef struct LfmDepthBufferV1 {
+typedef struct LfmDepthBuffer {
     uintptr_t address;
     size_t count;
-} LfmDepthBufferV1;
+} LfmDepthBuffer;
 
-typedef struct LfmDepthLayerV1 {
-    LfmDepthBufferV1 qkv_w;
-    LfmDepthBufferV1 out_w;
-    LfmDepthBufferV1 q_ln;
-    LfmDepthBufferV1 k_ln;
-    LfmDepthBufferV1 op_norm;
-    LfmDepthBufferV1 ffn_norm;
-    LfmDepthBufferV1 w1;
-    LfmDepthBufferV1 w3;
-    LfmDepthBufferV1 w2;
-} LfmDepthLayerV1;
+typedef struct LfmDepthLayer {
+    LfmDepthBuffer qkv_w;
+    LfmDepthBuffer out_w;
+    LfmDepthBuffer q_ln;
+    LfmDepthBuffer k_ln;
+    LfmDepthBuffer op_norm;
+    LfmDepthBuffer ffn_norm;
+    LfmDepthBuffer w1;
+    LfmDepthBuffer w3;
+    LfmDepthBuffer w2;
+} LfmDepthLayer;
 
-typedef struct LfmDepthHeadV1 {
-    LfmDepthBufferV1 embedding;
-    LfmDepthBufferV1 norm;
-    LfmDepthBufferV1 logits;
+typedef struct LfmDepthHead {
+    LfmDepthBuffer embedding;
+    LfmDepthBuffer norm;
+    LfmDepthBuffer logits;
     size_t vocab;
-} LfmDepthHeadV1;
+} LfmDepthHead;
 
 /* Construction-only descriptor. Flashkern copies the layer/head tables and
  * reserves every mutable plane before publishing the returned plan identity. */
-typedef struct LfmDepthPlanV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmDepthPlan {
     uint32_t dim;
     uint32_t heads;
     uint32_t kv_heads;
@@ -55,26 +52,26 @@ typedef struct LfmDepthPlanV1 {
     uint32_t codebooks;
     uint32_t backbone_dim;
     float eps;
-    LfmDepthBufferV1 depth_linear_w;
-    LfmDepthBufferV1 depth_linear_b;
-    LfmDepthBufferV1 rope_cos;
-    LfmDepthBufferV1 rope_sin;
-    const LfmDepthLayerV1 *layers;
+    LfmDepthBuffer depth_linear_w;
+    LfmDepthBuffer depth_linear_b;
+    LfmDepthBuffer rope_cos;
+    LfmDepthBuffer rope_sin;
+    const LfmDepthLayer *layers;
     size_t layer_count;
-    const LfmDepthHeadV1 *codebook_heads;
+    const LfmDepthHead *codebook_heads;
     size_t codebook_head_count;
-} LfmDepthPlanV1;
+} LfmDepthPlan;
 
-LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthBufferV1) == 16,
-                        "LfmDepthBufferV1 ABI changed");
-LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthLayerV1) == 144,
-                        "LfmDepthLayerV1 ABI changed");
-LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthHeadV1) == 56,
-                        "LfmDepthHeadV1 ABI changed");
-LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthPlanV1) == 136,
-                        "LfmDepthPlanV1 ABI changed");
+LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthBuffer) == 16,
+                        "LfmDepthBuffer layout must stay compact");
+LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthLayer) == 144,
+                        "LfmDepthLayer layout must stay compact");
+LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthHead) == 56,
+                        "LfmDepthHead layout must stay compact");
+LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthPlan) == 128,
+                        "LfmDepthPlan layout must stay compact");
 
-int lfm_engine_depth_build(void *engine, const LfmDepthPlanV1 *plan,
+int lfm_engine_depth_build(void *engine, const LfmDepthPlan *plan,
                            uint64_t *out_id);
 int lfm_engine_depth_clear(void *engine, uint64_t id);
 

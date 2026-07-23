@@ -119,8 +119,6 @@ int bind_f32(const LfmWeightImage *image, const std::string &name,
              uint64_t *bound, char *error, size_t error_length) {
     if (!image || !out || !bound) return -EINVAL;
     LfmTensorView tensor = {
-        .size = sizeof(LfmTensorView),
-        .abi_version = LFM_WEIGHT_ABI_VERSION,
     };
     const int status = lfm_weights_find_component(
         image, LFM_WEIGHT_COMPONENT_DETOKENIZER, name.c_str(), &tensor);
@@ -197,7 +195,6 @@ void rmsnorm(const float *input, size_t rows, size_t columns,
             .output = output + row * columns,
             .columns = columns,
             .epsilon = kEpsilon,
-            .reserved = 0,
         };
         lfm_detok_rms_f32(&args);
     }
@@ -572,7 +569,6 @@ int emit_segment_owned_lane(LfmAudioDetokenizerState *state, float *pcm,
         .pcm = pcm + destination,
         .count = owned,
         .epsilon = 1.0e-11f,
-        .reserved = 0,
     };
     const int status = lfm_detok_emit_f32(&args);
     if (status != 0) return status;

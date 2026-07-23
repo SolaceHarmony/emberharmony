@@ -209,12 +209,11 @@ The final cutover additionally requires:
 | Responsibility | Source |
 |---|---|
 | desktop commands/settings/events | `packages/desktop/src-tauri/src/voice/` |
-| safe Rust continuation/notifier seam | `crates/kcoro-sys/src/lib.rs` |
-| opaque platform callback endpoints | `crates/liquid-audio/src/voice_api.rs`, `src/native_voice.rs` |
-| native product lifecycle ABI | `crates/liquid-audio/native/include/lfm_runtime.h`, `lfm_session.h` |
-| private numerical oracle ABI | none; the callable Rust/Candle comparison path was deleted |
+| optional Rust coordination adapter outside inference | `crates/kcoro-sys/src/lib.rs` |
+| platform callback endpoints | `crates/liquid-audio/native/src/runtime/lfm_platform_audio.cpp` |
+| native lifecycle interfaces | `crates/liquid-audio/native/include/lfm_runtime.h`, `lfm_session.h` |
 | native model binding | `crates/liquid-audio/native/src/model/lfm_model.cpp` |
-| native queue/doorbell protocol | `native/include/lfm_kernel_bridge.h`, `native/src/runtime/` |
+| native mailboxes/doorbells | `crates/kcoro-sys/vendor/kcoro_arena`, `native/src/io/lfm_host_mailbox.cpp` |
 | fixed lane control | `native/src/engine/flashkern_engine.cpp` |
 | numerical kernels | `native/kernels/aarch64/*.S`, `native/kernels/x86_64/*.S` |
 | resident checkpoint image | `native/src/io/safetensors.cpp` |

@@ -10,7 +10,6 @@
 extern "C" {
 #endif
 
-#define LFM_WEIGHT_ABI_VERSION 2u
 
 typedef struct LfmWeightImage LfmWeightImage;
 
@@ -70,8 +69,6 @@ typedef enum LfmWeightDType {
  * lfm_weights_data(image), so native kernels may bind one base pointer and keep
  * compact offset descriptors instead of retaining C structs. */
 typedef struct LfmTensorView {
-    uint32_t size;
-    uint32_t abi_version;
     const char *name;
     const void *data;
     const uint64_t *shape;
@@ -81,7 +78,6 @@ typedef struct LfmTensorView {
     uint32_t rank;
     uint32_t dtype;
     uint32_t shard;
-    uint32_t reserved;
 } LfmTensorView;
 
 typedef enum LfmWeightLoadFlags {
@@ -98,9 +94,7 @@ typedef enum LfmWeightLoadFlags {
  * pages are never presented as a fresh private allocation for every model.
  * process_resident_bytes describes the one process mapping and is deliberately
  * non-additive across handles or processes. */
-typedef struct LfmWeightLoadStatsV2 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmWeightLoadStats {
     uint64_t source_bytes;
     uint64_t segment_bytes;
     uint64_t segment_constructed_bytes;
@@ -121,7 +115,7 @@ typedef struct LfmWeightLoadStatsV2 {
     uint64_t payload_read_bytes;
     uint8_t identity_digest[32];
     uint8_t content_digest[32];
-} LfmWeightLoadStatsV2;
+} LfmWeightLoadStats;
 
 /* Open one .safetensors file, a model.safetensors.index.json file, or a
  * checkpoint directory. A directory prefers the Hugging Face shard index,
@@ -161,10 +155,10 @@ lfm_weights_resident_bytes(const LfmWeightImage *image);
 LFM_INTERNAL_API size_t lfm_weights_count(const LfmWeightImage *image);
 LFM_INTERNAL_API size_t
 lfm_weights_component_count(const LfmWeightImage *image, uint32_t component);
-/* Native-only shared-segment accounting. The function initializes the complete
- * V2 output, including identity and content digests. */
+/* Native-only shared-segment accounting, including identity and content
+ * digests. */
 LFM_INTERNAL_API int lfm_weights_load_stats(const LfmWeightImage *image,
-                                          LfmWeightLoadStatsV2 *out);
+                                          LfmWeightLoadStats *out);
 
 LFM_INTERNAL_API int lfm_weights_at(const LfmWeightImage *image, size_t index,
                                   LfmTensorView *out);

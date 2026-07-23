@@ -218,9 +218,6 @@ void store_contract() {
     Store::Header header{};
     std::memcpy(&header, bytes.data(), sizeof(header));
     check(header.magic == UINT64_C(0x1122334455667788) &&
-              header.format_version == Store::format &&
-              header.header_size == sizeof(Store::Header) &&
-              header.record_size == sizeof(Fatal) &&
               header.publication == Store::committed &&
               header.runtime_epoch == 91,
           "fatal store header drifted");

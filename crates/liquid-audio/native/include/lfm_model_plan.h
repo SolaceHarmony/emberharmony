@@ -46,7 +46,6 @@ typedef struct LfmAudioRouteResult {
     uint32_t depth_completed;
     uint32_t detokenizer_completed;
     uint32_t eoaudio;
-    uint32_t reserved;
     size_t pcm_samples;
     uint32_t codes[LFM_DETOKENIZER_CODEBOOKS];
 } LfmAudioRouteResult;
@@ -148,7 +147,7 @@ int lfm_engine_audio_route_submit(
     const LfmLayerState *states, size_t state_count, size_t position,
     const uint16_t *rope_cos, const uint16_t *rope_sin,
     size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
-    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    const LfmSamplerConfig *audio_sampler, LfmPrngState *prng,
     LfmAudioDetokenizerState *detokenizer, const LfmAudioRouteTarget *target,
     LfmAudioRouteResult *result, size_t lanes,
     const struct LfmTokenCommitRecord *commit,
@@ -170,7 +169,7 @@ int lfm_engine_token_route_submit(
     uint32_t embedding_kind, const LfmLayerState *states, size_t state_count,
     size_t position, const uint16_t *rope_cos, const uint16_t *rope_sin,
     size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
-    const LfmSamplerConfigV1 *sampler, LfmPrngStateV1 *prng,
+    const LfmSamplerConfig *sampler, LfmPrngState *prng,
     uint32_t *out_token, size_t lanes,
     const struct LfmTokenCommitRecord *commit,
     uint32_t *out_token_completed, LfmAudioRouteNotify notify,
@@ -196,41 +195,14 @@ int lfm_engine_prefill_workspace_create(void *engine, uint64_t id,
                                         void **out_workspace);
 void lfm_engine_prefill_workspace_destroy(void *workspace);
 
-/* Test-only per-row dual-head readout captured at the prefill sample seam.
- * Every production submit passes a null readout; the pointer is carried in
- * the pass record exactly like `out_token` and costs nothing when absent.
- * When present the pass must sample, and after the text sample completes the
- * engine reports the top-`LFM_LISTEN_READOUT_TOP_K` ids with natural-log
- * probabilities plus the full-distribution entropy (nats) for two heads over
- * the very logits planes the samplers consume:
- *   - the text head: the prefill sample plane itself, and
- *   - the Depthformer codebook-0 head of `depth_id`, evaluated by the
- *     ordinary depth program stages on the same post-embedding-norm hidden a
- *     generation pass would hand it, halted before any codebook sampling.
- * Unused trailing top-k slots report id UINT32_MAX and -infinity. Equal
- * logits rank the lower id first, matching the greedy sample fold. */
-enum { LFM_LISTEN_READOUT_TOP_K = 8 };
-
-typedef struct LfmListenReadoutForTest {
-    /* Input: the Depthformer plan whose codebook-0 head is evaluated. */
-    uint64_t depth_id;
-    uint32_t text_ids[LFM_LISTEN_READOUT_TOP_K];
-    float text_logprobs[LFM_LISTEN_READOUT_TOP_K];
-    float text_entropy;
-    uint32_t audio_ids[LFM_LISTEN_READOUT_TOP_K];
-    float audio_logprobs[LFM_LISTEN_READOUT_TOP_K];
-    float audio_entropy;
-} LfmListenReadoutForTest;
-
 int lfm_engine_prefill_submit(
     void *engine, uint64_t id, void *workspace, const uint32_t *ids,
     const uint16_t *provided_rows, size_t row_count,
     uint32_t embedding_kind, const LfmLayerState *states,
     size_t state_count, size_t position, const uint16_t *rope_cos,
     const uint16_t *rope_sin, size_t rope_elements, uint16_t *out_hidden,
-    size_t hidden_elements, const LfmSamplerConfigV1 *sampler,
-    LfmPrngStateV1 *prng, uint32_t *out_token, size_t lanes,
-    LfmListenReadoutForTest *readout_for_test,
+    size_t hidden_elements, const LfmSamplerConfig *sampler,
+    LfmPrngState *prng, uint32_t *out_token, size_t lanes,
     LfmAudioRouteNotify notify, void *notify_context,
     LfmAudioRouteHandle *out_handle);
 

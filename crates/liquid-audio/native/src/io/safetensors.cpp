@@ -1,9 +1,9 @@
 // Native resident safetensors loader.
 //
 // The span planning and whole-file residency discipline comes from the
-// safetensors path in ember-ml. This version deliberately stops before UKM's
-// numerical ingress: model payloads remain byte-exact checkpoint storage and
-// kernels receive immutable pointers into one process-long aligned image.
+// safetensors path in ember-ml. Model payloads remain byte-exact checkpoint
+// storage and kernels receive immutable pointers into one process-long aligned
+// image.
 
 #include "lfm_safetensors.h"
 #include "lfm_payload_reader.h"
@@ -65,7 +65,6 @@ namespace {
  * tensor offsets inside each verbatim safetensors source are never changed. */
 constexpr size_t kWeightAlign = 64 * 1024;
 constexpr size_t kSegmentHeaderBytes = kWeightAlign;
-constexpr uint32_t kSegmentLayoutVersion = 2;
 constexpr uint32_t kSegmentInvalid = 0;
 constexpr uint32_t kSegmentInitializing = 1;
 constexpr uint32_t kSegmentBuilding = 2;
@@ -75,7 +74,7 @@ constexpr size_t kMaxSegmentSources = 512;
 constexpr size_t kReadChunkBytes = 8 * 1024 * 1024;
 constexpr size_t kReadWorkers = 4;
 constexpr uint64_t kMaxHeaderBytes = 100'000'000;
-static_assert(sizeof(LfmWeightLoadStatsV2) == 176);
+static_assert(sizeof(LfmWeightLoadStats) == 168);
 
 using Digest = std::array<uint8_t, 32>;
 
@@ -223,14 +222,6 @@ Digest hash_bytes(const void *data, size_t bytes) {
     hash.update(data, bytes);
     return hash.finish();
 }
-
-struct ReadTestHook;
-
-struct LoadOptions {
-    size_t workers{kReadWorkers};
-    bool uncached{false};
-    ReadTestHook *test{nullptr};
-};
 
 class WeightError final : public std::runtime_error {
   public:
@@ -385,9 +376,7 @@ std::string system_message(DWORD error) {
 
 class OpenFile {
   public:
-    explicit OpenFile(fs::path path, bool uncached = false)
-        : path_(std::move(path)) {
-        (void)uncached;
+    explicit OpenFile(fs::path path) : path_(std::move(path)) {
         handle_ = CreateFileW(path_.c_str(), GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               nullptr, OPEN_EXISTING,
@@ -502,8 +491,7 @@ using ReadEvent = int;
 
 class OpenFile {
   public:
-    explicit OpenFile(fs::path path, bool uncached = false)
-        : path_(std::move(path)) {
+    explicit OpenFile(fs::path path) : path_(std::move(path)) {
         int flags = O_RDONLY;
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
@@ -516,28 +504,6 @@ class OpenFile {
         }
         try {
             initial_ = state();
-#ifdef __APPLE__
-            if (uncached && ::fcntl(handle_, F_NOCACHE, 1) != 0) {
-                const int error = errno;
-                fail(LFM_WEIGHT_IO_ERROR,
-                     "cannot disable file caching for benchmark source '" +
-                         path_.string() + "': " + std::strerror(error));
-            }
-#elif defined(POSIX_FADV_DONTNEED)
-            if (uncached) {
-                const int error = ::posix_fadvise(handle_, 0, 0, POSIX_FADV_DONTNEED);
-                if (error != 0) {
-                    fail(LFM_WEIGHT_IO_ERROR,
-                         "cannot evict benchmark source '" + path_.string() +
-                             "' from the file cache: " + std::strerror(error));
-                }
-            }
-#else
-            if (uncached) {
-                fail(LFM_WEIGHT_IO_ERROR,
-                     "cold-cache loader benchmarking is unsupported on this platform");
-            }
-#endif
         } catch (...) {
             ::close(handle_);
             handle_ = -1;
@@ -633,15 +599,12 @@ struct SegmentSourceRecord {
     uint64_t offset{0};
     uint64_t bytes{0};
     uint32_t component{0};
-    uint32_t reserved0{0};
     uint8_t label_digest[32]{};
-    uint64_t reserved1{0};
 };
-static_assert(sizeof(SegmentSourceRecord) == 64);
+static_assert(sizeof(SegmentSourceRecord) == 56);
 
 struct alignas(64) SegmentHeader {
     uint8_t magic[8]{};
-    uint32_t layout_version{0};
     uint32_t header_bytes{0};
     uint32_t state{0};
     uint32_t source_count{0};
@@ -662,7 +625,7 @@ static_assert(sizeof(SegmentHeader) <= kSegmentHeaderBytes);
 static_assert(offsetof(SegmentHeader, state) % alignof(uint32_t) == 0);
 static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr));
 
-constexpr uint8_t kSegmentMagic[8] = {'L', 'F', 'M', 'W', 'S', 'E', 'G', '2'};
+constexpr uint8_t kSegmentMagic[8] = {'L', 'F', 'M', 'W', 'S', 'E', 'G', 0};
 
 uint32_t segment_state(const SegmentHeader *header) {
     return __atomic_load_n(&header->state, __ATOMIC_ACQUIRE);
@@ -698,10 +661,9 @@ Digest label_digest(std::string_view label) {
 
 Digest identity_digest(const std::vector<Source> &sources,
                        const std::vector<OpenFile> &files) {
-    static constexpr char domain[] = "LFM-WEIGHT-IDENTITY-V1";
+    static constexpr char domain[] = "LFM-WEIGHT-IDENTITY";
     Sha256 hash;
     hash.update(domain, sizeof(domain) - 1);
-    hash_integer(hash, kSegmentLayoutVersion);
     hash_integer(hash, static_cast<uint64_t>(sources.size()));
     for (size_t index = 0; index < sources.size(); ++index) {
         const Source &source = sources[index];
@@ -748,7 +710,6 @@ void publish_segment_build_header(SegmentHeader *header,
                                   size_t bytes, size_t source_bytes,
                                   const Digest &identity) {
     std::memcpy(header->magic, kSegmentMagic, sizeof(kSegmentMagic));
-    header->layout_version = kSegmentLayoutVersion;
     header->header_bytes = static_cast<uint32_t>(kSegmentHeaderBytes);
     header->source_count = static_cast<uint32_t>(sources.size());
     header->total_bytes = bytes;
@@ -948,9 +909,7 @@ class WeightSegment {
     static WeightSegment acquire(const std::vector<Source> &sources,
                                  const std::vector<OpenFile> &files,
                                  size_t bytes, size_t source_bytes,
-                                 const Digest &identity,
-                                 bool inject_wire_failure = false,
-                                 bool takeover = true) {
+                                 const Digest &identity, bool takeover = true) {
         if (sources.size() > kMaxSegmentSources) {
             fail(LFM_WEIGHT_FORMAT_ERROR,
                  "shared weight segment source count exceeds header capacity");
@@ -1112,7 +1071,7 @@ class WeightSegment {
                     (void)poison_abandoned_segment(
                         segment.name_, generation, owner, started, owner_uid);
                     return acquire(sources, files, bytes, source_bytes,
-                                   identity, inject_wire_failure, false);
+                                   identity, false);
                 }
 #else
                 if (!owner_alive(owner, started)) {
@@ -1127,7 +1086,6 @@ class WeightSegment {
             const bool header_valid =
                 std::memcmp(header->magic, kSegmentMagic,
                             sizeof(kSegmentMagic)) == 0 &&
-                header->layout_version == kSegmentLayoutVersion &&
                 header->header_bytes == kSegmentHeaderBytes &&
                 header->total_bytes == bytes &&
                 header->source_bytes == source_bytes &&
@@ -1163,7 +1121,7 @@ class WeightSegment {
                     (void)poison_abandoned_segment(
                         segment.name_, generation, owner, started, owner_uid);
                     return acquire(sources, files, bytes, source_bytes,
-                                   identity, inject_wire_failure, false);
+                                   identity, false);
                 }
 #else
                 if (!owner_alive(owner, started)) {
@@ -1189,9 +1147,6 @@ class WeightSegment {
             segment.published_ = true;
         }
 
-        if (inject_wire_failure) {
-            fail(LFM_WEIGHT_IO_ERROR, wire_failure(bytes, ENOMEM));
-        }
         segment.wire();
         const auto end = std::chrono::steady_clock::now();
         const uint64_t elapsed = static_cast<uint64_t>(
@@ -1344,21 +1299,9 @@ struct ReadSummary {
     Digest content_digest{};
 };
 
-/* Private deterministic fault injection for the loader integration test. It
- * is reachable only through the unadvertised test entry point below; product
- * opens always pass null and retain exactly the production read path. */
-struct ReadTestHook {
-    size_t fail_task{std::numeric_limits<size_t>::max()};
-    fs::path change_after_reads;
-    std::atomic<size_t> completed{0};
-    size_t scheduled{0};
-    bool fail_wire{false};
-};
-
 ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
                          const std::vector<Source> &sources,
                          size_t image_bytes, size_t worker_limit,
-                         ReadTestHook *test,
                          const LfmPayloadReadScope *accounting = nullptr) {
     std::vector<ReadTask> tasks;
     for (size_t source = 0; source < sources.size(); ++source) {
@@ -1372,8 +1315,6 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
     if (tasks.size() > std::numeric_limits<uint32_t>::max()) {
         fail(LFM_WEIGHT_OUT_OF_MEMORY, "safetensors read task count exceeds uint32_t");
     }
-    if (test) test->scheduled = tasks.size();
-
     std::atomic<size_t> next{0};
     const size_t count = std::min(worker_limit, tasks.size());
 
@@ -1420,10 +1361,6 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
                     if (index >= tasks.size()) return;
                     ReadTask &task = tasks[index];
                     try {
-                        if (test && index == test->fail_task) {
-                            fail(LFM_WEIGHT_IO_ERROR,
-                                 "injected positioned-read failure");
-                        }
                         files[task.source].read_at(task.destination, task.bytes,
                                                    task.offset, event);
                         task.digest = hash_bytes(task.destination, task.bytes);
@@ -1438,9 +1375,6 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
                         }
                     } catch (...) {
                         task.error = std::current_exception();
-                    }
-                    if (test) {
-                        test->completed.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             });
@@ -1461,17 +1395,6 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
 #ifdef _WIN32
     for (const HANDLE event : events) CloseHandle(event);
 #endif
-
-    if (test && !test->change_after_reads.empty()) {
-        const std::string path = test->change_after_reads.string();
-        std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
-            std::fopen(path.c_str(), "ab"), &std::fclose);
-        if (!file || std::fputc(0, file.get()) == EOF ||
-            std::fflush(file.get()) != 0) {
-            fail(LFM_WEIGHT_IO_ERROR,
-                 "cannot mutate loader test source '" + path + "'");
-        }
-    }
 
     std::vector<std::exception_ptr> changed(files.size());
     for (size_t source = 0; source < files.size(); ++source) {
@@ -1494,7 +1417,7 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
      * a deterministic tree over the layout and those ordered leaf hashes; it
      * covers every source byte without a second multi-gigabyte scan and binds
      * the zero-filled gaps/tail through their offsets and final segment size. */
-    static constexpr char domain[] = "LFM-WEIGHT-CONTENT-V1";
+    static constexpr char domain[] = "LFM-WEIGHT-CONTENT";
     Sha256 content;
     content.update(domain, sizeof(domain) - 1);
     hash_integer(content, static_cast<uint64_t>(image_bytes));
@@ -2028,23 +1951,12 @@ void parse_shard(WeightImageCore &image, uint32_t shard) {
     }
 }
 
-LfmWeightImage *load(
-    Resolved resolved, LoadOptions options = {},
-    const LfmPayloadReadScope *accounting = nullptr,
-    const ReadyTarget *ready = nullptr) {
+LfmWeightImage *load(Resolved resolved,
+                     const LfmPayloadReadScope *accounting = nullptr,
+                     const ReadyTarget *ready = nullptr) {
     if (resolved.sources.empty()) {
         fail(LFM_WEIGHT_INVALID_ARGUMENT, "no safetensors sources were provided");
     }
-    if (options.workers == 0 || options.workers > kReadWorkers) {
-        fail(LFM_WEIGHT_INVALID_ARGUMENT,
-             "safetensors worker count must be between one and four");
-    }
-#ifdef _WIN32
-    if (options.uncached) {
-        fail(LFM_WEIGHT_IO_ERROR,
-             "cold-cache loader benchmarking is unsupported on Windows");
-    }
-#endif
     if (resolved.sources.size() > std::numeric_limits<uint32_t>::max()) {
         fail(LFM_WEIGHT_FORMAT_ERROR, "too many safetensors shards");
     }
@@ -2052,7 +1964,7 @@ LfmWeightImage *load(
     std::vector<OpenFile> files;
     files.reserve(resolved.sources.size());
     for (auto &source : resolved.sources) {
-        files.emplace_back(source.path, options.uncached);
+        files.emplace_back(source.path);
         source.bytes = files.back().bytes();
     }
 
@@ -2104,8 +2016,7 @@ LfmWeightImage *load(
     auto image = std::make_shared<WeightImageCore>();
     try {
         image->segment = WeightSegment::acquire(
-            resolved.sources, files, total, source_bytes, identity,
-            options.test && options.test->fail_wire);
+            resolved.sources, files, total, source_bytes, identity);
     } catch (const WeightError &error) {
         if (error.status() != LFM_WEIGHT_IN_PROGRESS) throw;
         if (ready) {
@@ -2136,8 +2047,7 @@ LfmWeightImage *load(
                         image->segment.size() - cursor);
         }
         summary = read_sources(files, destination, image->sources,
-                               image->segment.size(), options.workers,
-                               options.test, accounting);
+                               image->segment.size(), kReadWorkers, accounting);
         image->task_count = summary.tasks;
         image->worker_count = summary.workers;
     } else {
@@ -2195,8 +2105,6 @@ void fill_view(const LfmWeightImage &image, const TensorMeta &tensor,
                LfmTensorView &view) {
     const WeightImageCore &core = *image.core;
     view = {};
-    view.size = sizeof(LfmTensorView);
-    view.abi_version = LFM_WEIGHT_ABI_VERSION;
     view.name = tensor.name.c_str();
     view.data = core.segment.data() + tensor.offset;
     view.shape = tensor.shape.data();
@@ -2255,7 +2163,7 @@ static int weights_open(const char *path, const LfmPayloadReadOwner *owner,
             }
             return load(resolve_path(fs::path(path),
                                      LFM_WEIGHT_COMPONENT_MAIN, &scope),
-                        {}, &scope, ready);
+                        &scope, ready);
         },
         out, err, errlen);
 }
@@ -2345,7 +2253,7 @@ static int weights_open_bundle(const char *main_path,
                 resolved,
                 resolve_path(fs::path(detokenizer_path),
                              LFM_WEIGHT_COMPONENT_DETOKENIZER, &scope));
-            return load(std::move(resolved), {}, &scope, ready);
+            return load(std::move(resolved), &scope, ready);
         },
         out, err, errlen);
 }
@@ -2379,230 +2287,6 @@ int lfm_weights_open_bundle_owned_continuation(
     };
     return weights_open_bundle(main_path, detokenizer_path, owner, &ready, out,
                                err, errlen);
-}
-
-/* Deliberately absent from the installed header: the load benchmark needs to
- * run the exact production planner with one and four I/O workers, and (where
- * supported) with the file cache bypassed. This is not a model/loader ABI for
- * product code and may change with the benchmark without compatibility notice. */
-extern "C" int lfm_internal_weights_open_bundle_benchmark(
-    const char *main_path, const char *detokenizer_path, uint32_t workers,
-    uint32_t uncached, LfmWeightImage **out, char *err, size_t errlen) {
-    if (!main_path || main_path[0] == '\0' || !detokenizer_path ||
-        detokenizer_path[0] == '\0' || uncached > 1) {
-        if (out) *out = nullptr;
-        set_error(err, errlen, "invalid native load benchmark arguments");
-        return LFM_WEIGHT_INVALID_ARGUMENT;
-    }
-    return open_c(
-        [&] {
-            Resolved resolved;
-            append_resolved(
-                resolved,
-                resolve_path(fs::path(main_path), LFM_WEIGHT_COMPONENT_MAIN));
-            append_resolved(
-                resolved,
-                resolve_path(fs::path(detokenizer_path),
-                             LFM_WEIGHT_COMPONENT_DETOKENIZER));
-            return load(std::move(resolved),
-                        LoadOptions{workers, uncached != 0});
-        },
-        out, err, errlen);
-}
-
-extern "C" int lfm_internal_weights_benchmark_cold_supported(void) {
-#if defined(__APPLE__) || defined(POSIX_FADV_DONTNEED)
-    return 1;
-#else
-    return 0;
-#endif
-}
-
-extern "C" int lfm_internal_weights_open_fault_test(
-    const char *path, uint32_t mode, uint32_t *scheduled,
-    uint32_t *completed, char *err, size_t errlen) {
-    if (!path || path[0] == '\0' || !scheduled || !completed ||
-        (mode != 1 && mode != 2 && mode != 3)) {
-        set_error(err, errlen, "invalid native loader fault-test arguments");
-        return LFM_WEIGHT_INVALID_ARGUMENT;
-    }
-    *scheduled = 0;
-    *completed = 0;
-    ReadTestHook hook;
-    if (mode == 1) {
-        hook.fail_task = 0;
-    } else if (mode == 2) {
-        hook.change_after_reads = fs::path(path);
-    } else {
-        hook.fail_wire = true;
-    }
-    LfmWeightImage *image = nullptr;
-    const int status = open_c(
-        [&] {
-            return load(resolve_path(fs::path(path),
-                                     LFM_WEIGHT_COMPONENT_MAIN),
-                        LoadOptions{kReadWorkers, false, &hook});
-        },
-        &image, err, errlen);
-    lfm_weights_close(image);
-    if (hook.scheduled <= std::numeric_limits<uint32_t>::max()) {
-        *scheduled = static_cast<uint32_t>(hook.scheduled);
-    }
-    const size_t done = hook.completed.load(std::memory_order_relaxed);
-    if (done <= std::numeric_limits<uint32_t>::max()) {
-        *completed = static_cast<uint32_t>(done);
-    }
-    return status;
-}
-
-/* Hostile/stale namespace gate. It fabricates every persisted crash window
- * through the elected builder's real publication helpers: zero state before
- * INITIALIZING, live/dead INITIALIZING, live/dead BUILDING, malformed READY,
- * and POISONED. Other modes mutate exactly one contract field before entering
- * through the public attach path. Test code does not duplicate the validation
- * ladder it is meant to verify. */
-extern "C" int lfm_internal_weights_hostile_segment_test(
-    const char *path, uint32_t mode, int32_t *observed_status,
-    uint64_t *abandoned_generation, uint64_t *published_generation,
-    char *err, size_t errlen) {
-#ifdef _WIN32
-    (void)path;
-    (void)mode;
-    (void)observed_status;
-    (void)abandoned_generation;
-    (void)published_generation;
-    set_error(err, errlen,
-              "hostile POSIX shared-memory fixture is unsupported on Windows");
-    return LFM_WEIGHT_REJECTED;
-#else
-    if (!path || !path[0] || mode < 1 || mode > 11 || !observed_status ||
-        !abandoned_generation || !published_generation) {
-        set_error(err, errlen, "invalid hostile-segment gate arguments");
-        return LFM_WEIGHT_INVALID_ARGUMENT;
-    }
-    *observed_status = 0;
-    *abandoned_generation = 0;
-    *published_generation = 0;
-    try {
-        Resolved resolved =
-            resolve_path(fs::path(path), LFM_WEIGHT_COMPONENT_MAIN);
-        std::vector<OpenFile> files;
-        files.reserve(resolved.sources.size());
-        size_t total = kSegmentHeaderBytes;
-        size_t source_bytes = 0;
-        for (Source &source : resolved.sources) {
-            files.emplace_back(source.path, false);
-            source.bytes = files.back().bytes();
-            source_bytes = checked_add(source_bytes, source.bytes,
-                                       "hostile fixture source bytes");
-            source.offset = checked_align(total);
-            total = checked_add(source.offset, source.bytes,
-                                "hostile fixture segment bytes");
-        }
-        total = checked_align(total);
-        const Digest identity = identity_digest(resolved.sources, files);
-        const std::string name = segment_name(identity);
-        (void)lfm_weights_evict(identity.data(), nullptr, 0);
-
-        const int fd = shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) {
-            fail(LFM_WEIGHT_IO_ERROR,
-                 "cannot create hostile shared weight fixture: " +
-                     std::string(std::strerror(errno)));
-        }
-        const size_t object_bytes = mode == 2 ? total - kWeightAlign : total;
-        if (ftruncate(fd, static_cast<off_t>(object_bytes)) != 0) {
-            const int error = errno;
-            (void)::close(fd);
-            (void)shm_unlink(name.c_str());
-            fail(LFM_WEIGHT_IO_ERROR,
-                 "cannot size hostile shared weight fixture: " +
-                     std::string(std::strerror(error)));
-        }
-        if (mode != 2) {
-            void *mapping = mmap(nullptr, total, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED, fd, 0);
-            if (mapping == MAP_FAILED) {
-                const int error = errno;
-                (void)::close(fd);
-                (void)shm_unlink(name.c_str());
-                fail(LFM_WEIGHT_IO_ERROR,
-                     "cannot map hostile shared weight fixture: " +
-                         std::string(std::strerror(error)));
-            }
-            auto *header = static_cast<SegmentHeader *>(mapping);
-            if (mode == 1) {
-                std::memset(header, 0, kSegmentHeaderBytes);
-            } else {
-                const bool dead = mode == 6 || mode == 10;
-                const bool initializing = mode == 9 || mode == 10;
-                const uint64_t pid = dead ? UINT64_MAX : current_pid();
-                const uint64_t started =
-                    dead ? UINT64_C(1) : process_start_time(pid);
-                const uint64_t generation = segment_generation();
-                initialize_segment_owner(header, generation, pid, started,
-                                         current_uid());
-                *abandoned_generation = generation;
-                if (!initializing) {
-                    publish_segment_build_header(header, resolved.sources,
-                                                 total, source_bytes, identity);
-                    if (mode == 3) header->header_bytes = 1;
-                    if (mode == 4) {
-                        /* Deliberately publish READY without a content tree. */
-                        publish_segment_state(header, kSegmentReady);
-                    }
-                    if (mode == 7) header->owner_uid = current_uid() + 1;
-                    if (mode == 8) ++header->sources[0].offset;
-                    if (mode == 11) {
-                        publish_segment_state(header, kSegmentPoisoned);
-                    }
-                }
-            }
-            (void)munmap(mapping, total);
-        }
-        (void)::close(fd);
-
-        LfmWeightImage *image = nullptr;
-        char open_error[512]{};
-        *observed_status = lfm_weights_open(path, &image, open_error,
-                                            sizeof(open_error));
-        const int32_t expected = mode == 5 || mode == 9
-                                     ? LFM_WEIGHT_IN_PROGRESS
-                                 : mode == 6 || mode == 10 ? LFM_WEIGHT_OK
-                                                          : LFM_WEIGHT_REJECTED;
-        int result = LFM_WEIGHT_OK;
-        if (*observed_status != expected) {
-            set_error(err, errlen,
-                      open_error[0] ? open_error
-                                    : "hostile object returned wrong status");
-            result = LFM_WEIGHT_REJECTED;
-        }
-        if ((mode == 6 || mode == 10) && image) {
-            LfmWeightLoadStatsV2 stats{
-                .size = sizeof(LfmWeightLoadStatsV2),
-                .abi_version = LFM_WEIGHT_ABI_VERSION,
-            };
-            if (lfm_weights_load_stats(image, &stats) != LFM_WEIGHT_OK ||
-                !(stats.flags & LFM_WEIGHT_LOAD_BUILT) ||
-                stats.generation == *abandoned_generation) {
-                set_error(err, errlen,
-                          "dead initializer generation was not replaced "
-                          "exactly once");
-                result = LFM_WEIGHT_REJECTED;
-            }
-            *published_generation = stats.generation;
-        }
-        lfm_weights_close(image);
-        (void)lfm_weights_evict(identity.data(), nullptr, 0);
-        return result;
-    } catch (const WeightError &error) {
-        set_error(err, errlen, error.what());
-        return error.status();
-    } catch (const std::exception &error) {
-        set_error(err, errlen, error.what());
-        return LFM_WEIGHT_FORMAT_ERROR;
-    }
-#endif
 }
 
 extern "C" void lfm_weights_close(LfmWeightImage *image) {
@@ -2649,27 +2333,6 @@ extern "C" int lfm_weights_evict(const uint8_t identity_digest[32],
 #endif
 }
 
-/* Test cleanup resolves identity from file metadata only; it never opens or
- * reads a published segment and is deliberately absent from the installed
- * header. Product detach must never smuggle an unlink through close(). */
-extern "C" int lfm_internal_weights_evict_path_for_test(const char *path) {
-    if (!path || !path[0]) return LFM_WEIGHT_INVALID_ARGUMENT;
-    try {
-        Resolved resolved =
-            resolve_path(fs::path(path), LFM_WEIGHT_COMPONENT_MAIN, nullptr);
-        std::vector<OpenFile> files;
-        files.reserve(resolved.sources.size());
-        for (Source &source : resolved.sources) {
-            files.emplace_back(source.path, false);
-            source.bytes = files.back().bytes();
-        }
-        const Digest identity = identity_digest(resolved.sources, files);
-        return lfm_weights_evict(identity.data(), nullptr, 0);
-    } catch (...) {
-        return LFM_WEIGHT_NOT_FOUND;
-    }
-}
-
 extern "C" const void *lfm_weights_data(const LfmWeightImage *image) {
     return image && image->core ? image->core->segment.data() : nullptr;
 }
@@ -2691,12 +2354,10 @@ extern "C" size_t lfm_weights_component_count(const LfmWeightImage *image,
 }
 
 extern "C" int lfm_weights_load_stats(const LfmWeightImage *image,
-                                       LfmWeightLoadStatsV2 *out) {
+                                       LfmWeightLoadStats *out) {
     if (!image || !image->core || !out) return LFM_WEIGHT_INVALID_ARGUMENT;
     const WeightImageCore &core = *image->core;
     *out = {};
-    out->size = static_cast<uint32_t>(sizeof(LfmWeightLoadStatsV2));
-    out->abi_version = LFM_WEIGHT_ABI_VERSION;
     out->source_bytes = core.source_bytes;
     out->segment_bytes = core.segment.size();
     out->segment_constructed_bytes =

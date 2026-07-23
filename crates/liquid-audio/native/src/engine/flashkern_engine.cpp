@@ -56,7 +56,6 @@
 #include "kc_permit_broker.hpp"
 #include "kc_team_executor.hpp"
 #include "kc_team_supervisor.hpp"
-#include "../runtime/lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
 
 extern "C" {
@@ -87,12 +86,6 @@ extern "C" void lfm_attn_av_bf16(const float *att, const uint16_t *v, float *out
 extern "C" void lfm_rope_i_f32(float *x, const float *cos_p, const float *sin_p, int hd);
 extern "C" void lfm_swiglu_bf16(const float *g, const float *u, uint16_t *out, int n);
 
-/* Private implementation-backed supervision hook. This is intentionally not
- * declared by kc_team.h: product callers must not acquire a team-poison API. */
-extern "C" int kc_team_inject_member_exit_for_test(
-    kc_team_t *team, uint64_t generation, uint32_t member, uint32_t point,
-    void (*ready)(void *, uint64_t), void *context);
-
 namespace {
 
 constexpr int MAX_WORKERS = 16;
@@ -116,7 +109,7 @@ constexpr uint32_t TEAM_DEADLINE_SLOT = 0;
 /* The closed production request table below assigns this conservative
  * generation ceiling to every currently mounted numerical family. Unknown
  * work receives no fallback and is rejected before team dispatch. */
-constexpr uint64_t TEAM_PROBE_HARD_DEADLINE_NS = UINT64_C(1000000000);
+constexpr uint64_t TEAM_HARD_DEADLINE_NS = UINT64_C(1000000000);
 constexpr size_t PREFILL_ROWS = LFM_PREFILL_MAX_ROWS;
 constexpr size_t TOKEN_INPUT_MAX_IDS = 8;
 static bool checked_size_product(size_t left, size_t right, size_t *out) {
@@ -285,16 +278,16 @@ struct SampleReq {
     const void *logits = nullptr;
     size_t count = 0;
     uint32_t dtype = 0;
-    LfmSamplerConfigV1 config{};
-    LfmPrngStateV1 *state = nullptr;
+    LfmSamplerConfig config{};
+    LfmPrngState *state = nullptr;
     uint32_t *out = nullptr;
     uint32_t phase = 0;
 };
 
 struct DepthReq {
     const uint16_t *hidden = nullptr;
-    LfmSamplerConfigV1 sampler{};
-    LfmPrngStateV1 *sample_state = nullptr;
+    LfmSamplerConfig sampler{};
+    LfmPrngState *sample_state = nullptr;
     uint32_t *out_tokens = nullptr;
     int completion_status = 0; // private deterministic route-fault seam
 };
@@ -316,8 +309,8 @@ struct GemmReq {
 
 struct DepthPlan {
     uint64_t id = 0;
-    std::vector<LfmDepthLayerV1> layers;
-    std::vector<LfmDepthHeadV1> heads;
+    std::vector<LfmDepthLayer> layers;
+    std::vector<LfmDepthHead> heads;
     const uint8_t *depth_linear_w = nullptr;
     const uint8_t *depth_linear_b = nullptr;
     const float *cos = nullptr;
@@ -454,8 +447,8 @@ struct TokenReq {
     const uint16_t *sin_base = nullptr;
     uint16_t *out_hidden = nullptr; // [H] post embedding-norm bits
     float *out_logits = nullptr;    // [vocab] final f32 linear-logits destination
-    const LfmSamplerConfigV1 *sampler = nullptr;
-    LfmPrngStateV1 *sample_state = nullptr;
+    const LfmSamplerConfig *sampler = nullptr;
+    LfmPrngState *sample_state = nullptr;
     uint32_t *out_token = nullptr;
     size_t lanes = 0;
 };
@@ -509,12 +502,10 @@ struct PrefillReq {
     size_t rope_len = 0;
     uint16_t *out_hidden = nullptr;
     size_t out_hidden_len = 0;
-    LfmSamplerConfigV1 sampler{};
+    LfmSamplerConfig sampler{};
     bool sample = false;
-    LfmPrngStateV1 *sample_state = nullptr;
+    LfmPrngState *sample_state = nullptr;
     uint32_t *out_token = nullptr;
-    /* Test-only dual-head readout target. Null on every production pass. */
-    LfmListenReadoutForTest *readout = nullptr;
     size_t lanes = 0;
 };
 
@@ -534,7 +525,7 @@ struct DetokenizerReq {
 };
 
 struct AudioReq {
-    LfmAudioEncodePassV2 pass{};
+    LfmAudioEncodePass pass{};
     LfmConformerProgram conformer{};
     uint64_t adapted_values = 0;
     uint64_t frames = 0;
@@ -567,9 +558,6 @@ struct ScratchBank {
 };
 
 struct Engine;
-constexpr size_t BLOCK_DOMAIN_COUNT = 2;
-constexpr uint32_t BLOCK_LANES = 4;
-constexpr uint32_t GRID_LANES = BLOCK_DOMAIN_COUNT * BLOCK_LANES;
 
 // The production audio route is deliberately smaller than a graph runtime:
 // three trusted coarse nodes and one total immutable outcome table.
@@ -739,30 +727,6 @@ static uint64_t slot_generation(const PassSlot *slot);
 static bool transition_slot(PassSlot *slot, uint64_t generation,
                             uint32_t from, uint32_t to);
 
-struct LfmEngineSnapshotV1 {
-    uint32_t size;
-    uint32_t abi_version;
-    uint64_t pass_submissions;
-    uint64_t pass_completions;
-    uint64_t bridge_dispatches;
-    uint64_t dispatch_wakes;
-    uint32_t attention_qkv_capacity;
-    uint32_t attention_y_capacity;
-    uint32_t attention_score_capacity;
-    uint32_t pass_claimed;
-    uint32_t bridge_capacity;
-    uint32_t pass_slot_capacity;
-    uint32_t pass_slots_live;
-    uint32_t max_pass_slots_live;
-    uint64_t continuation_submissions;
-    uint32_t route_capacity;
-    uint32_t routes_live;
-    uint32_t routes_ready;
-    uint32_t reserved0;
-    uint64_t route_dispatches;
-    uint64_t route_admission_deferrals;
-};
-
 /* Immutable identity of the exact numerical generation mounted on the fixed
  * team. A request selector alone is not enough: token, prefill, Depthformer,
  * Conformer, and sampling tickets each contain multiple independently
@@ -774,7 +738,7 @@ struct TeamWorkDescriptor {
     uint32_t program_kind = 0;
     uint32_t program_phase = 0;
     uint32_t program_flags = 0;
-    uint32_t reserved = 0;
+    uint32_t padding = 0;
     uint64_t program_outer = 0;
     uint64_t program_inner = 0;
     uint64_t shape0 = 0;
@@ -788,8 +752,6 @@ static_assert(std::is_trivially_copyable_v<TeamWorkDescriptor>);
  * engine, route, conversation, or scratch lifetime. It is never a CQ record:
  * timeout poisons the process and therefore cannot publish ordinary progress. */
 struct alignas(ENGINE_CACHELINE) TeamFatalCapsule {
-    uint32_t size = sizeof(TeamFatalCapsule);
-    uint32_t abi_version = 2;
     uint32_t request = REQ_NONE;
     uint32_t stage = ST_IDLE;
     uint32_t program_kind = 0;
@@ -824,12 +786,6 @@ static_assert(std::is_trivially_copyable_v<TeamFatalCapsule>);
 
 constexpr uint64_t TEAM_FATAL_SINK_MAGIC = UINT64_C(0x314c415441464b46);
 
-struct TeamFaultTestConfig {
-    uint32_t member = 0;
-    uint32_t point = 0;
-    const char *fatal_path = nullptr;
-};
-
 using EngineSupervisor =
     kc::TeamSupervisor<FlashkernRequest, TeamWorkDescriptor,
                        TeamFatalCapsule, ENGINE_CACHELINE>;
@@ -855,7 +811,6 @@ struct Engine {
     int n_workers = 0;
     int control_started = 0;
     int executor_started = 0;
-    uint32_t block_count = 1;
     uint32_t lanes_total = 1;
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
@@ -868,8 +823,6 @@ struct Engine {
      * and budget selection. kc::TeamSupervisor owns deadline lineage,
      * terminal arbitration, quorum evidence, and fatal storage. */
     TeamWorkDescriptor supervised_work{};
-    bool manual_deadlines = false;
-    bool hard_timeout_probe = false;
     // Numerical publishers take a bounded, single-pass lease. Plan mutation
     // closes admission and succeeds only when every already-admitted publisher
     // has retired. No producer retries or waits for exclusivity.
@@ -886,14 +839,6 @@ struct Engine {
     std::atomic<uint32_t> max_pass_slots_live{0};
     std::atomic<uint64_t> continuation_submissions{0};
     std::atomic<uint64_t> route_dispatches{0};
-    std::atomic<uint64_t> audio_encode_passes{0};
-    std::atomic<int> test_audio_route_depth_status{0};
-    std::atomic<int> test_audio_route_detokenizer_status{0};
-    /* Owner-published control evidence for the fatal outer truth-gate
-     * watchdog. This is retained setup-time state, not a copied payload
-     * snapshot and not part of the product ABI. */
-    LfmEngineDiagnosticState diagnostics;
-
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
     SampleReq sample; // pointer-only logits/state handoff; policy is inline
@@ -954,30 +899,6 @@ static bool transition_slot(PassSlot *slot, uint64_t generation,
     return slot->engine->slots.transition(
         {.index = slot->index, .generation = generation}, from, to);
 }
-
-static void publish_engine_diagnostics(Engine *engine) {
-    if (!engine) return;
-    const kc::TeamExecutorSnapshot executor = engine->executor.snapshot();
-    LfmEngineDiagnosticState &state = engine->diagnostics;
-    state.bridge_activations.store(executor.activations,
-                                   std::memory_order_relaxed);
-    state.team_generation.store(executor.generation,
-                                std::memory_order_relaxed);
-    state.bridge_phase.store(executor.phase, std::memory_order_relaxed);
-    state.request.store(static_cast<uint32_t>(engine->cur_req),
-                        std::memory_order_relaxed);
-    state.stage.store(engine->supervised_work.stage,
-                      std::memory_order_relaxed);
-    state.program_phase.store(engine->supervised_work.program_phase,
-                              std::memory_order_relaxed);
-    state.bridge_valid.store(engine->active_slot ? 1u : 0u,
-                             std::memory_order_relaxed);
-    state.active_status.store(
-        engine->active_status.load(std::memory_order_acquire),
-        std::memory_order_relaxed);
-    state.publications.fetch_add(1, std::memory_order_release);
-}
-
 
 static void notify_route_broker(void *context) {
     Engine *engine = static_cast<Engine *>(context);
@@ -1400,14 +1321,9 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         break;
     }
     case ST_LOGITS: {
-        // linear_logits ladder EXACTLY: M==1 GEMV rows, f32 accumulate, RAW f32
-        // out. The pinned Rust head (linear_logits -> Bf16GemmNt) emits the
-        // kernel's f32 directly — the bf16 storage round this stage used to add
-        // was an EXTRA round the reference never performs, and it is what
-        // flipped the perf-chain hash when the head was first absorbed. Same
-        // kernel, same per-row K-reduction (row banding cannot reorder a row's
-        // accumulation), no round: bit-identical to the accepted head path — the
-        // PERF oracle is the proof.
+        // Linear logits are M==1 GEMV rows with f32 accumulation and a direct
+        // f32 destination. Row banding cannot reorder a row's K reduction.
+        // There is deliberately no intermediate BF16 storage round.
         Engine *ee = e;
         const TokenReq *t = ee->active_slot &&
                                   ee->active_slot->request == REQ_TOKEN_PASS
@@ -1435,9 +1351,8 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
     }
 }
 
-static bool sample_config_valid(const LfmSamplerConfigV1 *config) {
-    if (!config || config->size != sizeof(*config) ||
-        config->abi_version != LFM_SAMPLE_ABI_VERSION || config->reserved != 0 ||
+static bool sample_config_valid(const LfmSamplerConfig *config) {
+    if (!config ||
         (config->flags & ~LFM_SAMPLE_FLAG_GREEDY) != 0) {
         return false;
     }
@@ -1475,11 +1390,11 @@ static float sample_topk_threshold(const SampleReq &sample, float scale,
     return heap[0];
 }
 
-static inline const uint8_t *depth_bytes(const LfmDepthBufferV1 &view) {
+static inline const uint8_t *depth_bytes(const LfmDepthBuffer &view) {
     return reinterpret_cast<const uint8_t *>(view.address);
 }
 
-static inline const float *depth_f32(const LfmDepthBufferV1 &view) {
+static inline const float *depth_f32(const LfmDepthBuffer &view) {
     return reinterpret_cast<const float *>(view.address);
 }
 
@@ -1490,7 +1405,7 @@ static inline void depth_band(size_t count, uint32_t lane, uint32_t lanes,
     *end = std::min(*begin + chunk, count);
 }
 
-static inline void depth_gemv(const LfmDepthBufferV1 &weight, const uint16_t *x,
+static inline void depth_gemv(const LfmDepthBuffer &weight, const uint16_t *x,
                               float *out, size_t rows, size_t cols,
                               uint32_t lane, uint32_t lanes) {
     size_t begin = 0, end = 0;
@@ -1501,7 +1416,7 @@ static inline void depth_gemv(const LfmDepthBufferV1 &weight, const uint16_t *x,
             out + begin, 1, (int)(end - begin), (int)cols);
 }
 
-static inline void depth_gemv_rne(const LfmDepthBufferV1 &weight,
+static inline void depth_gemv_rne(const LfmDepthBuffer &weight,
                                   const uint16_t *x, uint16_t *out,
                                   size_t rows, size_t cols, uint32_t lane,
                                   uint32_t lanes) {
@@ -1514,7 +1429,7 @@ static inline void depth_gemv_rne(const LfmDepthBufferV1 &weight,
 }
 
 static inline void depth_gemv_rne_add(
-    const LfmDepthBufferV1 &weight, const uint16_t *x,
+    const LfmDepthBuffer &weight, const uint16_t *x,
     const uint16_t *residual, uint16_t *out, size_t rows, size_t cols,
     uint32_t lane, uint32_t lanes) {
     size_t begin = 0, end = 0;
@@ -1526,7 +1441,7 @@ static inline void depth_gemv_rne_add(
 }
 
 static inline void depth_gemv_pair_swiglu(
-    const LfmDepthBufferV1 &gate, const LfmDepthBufferV1 &up,
+    const LfmDepthBuffer &gate, const LfmDepthBuffer &up,
     const uint16_t *x, uint16_t *out, size_t rows, size_t cols,
     uint32_t lane, uint32_t lanes) {
     size_t begin = 0, end = 0;
@@ -1539,7 +1454,7 @@ static inline void depth_gemv_pair_swiglu(
 }
 
 static void depth_qk_head(const DepthPlan &d, const uint16_t *src,
-                          const LfmDepthBufferV1 &weight, uint16_t *out,
+                          const LfmDepthBuffer &weight, uint16_t *out,
                           size_t position) {
     uint16_t normed[128];
     float rotated[128];
@@ -1603,7 +1518,7 @@ static void depth_norm_sum_stage(Engine *e, uint32_t lane,
 
 static void depth_norm_apply_stage(Engine *e, uint32_t lane,
                                    const uint16_t *values,
-                                   const LfmDepthBufferV1 &weight,
+                                   const LfmDepthBuffer &weight,
                                    uint16_t *out) {
     DepthPlan &plan = *e->active_depth;
     DepthScratch &scratch = e->depth_scratch;
@@ -1671,7 +1586,7 @@ static void run_depth_program_stage(Engine *e, uint32_t lane,
         return;
     }
     case DEPTH_PHASE_QK_PREP: {
-        const LfmDepthLayerV1 &weights = plan.layers[layer];
+        const LfmDepthLayer &weights = plan.layers[layer];
         const size_t heads = plan.heads_total + plan.kv_heads;
         const size_t cache =
             layer * plan.kv_heads * plan.codebooks * plan.hd;
@@ -2457,10 +2372,6 @@ enum : uint32_t {
 
 enum : uint32_t {
     PREFILL_FLAG_SAMPLE = 1u,
-    /* Test-only: the pass is running the Depthformer codebook-0 readout tail
-     * of a sampled prefill; program.phase holds DEPTH_PHASE_* values and the
-     * ordinary depth program stages execute against this slot. */
-    PREFILL_FLAG_READOUT_DEPTH = 2u,
 };
 
 static PrefillInput prefill_first_input(const PassSlot *slot) {
@@ -2709,10 +2620,7 @@ static void initialize_prefill_program(Engine *e, PassSlot *slot) {
          (slot->prefill.embed_kind == 2 && slot->prefill.provided_rows &&
           slot->prefill.provided_values == provided_values)) &&
         ((!slot->prefill.sample && !slot->prefill.out_token) ||
-         (slot->prefill.sample && slot->prefill.out_token)) &&
-        (!slot->prefill.readout ||
-         (slot->prefill.sample && slot->depth &&
-          slot->depth_req.hidden == slot->prefill.out_hidden));
+         (slot->prefill.sample && slot->prefill.out_token));
     const size_t end_pos = slot->prefill.pos + slot->prefill.rows;
     valid = valid && end_pos >= slot->prefill.pos &&
         end_pos <= slot->model->max_ctx;
@@ -2770,71 +2678,8 @@ static void configure_prefill_sample(Engine *e, PassSlot *slot) {
     e->sample = slot->sample;
 }
 
-/* Test-only readout fill. It scans the exact logits plane the sampler
- * consumed (softmax/logprob math lives here, on the test path only) and
- * mirrors the greedy fold's tie policy: equal values keep the lower id. */
-static void fill_listen_readout_head(const void *logits, size_t count,
-                                     uint32_t dtype, uint32_t *out_ids,
-                                     float *out_logprobs,
-                                     float *out_entropy) {
-    const auto value_at = [logits, dtype](size_t index) {
-        const float value = dtype == SAMPLE_F32
-            ? static_cast<const float *>(logits)[index]
-            : bf16_f32(static_cast<const uint16_t *>(logits)[index]);
-        return std::isnan(value) ? -std::numeric_limits<float>::infinity()
-                                 : value;
-    };
-    float top_values[LFM_LISTEN_READOUT_TOP_K];
-    uint32_t top_ids[LFM_LISTEN_READOUT_TOP_K];
-    size_t held = 0;
-    float maximum = -std::numeric_limits<float>::infinity();
-    for (size_t index = 0; index < count; ++index) {
-        const float value = value_at(index);
-        if (value > maximum) maximum = value;
-        size_t rank = held;
-        while (rank > 0 && value > top_values[rank - 1]) --rank;
-        if (rank >= LFM_LISTEN_READOUT_TOP_K) continue;
-        const size_t tail =
-            std::min(held, size_t{LFM_LISTEN_READOUT_TOP_K} - 1);
-        for (size_t move = tail; move > rank; --move) {
-            top_values[move] = top_values[move - 1];
-            top_ids[move] = top_ids[move - 1];
-        }
-        top_values[rank] = value;
-        top_ids[rank] = static_cast<uint32_t>(index);
-        if (held < LFM_LISTEN_READOUT_TOP_K) ++held;
-    }
-    double exp_sum = 0.0;
-    double weighted = 0.0;
-    for (size_t index = 0; index < count; ++index) {
-        const double centered =
-            static_cast<double>(value_at(index)) -
-            static_cast<double>(maximum);
-        const double weight = std::exp(centered);
-        exp_sum += weight;
-        weighted += weight * centered;
-    }
-    const double log_z = std::log(exp_sum);
-    for (size_t rank = 0; rank < LFM_LISTEN_READOUT_TOP_K; ++rank) {
-        const bool live = rank < held;
-        out_ids[rank] = live ? top_ids[rank] : UINT32_MAX;
-        out_logprobs[rank] = live
-            ? static_cast<float>(
-                  static_cast<double>(top_values[rank]) -
-                  static_cast<double>(maximum) - log_z)
-            : -std::numeric_limits<float>::infinity();
-    }
-    *out_entropy = static_cast<float>(log_z - weighted / exp_sum);
-}
-
 static void run_prefill_program_stage(Engine *e, uint32_t lane,
                                       PassSlot *slot) {
-    if ((slot->program.flags & PREFILL_FLAG_READOUT_DEPTH) != 0) {
-        /* Test-only readout tail: the codebook-0 head evaluation runs the
-         * ordinary depth program stages against this slot's depth scratch. */
-        run_depth_program_stage(e, lane, slot);
-        return;
-    }
     PrefillWorkspace *workspace = slot->prefill.workspace;
     const size_t layer = static_cast<size_t>(slot->program.outer);
     const size_t rows = slot->prefill.rows;
@@ -2952,26 +2797,8 @@ static void run_prefill_program_stage(Engine *e, uint32_t lane,
 
 static bool advance_prefill_program(Engine *e, PassSlot *slot) {
     if (e->active_status.load(std::memory_order_acquire) != 0) {
-        slot->program.flags &= ~PREFILL_FLAG_READOUT_DEPTH;
         slot->program.phase = PREFILL_PHASE_DONE;
         return false;
-    }
-    if ((slot->program.flags & PREFILL_FLAG_READOUT_DEPTH) != 0) {
-        /* Test-only readout tail. Halt the depth program at the codebook-0
-         * logits: the readout wants the head distribution, never a sampled
-         * code, so no sampler state is consumed and no embedding follows. */
-        if (slot->program.phase == DEPTH_PHASE_HEAD_LOGITS) {
-            LfmListenReadoutForTest *readout = slot->prefill.readout;
-            fill_listen_readout_head(
-                e->depth_scratch.logits_b.data(),
-                slot->depth->heads[0].vocab, SAMPLE_BF16,
-                readout->audio_ids, readout->audio_logprobs,
-                &readout->audio_entropy);
-            slot->program.flags &= ~PREFILL_FLAG_READOUT_DEPTH;
-            slot->program.phase = PREFILL_PHASE_DONE;
-            return false;
-        }
-        return advance_depth_program(e, slot);
     }
     switch (slot->program.phase) {
     case PREFILL_PHASE_CONV_NORM:
@@ -3044,21 +2871,6 @@ static bool advance_prefill_program(Engine *e, PassSlot *slot) {
         return true;
     case PREFILL_PHASE_SAMPLE:
         if (advance_sample_program(e, slot)) return true;
-        if (slot->prefill.readout) {
-            /* Test-only: report the text head from the very plane the sample
-             * fold consumed, then evaluate the codebook-0 head by running the
-             * ordinary depth program on the just-published hidden. */
-            LfmListenReadoutForTest *readout = slot->prefill.readout;
-            fill_listen_readout_head(
-                slot->prefill.workspace->logits.data(), slot->model->vocab,
-                SAMPLE_F32, readout->text_ids, readout->text_logprobs,
-                &readout->text_entropy);
-            slot->program.outer = 0;
-            slot->program.inner = 0;
-            slot->program.flags |= PREFILL_FLAG_READOUT_DEPTH;
-            slot->program.phase = DEPTH_PHASE_PROJECT;
-            return true;
-        }
         slot->program.phase = PREFILL_PHASE_DONE;
         return false;
     case PREFILL_PHASE_DONE:
@@ -3544,7 +3356,7 @@ static void run_gemm(Engine *e, uint32_t lane) {
     if (row >= request.m) return;
     const size_t count = std::min(rows, request.m - row);
     if (request.rhs_layout == LFM_GEMM_RHS_KN) {
-        lfm_bf16_gemm_f32_v2(
+        lfm_bf16_gemm_f32(
                              request.a + row * request.k,
                              static_cast<const uint16_t *>(request.rhs),
                              request.out + row * request.n, (int)count,
@@ -3606,7 +3418,7 @@ static int configure_audio_gemm(Engine *e, PassSlot *slot) {
 
 static int prepare_audio_conformer(Engine *e, PassSlot *slot) {
     AudioReq &audio = slot->audio;
-    const LfmAudioEncodePassV2 &pass = audio.pass;
+    const LfmAudioEncodePass &pass = audio.pass;
     LfmF32SpanChain samples{};
     int status = lfm_resampler_process_spans(
         pass.resampler, pass.resampler_workspace, &pass.pcm, pass.resampled,
@@ -3643,7 +3455,6 @@ static void run_audio_program_stage(Engine *e, uint32_t lane) {
     AudioReq &audio = slot->audio;
     if (audio.phase == AUDIO_PHASE_FRONTEND) {
         if (lane != 0) return;
-        e->audio_encode_passes.fetch_add(1, std::memory_order_relaxed);
         const int status = prepare_audio_conformer(e, slot);
         if (status != 0)
             e->active_status.store(status, std::memory_order_release);
@@ -3914,9 +3725,7 @@ static TeamWorkDescriptor describe_active_generation(const Engine *e) {
 /* Closed production budget table. Every mounted request family has an explicit
  * conservative hard ceiling; an unknown selector returns zero and
  * kc::TeamSupervisor rejects it before the team generation is dispatched. */
-static uint64_t team_hard_budget_ns(bool hard_timeout_probe,
-                                    const TeamWorkDescriptor &work) {
-    if (hard_timeout_probe) return TEAM_PROBE_HARD_DEADLINE_NS;
+static uint64_t team_hard_budget_ns(const TeamWorkDescriptor &work) {
     switch (work.request) {
     case REQ_CONV_LAYER:
     case REQ_ATTN_LAYER:
@@ -3925,7 +3734,7 @@ static uint64_t team_hard_budget_ns(bool hard_timeout_probe,
     case REQ_PREFILL:
     case REQ_AUDIO_DETOKENIZE:
     case REQ_AUDIO_ENCODE:
-        return TEAM_PROBE_HARD_DEADLINE_NS;
+        return TEAM_HARD_DEADLINE_NS;
     default:
         return 0;
     }
@@ -3944,8 +3753,6 @@ static void fill_team_fatal_capsule(
     const uint64_t entered_not_returned =
         quorum.entered_mask & ~quorum.returned_mask;
     capsule = {
-        .size = sizeof(capsule),
-        .abi_version = 2,
         .request = work.request,
         .stage = work.stage,
         .program_kind = work.program_kind,
@@ -3978,21 +3785,6 @@ static void fill_team_fatal_capsule(
     };
 }
 
-static void hard_timeout_probe_ready(void *context, uint64_t generation) {
-    Engine *e = static_cast<Engine *>(context);
-    const kc::TeamSupervisorSnapshot snapshot =
-        e ? e->supervisor.snapshot() : kc::TeamSupervisorSnapshot{};
-    if (!e || !e->hard_timeout_probe || !e->manual_deadlines ||
-        generation != snapshot.generation ||
-        snapshot.arm_team_generation != generation ||
-        snapshot.budget_ns != TEAM_PROBE_HARD_DEADLINE_NS) {
-        std::abort();
-    }
-    if (e->supervisor.expire_manual_test(generation) != 0) {
-        std::abort();
-    }
-}
-
 static int begin_team_supervision(
     Engine *e, uint64_t generation) noexcept {
     if (!e || !e->active_slot ||
@@ -4000,8 +3792,7 @@ static int begin_team_supervision(
         return -EINVAL;
     }
     e->supervised_work = describe_active_generation(e);
-    const uint64_t budget =
-        team_hard_budget_ns(e->hard_timeout_probe, e->supervised_work);
+    const uint64_t budget = team_hard_budget_ns(e->supervised_work);
     if (budget == 0) return -ENODATA;
     return e->supervisor.begin(
         e->active_submission, e->supervised_work,
@@ -4092,12 +3883,8 @@ static int executor_begin(void *context,
     } else if (slot->request == REQ_AUDIO_DETOKENIZE) {
         initialize_detokenizer_program(e, slot);
     } else if (slot->request == REQ_AUDIO_ENCODE) {
-        if (!e->hard_timeout_probe ||
-            slot->audio.phase != AUDIO_PHASE_DONE) {
-            slot->audio.phase = AUDIO_PHASE_FRONTEND;
-        }
+        slot->audio.phase = AUDIO_PHASE_FRONTEND;
     }
-    publish_engine_diagnostics(e);
     return 0;
 }
 
@@ -4120,7 +3907,6 @@ static int executor_before_generation(
     }
     const int status = begin_team_supervision(e, generation);
     if (status != 0) return status;
-    publish_engine_diagnostics(e);
     return 0;
 }
 
@@ -4133,8 +3919,6 @@ static void executor_generation_returned(
         e->supervisor.snapshot().generation != generation) {
         std::abort();
     }
-    e->diagnostics.team_completion_edge.store(
-        generation, std::memory_order_release);
 }
 
 static kc::TeamReturn executor_accept_generation(
@@ -4146,8 +3930,6 @@ static kc::TeamReturn executor_accept_generation(
                       e->active_submission.ticket)) {
         std::abort();
     }
-    e->diagnostics.team_completion_consumed.store(
-        generation, std::memory_order_release);
     kc::TeamCompletion completion{};
     const int status =
         e->supervisor.complete(generation, &completion);
@@ -4290,7 +4072,6 @@ static void executor_finish(
     }
     if (!permit.consumed && !release_pass_slot(slot, owner))
         std::abort();
-    publish_engine_diagnostics(e);
 }
 
 static void executor_stopping(void *context) noexcept {
@@ -4305,7 +4086,6 @@ static void executor_retired(void *context,
         !ticket_equal(*identity, e->executor.identity())) {
         std::abort();
     }
-    publish_engine_diagnostics(e);
 }
 
 static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
@@ -4619,12 +4399,6 @@ static int mount_audio_route(PassSlot *slot, AudioRouteInstance *route,
     if (route->kind == AUDIO_ROUTE_PREFILL) {
         slot->model = route->model;
         slot->prefill = route->prefill_req;
-        if (route->prefill_req.readout) {
-            /* Test-only dual-head readout: the codebook-0 evaluation reuses
-             * the depth program on this slot after the text sample. */
-            slot->depth = route->depth;
-            slot->depth_req = route->depth_req;
-        }
         *request = REQ_PREFILL;
         *context = route->model_id;
         return 0;
@@ -4689,8 +4463,6 @@ static kc::PermitAdvance step_audio_route(
     void *context, AudioRouteBroker::Lease,
     AudioRouteInstance &route, kc::PermitEvent event) noexcept {
     Engine *engine = static_cast<Engine *>(context);
-    engine->diagnostics.route_callbacks.fetch_add(
-        1, std::memory_order_relaxed);
     if (event == kc::PermitEvent::Cancel)
         return complete_audio_route(-ECANCELED);
     if (event == kc::PermitEvent::Completion) {
@@ -4763,9 +4535,7 @@ void lfm_engine_free(void *ep);
 // `workers` is the complete bounded kcoro worker pool. Numerical lane members,
 // the bridge, the route broker, and the supervisor are logical continuations
 // on that one pool; engine construction creates no second thread society.
-static void *engine_new_impl(int workers, bool manual_deadlines,
-                             const TeamFaultTestConfig *fault,
-                             int *out_status) {
+static void *engine_new_impl(int workers, int *out_status) {
     if (out_status) *out_status = -ENOMEM;
     if (workers < 1 || workers > MAX_WORKERS) {
         if (out_status) *out_status = -EINVAL;
@@ -4777,11 +4547,8 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     }
     Engine *e = new (std::nothrow) Engine();
     if (!e) return nullptr;
-    e->manual_deadlines = manual_deadlines;
-    if (fault) e->hard_timeout_probe = true;
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
-    e->block_count = workers == (int)GRID_LANES ? 2u : 1u;
     for (size_t index = 0; index < e->slots.size(); ++index) {
         PassSlot &slot = e->slots.record(index);
         slot.engine = e;
@@ -4854,8 +4621,8 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         .deadline_slot = TEAM_DEADLINE_SLOT,
         .expected_mask = expected_team_mask(e),
         .fatal_magic = TEAM_FATAL_SINK_MAGIC,
-        .fatal_path = fault ? fault->fatal_path : nullptr,
-        .manual_deadlines = manual_deadlines,
+        .fatal_path = nullptr,
+        .manual_deadlines = false,
         .context = e,
         .operations = {
             .fill_fatal = fill_team_fatal_capsule,
@@ -4866,12 +4633,6 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         e->supervisor.initialize(supervisor_config);
     if (supervisor_status != 0) {
         if (out_status) *out_status = supervisor_status;
-        lfm_engine_free(e);
-        return nullptr;
-    }
-    if (fault && kc_team_inject_member_exit_for_test(
-                     e->executor.team(), 1, fault->member, fault->point,
-                     hard_timeout_probe_ready, e) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
@@ -4896,53 +4657,7 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
 }
 
 void *lfm_engine_new_status(int workers, int *out_status) {
-    return engine_new_impl(workers, false, nullptr, out_status);
-}
-
-void *lfm_internal_engine_new_manual_deadlines_for_test(int workers) {
-    return engine_new_impl(workers, true, nullptr, nullptr);
-}
-
-void *lfm_internal_engine_new_hard_timeout_probe_for_test(
-    int workers, uint32_t member, uint32_t point, const char *fatal_path) {
-    if (!fatal_path || fatal_path[0] == '\0') return nullptr;
-    const TeamFaultTestConfig fault = {
-        .member = member,
-        .point = point,
-        .fatal_path = fatal_path,
-    };
-    return engine_new_impl(workers, true, &fault, nullptr);
-}
-
-static void hard_timeout_probe_completion(
-    PassContinuationPermit *, const FlashkernCompletion &, void *) {
-    /* The hard deadline must abort before ordinary numerical publication. */
-    std::abort();
-}
-
-int lfm_internal_engine_trigger_hard_timeout_probe_for_test(void *ep) {
-    Engine *e = static_cast<Engine *>(ep);
-    if (!e || !e->hard_timeout_probe || !e->manual_deadlines ||
-        e->active_slot || e->cur_req != REQ_NONE ||
-        e->supervisor.snapshot().terminal != 0) {
-        return -EINVAL;
-    }
-    PassSlot *slot = reserve_pass_slot(e);
-    if (!slot) return -EAGAIN;
-    const uint64_t generation = slot_generation(slot);
-    /* AUDIO_ENCODE/DONE is a valid closed-protocol request whose peers only
-     * publish -EPROTO; it touches no model, PCM, or scratch view. The selected
-     * member alone owns the injected liveness fault. */
-    slot->audio.phase = AUDIO_PHASE_DONE;
-    slot->stage.kind = ST_IDLE;
-    const kc_ticket_id parent =
-        e->tickets.mint(KC_TICKET_KIND_WORKFLOW);
-    const int status = submit_slot(
-        e, slot, generation, REQ_AUDIO_ENCODE, 0, parent,
-        hard_timeout_probe_completion, nullptr);
-    if (status == 0) return 0;
-    if (!release_pass_slot(slot, generation)) std::abort();
-    return status;
+    return engine_new_impl(workers, out_status);
 }
 
 void lfm_engine_request_stop(void *ep) {
@@ -4953,238 +4668,17 @@ void lfm_engine_request_stop(void *ep) {
     if (!e->executor_started) e->supervisor.request_stop();
 }
 
-// Private implementation-backed protocol probes. Selector membership is
-// queried without dispatch: a valid request also requires a fully populated
-// typed payload, so submitting an empty test slot would be an unsafe probe.
-int lfm_internal_engine_request_kind_valid_for_test(uint32_t kind) {
-    return request_kind_valid(kind) ? 1 : 0;
-}
-
-uint64_t lfm_internal_engine_hard_budget_for_test(uint32_t probe,
-                                                  uint32_t request) {
-    const TeamWorkDescriptor work = {
-        .request = request,
-    };
-    return team_hard_budget_ns(probe != 0, work);
-}
-
-int lfm_internal_engine_team_terminal_race_for_test(
-    uint64_t generation, uint32_t first, uint32_t second,
-    uint32_t *winner_bits, uint32_t *terminal_state) {
-    const uint32_t completed =
-        static_cast<uint32_t>(kc::TeamTerminalState::Completed);
-    const uint32_t timed_out =
-        static_cast<uint32_t>(kc::TeamTerminalState::TimedOut);
-    if (generation == 0 ||
-        generation > kc::TeamTerminal::max_generation ||
-        !winner_bits || !terminal_state ||
-        (first != completed && first != timed_out) ||
-        (second != completed && second != timed_out) ||
-        first == second) {
-        return -EINVAL;
-    }
-    kc::TeamTerminal terminal;
-    if (terminal.begin(generation) != 0) return -EFAULT;
-    uint32_t winners = 0;
-    if (terminal.claim(
-            generation,
-            static_cast<kc::TeamTerminalState>(first))) {
-        winners |= 1;
-    }
-    if (terminal.claim(
-            generation,
-            static_cast<kc::TeamTerminalState>(second))) {
-        winners |= 2;
-    }
-    const uint64_t result = terminal.word();
-    if (kc::TeamTerminal::generation_of(result) != generation)
-        return -EFAULT;
-    *winner_bits = winners;
-    *terminal_state = static_cast<uint32_t>(
-        kc::TeamTerminal::state_of(result));
-    return 0;
-}
-
-int lfm_internal_engine_completion_decision_for_test(
-    uint64_t generation, int retire_result, int *decision,
-    uint32_t *terminal_state) {
-    if (generation == 0 ||
-        generation > kc::TeamTerminal::max_generation || !decision ||
-        !terminal_state) {
-        return -EINVAL;
-    }
-    kc::TeamTerminal terminal;
-    if (terminal.begin(generation) != 0) return -EFAULT;
-    kc::TeamCompletion completion{};
-    const int status =
-        terminal.settle(generation, retire_result, &completion);
-    if (status != 0) return status;
-    *decision = static_cast<int>(completion);
-    const uint64_t observed = terminal.word();
-    if (kc::TeamTerminal::generation_of(observed) != generation)
-        return -EFAULT;
-    *terminal_state = static_cast<uint32_t>(
-        kc::TeamTerminal::state_of(observed));
-    return 0;
-}
-
-int lfm_internal_engine_fatal_capsule_for_test(
-    uint64_t generation, uint64_t expected_mask, uint64_t entered_mask,
-    uint64_t returned_mask, TeamFatalCapsule *out) {
-    if (!out || out->size < sizeof(*out) || generation == 0 ||
-        (entered_mask & ~expected_mask) != 0 ||
-        (returned_mask & ~entered_mask) != 0) {
-        return -EINVAL;
-    }
-    const FlashkernRequest submission = {
-        .ticket = {
-            .runtime_epoch = 11,
-            .sequence = 22,
-            .generation = 32,
-            .kind = KC_TICKET_KIND_PASS,
-        },
-        .parent = {
-            .runtime_epoch = 11,
-            .sequence = 21,
-            .generation = 31,
-            .kind = KC_TICKET_KIND_WORKFLOW,
-        },
-        .conversation_id = 44,
-        .epoch = 55,
-    };
-    const kc_deadline_event event = {
-        .slot = TEAM_DEADLINE_SLOT,
-        .kind = KC_DEADLINE_EVENT_EXPIRED,
-        .sequence = 77,
-        .scheduled_arm_generation = 88,
-        .current_arm_generation = 88,
-        .child = {
-            .runtime_epoch = 11,
-            .sequence = 23,
-            .generation = 33,
-            .kind = KC_TICKET_KIND_DEADLINE,
-        },
-        .parent = submission.ticket,
-        .scope_generation = 66,
-        .epoch = submission.epoch,
-        .domain = 99,
-        .team_generation = generation,
-    };
-    const kc_team_quorum_snapshot quorum = {
-        .generation = generation,
-        .expected_mask = expected_mask,
-        .entered_mask = entered_mask,
-        .returned_mask = returned_mask,
-    };
-    const TeamWorkDescriptor work = {
-        .request = REQ_TOKEN_PASS,
-        .stage = ST_NORM,
-        .program_kind = TOKEN_PROGRAM_CONV,
-        .program_phase = CONV_PHASE_NORM,
-        .program_flags = 0x5a,
-        .program_outer = 12,
-        .program_inner = 13,
-        .shape0 = 2048,
-        .shape1 = 8192,
-        .shape2 = 7,
-    };
-    constexpr uint64_t armed_ns = 1000;
-    constexpr uint64_t elapsed_ns = TEAM_PROBE_HARD_DEADLINE_NS + 123;
-    fill_team_fatal_capsule(
-        nullptr, *out, submission, work, event, armed_ns,
-        TEAM_PROBE_HARD_DEADLINE_NS, elapsed_ns, 0, quorum);
-    return 0;
-}
-
-int lfm_internal_engine_grid_snapshot_for_test(
-    void *ep, uint32_t *blocks, uint64_t *completions,
-    uint64_t *generations, uint64_t *lease) {
-    Engine *e = static_cast<Engine *>(ep);
-    if (!e || !blocks || !completions || !generations || !lease) {
-        return -EINVAL;
-    }
-    const kc::TeamExecutorSnapshot executor = e->executor.snapshot();
-    *blocks = e->block_count;
-    *completions =
-        executor.generations_returned * e->block_count;
-    *generations = executor.generations_dispatched;
-    *lease = executor.generation;
-    return 0;
-}
-
-int lfm_internal_engine_audio_route_edge_for_test(uint32_t node,
-                                                  uint32_t outcome,
-                                                  uint32_t *target) {
-    return audio_route_next(node, outcome, target) ? 0 : -EINVAL;
-}
-
-int lfm_internal_engine_audio_token_class_for_test(uint32_t token) {
-    return (int)audio_token_class(token);
-}
-
-uint32_t lfm_internal_engine_audio_route_service_for_test(
-    uint64_t snapshot, uint64_t enqueued, uint32_t service) {
-    if (service < static_cast<uint32_t>(kc::ServiceClass::Deadline) ||
-        service > static_cast<uint32_t>(kc::ServiceClass::Background)) {
-        return 0;
-    }
-    return static_cast<uint32_t>(AudioRouteBroker::classify(
-        snapshot, enqueued, static_cast<kc::ServiceClass>(service),
-        ROUTE_AGE_PROMOTION));
-}
-
-int lfm_internal_engine_fail_audio_route_depth_for_test(void *ep, int status) {
-    Engine *e = static_cast<Engine *>(ep);
-    if (!e || status >= 0) return -EINVAL;
-    int idle = 0;
-    return e->test_audio_route_depth_status.compare_exchange_strong(
-               idle, status, std::memory_order_acq_rel,
-               std::memory_order_acquire)
-        ? 0
-        : -EBUSY;
-}
-
-int lfm_internal_engine_fail_audio_route_detokenizer_for_test(void *ep,
-                                                              int status) {
-    Engine *e = static_cast<Engine *>(ep);
-    if (!e || status >= 0) return -EINVAL;
-    int idle = 0;
-    return e->test_audio_route_detokenizer_status.compare_exchange_strong(
-               idle, status, std::memory_order_acq_rel,
-               std::memory_order_acquire)
-        ? 0
-        : -EBUSY;
-}
-
-void *lfm_internal_audio_route_epoch_new_for_test(uint64_t value) {
-    if (value == 0) return nullptr;
-    LfmRouteEpoch *epoch = new (std::nothrow) LfmRouteEpoch();
-    if (!epoch) return nullptr;
-    epoch->store(value, std::memory_order_release);
-    return epoch;
-}
-
-void lfm_internal_audio_route_epoch_free_for_test(void *opaque) {
-    delete static_cast<LfmRouteEpoch *>(opaque);
-}
-
 uint32_t lfm_engine_lanes(void *ep) {
     Engine *e = (Engine *)ep;
     return e ? e->lanes_total : 0;
 }
 
-uint64_t lfm_engine_audio_encode_passes(const void *ep) {
-    const Engine *e = static_cast<const Engine *>(ep);
-    return e ? e->audio_encode_passes.load(std::memory_order_relaxed) : 0;
-}
-
 int lfm_engine_audio_encode_submit(
-    void *ep, uint64_t model_id, const LfmAudioEncodePassV2 *pass,
+    void *ep, uint64_t model_id, const LfmAudioEncodePass *pass,
     uint64_t *out_adapted_values, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle) {
     Engine *e = static_cast<Engine *>(ep);
-    if (!e || !pass || pass->size < sizeof(*pass) ||
-        pass->abi_version != LFM_AUDIO_PASS_ABI || !pass->resampler ||
+    if (!e || !pass || !pass->resampler ||
         !pass->resampler_workspace || !pass->frontend ||
         !pass->frontend_workspace || !pass->conformer ||
         !pass->conformer_workspace || pass->pcm.count == 0 ||
@@ -5237,120 +4731,6 @@ int lfm_engine_audio_encode_submit(
     return 0;
 }
 
-int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
-    Engine *e = (Engine *)ep;
-    if (!e || !out || out->size < sizeof(*out) || out->abi_version != 1) return -EINVAL;
-    const kc::TeamExecutorSnapshot executor = e->executor.snapshot();
-    const kc::MailboxSnapshot mailbox = executor.mailbox;
-    const kc::PermitBrokerSnapshot routes = e->routes.snapshot();
-    *out = {
-        .size = sizeof(*out),
-        .abi_version = 1,
-        .pass_submissions = e->pass_submissions.load(std::memory_order_relaxed),
-        .pass_completions = e->pass_completions.load(std::memory_order_relaxed),
-        .bridge_dispatches = executor.requests_started,
-        .dispatch_wakes = executor.generations_dispatched,
-        .attention_qkv_capacity =
-            e->attention_qkv_capacity.load(std::memory_order_relaxed),
-        .attention_y_capacity =
-            e->attention_y_capacity.load(std::memory_order_relaxed),
-        .attention_score_capacity =
-            e->attention_score_capacity.load(std::memory_order_relaxed),
-        .pass_claimed = e->pass_claimed.load(std::memory_order_acquire) ? 1u : 0u,
-        .bridge_capacity = mailbox.capacity,
-        .pass_slot_capacity = (uint32_t)e->slots.size(),
-        .pass_slots_live = e->pass_slots_live.load(std::memory_order_acquire),
-        .max_pass_slots_live =
-            e->max_pass_slots_live.load(std::memory_order_acquire),
-        .continuation_submissions =
-            e->continuation_submissions.load(std::memory_order_relaxed),
-        .route_capacity = (uint32_t)ROUTE_CAPACITY,
-        .routes_live = routes.live,
-        .routes_ready = routes.ready,
-        .reserved0 = 0,
-        .route_dispatches =
-            e->route_dispatches.load(std::memory_order_relaxed),
-        .route_admission_deferrals = routes.deferrals,
-    };
-    return 0;
-}
-
-extern "C++" int lfm_internal_engine_diagnostic_view(
-    void *ep, LfmEngineDiagnosticView *out) {
-    Engine *engine = static_cast<Engine *>(ep);
-    if (!engine || !out || !engine->control_runtime ||
-        !engine->executor.continuation() || !engine->routes.service() ||
-        !engine->supervisor.service() || !engine->executor.team()) {
-        return -EINVAL;
-    }
-    *out = {
-        .state = &engine->diagnostics,
-        .runtime = engine->control_runtime,
-        .bridge_continuation = engine->executor.continuation(),
-        .route_service = engine->routes.service(),
-        .supervisor_service = engine->supervisor.service(),
-        .team = engine->executor.team(),
-        .owner = engine,
-    };
-    return 0;
-}
-
-extern "C++" int lfm_internal_engine_diagnostic_counts(
-    const LfmEngineDiagnosticView *view, LfmEngineDiagnosticCounts *out) {
-    if (!view || !view->owner || !view->state || !out) return -EINVAL;
-    Engine *engine = static_cast<Engine *>(view->owner);
-    const kc::TeamExecutorSnapshot executor =
-        engine->executor.snapshot();
-    const kc::MailboxSnapshot mailbox = executor.mailbox;
-    const kc::PermitBrokerSnapshot routes =
-        engine->routes.snapshot();
-    LfmEngineDiagnosticCounts counts = {
-        .pass_submissions =
-            engine->pass_submissions.load(std::memory_order_acquire),
-        .pass_completions =
-            engine->pass_completions.load(std::memory_order_acquire),
-        .bridge_dispatches = executor.requests_started,
-        .dispatch_wakes = executor.generations_dispatched,
-        .route_dispatches =
-            engine->route_dispatches.load(std::memory_order_acquire),
-        .route_admission_deferrals = routes.deferrals,
-        .bridge_team_generation = executor.generation,
-        .bridge_team_completion = executor.returned_generation,
-        .bridge_retired_generation = executor.retired_generation,
-        .mailbox_requests_published = mailbox.requests_published,
-        .mailbox_requests_consumed = mailbox.requests_consumed,
-        .mailbox_completions_published = mailbox.completions_published,
-        .mailbox_completions_consumed = mailbox.completions_consumed,
-        .gang_lease = executor.generation,
-        .team_terminal = engine->supervisor.snapshot().terminal,
-        .pass_slots_live =
-            engine->pass_slots_live.load(std::memory_order_acquire),
-    };
-    counts.routes_free = routes.free;
-    counts.routes_claimed = routes.claimed;
-    counts.routes_ready = routes.ready;
-    counts.routes_dispatching = 0;
-    counts.routes_running = routes.running;
-    counts.routes_done = routes.done;
-    *out = counts;
-    return 0;
-}
-
-int lfm_internal_engine_stackless_runtime_for_test(
-    void *ep, kc_runtime_snapshot *out_runtime, kc_ticket_id *out_bridge) {
-    Engine *engine = static_cast<Engine *>(ep);
-    if (!engine || !engine->control_runtime ||
-        !engine->executor.continuation() ||
-        !out_runtime || !out_bridge) {
-        return -EINVAL;
-    }
-    const int status = kc_runtime_snapshot_get(engine->control_runtime,
-                                               out_runtime);
-    if (status != 0) return status;
-    *out_bridge = engine->executor.identity();
-    return 0;
-}
-
 void lfm_engine_free(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
@@ -5385,17 +4765,16 @@ static bool depth_mul(size_t a, size_t b, size_t *out) {
     return true;
 }
 
-static bool depth_view(const LfmDepthBufferV1 &view, size_t count) {
+static bool depth_view(const LfmDepthBuffer &view, size_t count) {
     return view.address != 0 && view.count >= count;
 }
 
 // Install one resident Depthformer plan. Descriptor tables are copied; weights
 // remain zero-copy views into the model image. All scratch is reserved before
 // the plan identity becomes live, so frame passes cannot allocate.
-int lfm_engine_depth_build(void *ep, const LfmDepthPlanV1 *plan, uint64_t *out_id) {
+int lfm_engine_depth_build(void *ep, const LfmDepthPlan *plan, uint64_t *out_id) {
     Engine *e = (Engine *)ep;
-    if (!e || !plan || !out_id || plan->size < sizeof(*plan) ||
-        plan->abi_version != LFM_DEPTH_ABI_VERSION || !plan->layers ||
+    if (!e || !plan || !out_id || !plan->layers ||
         !plan->codebook_heads || plan->layer_count == 0 || plan->dim == 0 ||
         plan->heads == 0 || plan->kv_heads == 0 || plan->head_dim == 0 ||
         plan->ffn_dim == 0 || plan->codebooks == 0 || plan->backbone_dim == 0 ||
@@ -5438,7 +4817,7 @@ int lfm_engine_depth_build(void *ep, const LfmDepthPlanV1 *plan, uint64_t *out_i
         !depth_mul(ffn, dim, &ffn_weight_count))
         return -EOVERFLOW;
     for (size_t i = 0; i < plan->layer_count; ++i) {
-        const LfmDepthLayerV1 &layer = plan->layers[i];
+        const LfmDepthLayer &layer = plan->layers[i];
         if (!depth_view(layer.qkv_w, qkv_weight_count) ||
             !depth_view(layer.out_w, square) || !depth_view(layer.q_ln, hd) ||
             !depth_view(layer.k_ln, hd) || !depth_view(layer.op_norm, dim) ||
@@ -5451,7 +4830,7 @@ int lfm_engine_depth_build(void *ep, const LfmDepthPlanV1 *plan, uint64_t *out_i
 
     size_t vocab_max = 0;
     for (size_t i = 0; i < codebooks; ++i) {
-        const LfmDepthHeadV1 &head = plan->codebook_heads[i];
+        const LfmDepthHead &head = plan->codebook_heads[i];
         size_t table_count = 0;
         if (head.vocab == 0 || head.vocab > INT_MAX ||
             !depth_mul(head.vocab, dim, &table_count) ||
@@ -5528,7 +4907,7 @@ static int run_audio_route(
     const LfmLayerState *states, size_t state_count, size_t position,
     const uint16_t *rope_cos, const uint16_t *rope_sin,
     size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
-    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    const LfmSamplerConfig *audio_sampler, LfmPrngState *prng,
     uint32_t *out_codes, size_t code_count, size_t lanes,
     const LfmTokenCommitRecord *commit, uint32_t *out_token_completed,
     LfmAudioDetokenizerState *detokenizer,
@@ -5707,9 +5086,7 @@ static int run_audio_route(
             .sampler = *audio_sampler,
             .sample_state = prng,
             .out_tokens = out_codes,
-            .completion_status =
-                e->test_audio_route_depth_status.exchange(
-                    0, std::memory_order_acq_rel),
+            .completion_status = 0,
         };
     route->detokenizer_req = {
             .state = detokenizer,
@@ -5726,10 +5103,7 @@ static int run_audio_route(
                 resample_detokenizer ? target->resampler_stream : nullptr,
             .out_samples = result ? &result->pcm_samples : nullptr,
             .flush = false,
-            .completion_status = decode_detokenizer
-                ? e->test_audio_route_detokenizer_status.exchange(
-                      0, std::memory_order_acq_rel)
-                : 0,
+            .completion_status = 0,
         };
     route->epoch = decode_detokenizer ? target->epoch : nullptr;
     route->expected_epoch = decode_detokenizer ? target->expected_epoch : 0;
@@ -5758,7 +5132,7 @@ int lfm_engine_audio_route_submit(
     const LfmLayerState *states, size_t state_count, size_t position,
     const uint16_t *rope_cos, const uint16_t *rope_sin,
     size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
-    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    const LfmSamplerConfig *audio_sampler, LfmPrngState *prng,
     LfmAudioDetokenizerState *detokenizer,
     const LfmAudioRouteTarget *target,
     LfmAudioRouteResult *result, size_t lanes,
@@ -5779,7 +5153,7 @@ int lfm_engine_token_route_submit(
     uint32_t embedding_kind, const LfmLayerState *states, size_t state_count,
     size_t position, const uint16_t *rope_cos, const uint16_t *rope_sin,
     size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
-    const LfmSamplerConfigV1 *sampler, LfmPrngStateV1 *prng,
+    const LfmSamplerConfig *sampler, LfmPrngState *prng,
     uint32_t *out_token, size_t lanes,
     const LfmTokenCommitRecord *commit, uint32_t *out_token_completed,
     LfmAudioRouteNotify notify, void *notify_context,
@@ -5885,9 +5259,9 @@ int lfm_engine_depth_clear(void *ep, uint64_t id) {
 // Build the resident layer table: one descriptor per backbone block (indexed by
 // block_idx), plus the model dims. Sizes ALL pass scratch here — fixed-arena
 // discipline: after a successful build, conv-layer passes allocate nothing.
-// The Rust rim serializes this against passes (pass_lock); pointers must stay valid
-// until lfm_ctx_clear (the model-side guard guarantees clear-before-drop). Plans
-// coexist by identity; shared executor scratch grows to the largest live geometry.
+// PlanClaim closes native admission and proves no pass is in flight. Weight
+// pointers stay valid until lfm_ctx_clear. Plans coexist by identity; shared
+// executor scratch grows to the largest live geometry.
 int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h,
                   size_t ffn, size_t max_ctx, uint64_t *out_id) {
     Engine *e = (Engine *)ep;
@@ -6038,8 +5412,8 @@ int lfm_ctx_set_heads(void *ep, uint64_t id, const uint8_t *embed_w,
 }
 
 // Clear one retained plan (its weight pointers are about to die with the model).
-// Serialized by the Rust rim's pass lock, so no pass is in flight here. A stale or
-// foreign id is a no-op and cannot disturb any other resident model.
+// PlanClaim proves no pass is in flight. A stale or foreign id is a no-op and
+// cannot disturb any other resident model.
 int lfm_ctx_clear(void *ep, uint64_t id) {
     Engine *e = (Engine *)ep;
     if (!e || id == 0) return -1;
@@ -6117,9 +5491,8 @@ int lfm_engine_prefill_submit(
     const LfmLayerState *states, size_t state_count, size_t pos,
     const uint16_t *cos_base, const uint16_t *sin_base, size_t rope_len,
     uint16_t *out_hidden, size_t out_hidden_len,
-    const LfmSamplerConfigV1 *sampler, LfmPrngStateV1 *sample_state,
-    uint32_t *out_token, size_t lanes,
-    LfmListenReadoutForTest *readout, LfmAudioRouteNotify notify,
+    const LfmSamplerConfig *sampler, LfmPrngState *sample_state,
+    uint32_t *out_token, size_t lanes, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle) {
     Engine *e = (Engine *)ep;
     PrefillWorkspace *workspace =
@@ -6172,24 +5545,6 @@ int lfm_engine_prefill_submit(
     } else if (sampler || sample_state) {
         return -EINVAL;
     }
-    DepthPlan *readout_depth = nullptr;
-    if (readout) {
-        /* Test-only readout: it rides a sampled pass and evaluates the named
-         * Depthformer's codebook-0 head on the pass's published hidden. */
-        if (!out_token || readout->depth_id == 0) return -EINVAL;
-        for (const std::unique_ptr<DepthPlan> &candidate : e->depth_plans) {
-            if (candidate->id == readout->depth_id) {
-                readout_depth = candidate.get();
-                break;
-            }
-        }
-        if (!readout_depth) return -ESTALE;
-        if (readout_depth->backbone_dim != model->h ||
-            readout_depth->heads.empty()) {
-            return -EINVAL;
-        }
-    }
-
     const size_t end_pos = pos + row_count;
     for (size_t layer = 0; layer < model->layers.size(); ++layer) {
         const LfmLayerDesc *desc = &model->layers[layer];
@@ -6251,14 +5606,7 @@ int lfm_engine_prefill_submit(
     route->prefill_req.sample = out_token != nullptr;
     route->prefill_req.sample_state = sample_state;
     route->prefill_req.out_token = out_token;
-    route->prefill_req.readout = readout;
     route->prefill_req.lanes = lanes;
-    if (readout) {
-        route->depth = readout_depth;
-        route->depth_id = readout->depth_id;
-        route->depth_req = {};
-        route->depth_req.hidden = out_hidden;
-    }
     route->adapted_values = nullptr;
     route->result = nullptr;
     route->notify = notify;

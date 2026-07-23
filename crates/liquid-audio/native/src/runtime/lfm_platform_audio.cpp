@@ -40,7 +40,7 @@ struct alignas(HOT_ATOMIC_BYTES) AudioCursor {
 };
 
 struct alignas(HOT_ATOMIC_BYTES) ReadyCell {
-    LfmPcmLeaseV1 lease{};
+    LfmPcmLease lease{};
 };
 
 struct ReadyRing {
@@ -52,7 +52,7 @@ struct ReadyRing {
 static_assert(sizeof(AudioCursor<uint64_t>) == HOT_ATOMIC_BYTES);
 static_assert(alignof(ReadyCell) == HOT_ATOMIC_BYTES);
 
-bool ready_push(ReadyRing *ring, const LfmPcmLeaseV1 &lease) {
+bool ready_push(ReadyRing *ring, const LfmPcmLease &lease) {
     const uint64_t tail = ring->tail.value.load(std::memory_order_relaxed);
     const uint64_t head = ring->head.value.load(std::memory_order_acquire);
     if (tail - head == READY_CAPACITY) return false;
@@ -61,7 +61,7 @@ bool ready_push(ReadyRing *ring, const LfmPcmLeaseV1 &lease) {
     return true;
 }
 
-bool ready_pop(ReadyRing *ring, LfmPcmLeaseV1 *out) {
+bool ready_pop(ReadyRing *ring, LfmPcmLease *out) {
     const uint64_t head = ring->head.value.load(std::memory_order_relaxed);
     const uint64_t tail = ring->tail.value.load(std::memory_order_acquire);
     if (head == tail) return false;
@@ -71,7 +71,7 @@ bool ready_pop(ReadyRing *ring, LfmPcmLeaseV1 *out) {
     return true;
 }
 
-bool ready_peek(const ReadyRing *ring, LfmPcmLeaseV1 *out) {
+bool ready_peek(const ReadyRing *ring, LfmPcmLease *out) {
     const uint64_t head = ring->head.value.load(std::memory_order_relaxed);
     const uint64_t tail = ring->tail.value.load(std::memory_order_acquire);
     if (head == tail) return false;
@@ -85,9 +85,9 @@ struct LfmPlatformAudio {
     LfmSession *session = nullptr;
     LfmCaptureProducer *capture = nullptr;
     LfmPlaybackConsumer *playback = nullptr;
-    LfmPlatformAudioConfigV1 config{};
+    LfmPlatformAudioConfig config{};
     ReadyRing ready;
-    LfmPcmLeaseV1 active{};
+    LfmPcmLease active{};
     uint32_t active_offset = 0;
     std::atomic<bool> started{false};
     std::atomic<bool> capture_enabled{true};
@@ -97,14 +97,6 @@ struct LfmPlatformAudio {
     AudioCursor<uint64_t> callback_gate;
     std::atomic<uint32_t> endpoints_state{ENDPOINTS_LIVE};
     std::atomic<int32_t> terminal_status{0};
-    std::atomic<uint64_t> captured_frames{0};
-    std::atomic<uint64_t> dropped_capture_frames{0};
-    std::atomic<uint64_t> played_frames{0};
-    std::atomic<uint64_t> silent_playback_frames{0};
-    std::atomic<uint64_t> playback_leases{0};
-    std::atomic<uint64_t> playback_releases{0};
-    std::atomic<uint64_t> claimed_playback_frames{0};
-    std::atomic<uint64_t> dropped_playback_frames{0};
     float *capture_discard = nullptr;
 #if defined(__APPLE__)
     struct Listener {
@@ -207,15 +199,13 @@ void platform_fault(LfmPlatformAudio *audio, int32_t status) {
     close_callback_admission(audio);
 }
 
-int accept_playback(void *context, const LfmPcmLeaseV1 *lease) {
+int accept_playback(void *context, const LfmPcmLease *lease) {
     auto *audio = static_cast<LfmPlatformAudio *>(context);
     if (!audio || !lease || !enter_playback_callback(audio)) {
         return LFM_STATUS_CANCELLED;
     }
     const bool published = ready_push(&audio->ready, *lease);
     if (!published) {
-        audio->dropped_playback_frames.fetch_add(
-            lease->frames, std::memory_order_relaxed);
         platform_fault(audio, LFM_STATUS_INTERNAL);
     }
     leave_playback_callback(audio);
@@ -258,32 +248,20 @@ void destroy_context(void *context) {
 }
 
 int claim_next(LfmPlatformAudio *audio) {
-    LfmPcmLeaseV1 ready{};
+    LfmPcmLease ready{};
     if (!ready_pop(&audio->ready, &ready)) return LFM_STATUS_WOULD_BLOCK;
-    LfmPcmLeaseV1 claimed{};
+    LfmPcmLease claimed{};
     const int status = lfm_playback_consumer_claim(
         audio->playback, &ready.ticket, ready.stream_epoch, ready.lease_id,
         ready.buffer_generation, &claimed);
-    if (status != 0) {
-        audio->dropped_playback_frames.fetch_add(
-            ready.frames, std::memory_order_relaxed);
-        return status;
-    }
+    if (status != 0) return status;
     audio->active = claimed;
     audio->active_offset = 0;
-    audio->playback_leases.fetch_add(1, std::memory_order_relaxed);
-    audio->claimed_playback_frames.fetch_add(
-        claimed.frames, std::memory_order_relaxed);
     return 0;
 }
 
-void release_active(LfmPlatformAudio *audio, bool dropped = false) {
+void release_active(LfmPlatformAudio *audio) {
     if (!audio || audio->active.lease_id == 0) return;
-    if (dropped && audio->active_offset < audio->active.frames) {
-        audio->dropped_playback_frames.fetch_add(
-            audio->active.frames - audio->active_offset,
-            std::memory_order_relaxed);
-    }
     const int status = lfm_playback_consumer_release(
         audio->playback, &audio->active);
     if (status != 0 && status != LFM_STATUS_STALE &&
@@ -292,7 +270,6 @@ void release_active(LfmPlatformAudio *audio, bool dropped = false) {
     }
     audio->active = {};
     audio->active_offset = 0;
-    audio->playback_releases.fetch_add(1, std::memory_order_relaxed);
 }
 
 #if defined(__APPLE__)
@@ -495,14 +472,14 @@ void output_fill(LfmPlatformAudio *audio, float *destination,
             lfm_internal_session_epoch(audio->session);
         if (audio->active.lease_id != 0 &&
             audio->active.stream_epoch < flush_epoch) {
-            release_active(audio, true);
+            release_active(audio);
         }
-        LfmPcmLeaseV1 queued{};
+        LfmPcmLease queued{};
         while (ready_peek(&audio->ready, &queued) &&
                queued.stream_epoch < flush_epoch) {
             const int status = claim_next(audio);
             if (status == 0) {
-                release_active(audio, true);
+                release_active(audio);
                 continue;
             }
             if (status == LFM_STATUS_STALE ||
@@ -512,7 +489,7 @@ void output_fill(LfmPlatformAudio *audio, float *destination,
             platform_fault(audio, status);
             break;
         }
-        LfmPlaybackRenderV1 report{};
+        LfmPlaybackRender report{};
         const int published = lfm_internal_playback_consumer_publish_flush(
             audio->playback, flush_epoch, &report);
         /* A newer concurrent interrupt may advance the epoch between the
@@ -543,7 +520,7 @@ void output_fill(LfmPlatformAudio *audio, float *destination,
         const uint32_t remaining =
             audio->active.frames - audio->active_offset;
         const uint32_t count = std::min(frames - written, remaining);
-        LfmPlaybackRenderV1 report{};
+        LfmPlaybackRender report{};
         const int status = lfm_playback_consumer_render_f32(
             audio->playback, &audio->active, audio->active_offset,
             destination + written, count, 1, frames - written, &report);
@@ -557,23 +534,20 @@ void output_fill(LfmPlatformAudio *audio, float *destination,
                 status != LFM_STATUS_CANCELLED) {
                 platform_fault(audio, status);
             }
-            release_active(audio, true);
+            release_active(audio);
             break;
         }
         written += count;
         audio->active_offset += count;
-        audio->played_frames.fetch_add(count, std::memory_order_relaxed);
         if (audio->active_offset == audio->active.frames) {
             release_active(audio);
         }
     }
     if (written < frames) {
-        LfmPlaybackRenderV1 report{};
+        LfmPlaybackRender report{};
         (void)lfm_playback_consumer_observe(
             audio->playback, nullptr, 0, frames - written,
             LFM_PLAYBACK_EVIDENCE_SILENCE, &report);
-        audio->silent_playback_frames.fetch_add(
-            frames - written, std::memory_order_relaxed);
     }
 }
 
@@ -605,7 +579,7 @@ OSStatus input_callback(void *context, AudioUnitRenderActionFlags *flags,
     }
 
     if (!audio->capture_enabled.load(std::memory_order_acquire)) {
-        LfmCaptureChunkV1 gap{};
+        LfmCaptureChunk gap{};
         const OSStatus rendered = render_input(
             audio, flags, timestamp, frames, audio->capture_discard);
         const int status = lfm_capture_producer_publish_gap(
@@ -621,19 +595,17 @@ OSStatus input_callback(void *context, AudioUnitRenderActionFlags *flags,
         return rendered;
     }
 
-    LfmCaptureChunkV1 chunk{};
+    LfmCaptureChunk chunk{};
     int status = lfm_capture_producer_claim_chunk(
         audio->capture, frames, audio->config.capture_sample_rate, 1, 0,
         &chunk);
     if (status != 0) {
         const OSStatus rendered = render_input(
             audio, flags, timestamp, frames, audio->capture_discard);
-        LfmCaptureChunkV1 gap{};
+        LfmCaptureChunk gap{};
         const int gap_status = lfm_capture_producer_publish_gap(
             audio->capture, frames, 1,
             LFM_CAPTURE_CHUNK_GAP | LFM_CAPTURE_CHUNK_XRUN, &gap);
-        audio->dropped_capture_frames.fetch_add(
-            frames, std::memory_order_relaxed);
         if (rendered != noErr ||
             (gap_status != 0 && gap_status != LFM_STATUS_WOULD_BLOCK &&
              gap_status != LFM_STATUS_CANCELLED)) {
@@ -644,7 +616,7 @@ OSStatus input_callback(void *context, AudioUnitRenderActionFlags *flags,
         return rendered;
     }
 
-    LfmMutableF32SpanV1 spans[2]{};
+    LfmMutableF32Span spans[2]{};
     uint32_t span_count = 0;
     status = lfm_capture_producer_resolve_chunk(
         audio->capture, &chunk, spans, &span_count);
@@ -658,12 +630,10 @@ OSStatus input_callback(void *context, AudioUnitRenderActionFlags *flags,
         audio, flags, timestamp, frames, spans[0].data);
     if (rendered != noErr) {
         (void)lfm_capture_producer_abort_chunk(audio->capture, &chunk);
-        LfmCaptureChunkV1 gap{};
+        LfmCaptureChunk gap{};
         (void)lfm_capture_producer_publish_gap(
             audio->capture, frames, 1,
             LFM_CAPTURE_CHUNK_GAP | LFM_CAPTURE_CHUNK_XRUN, &gap);
-        audio->dropped_capture_frames.fetch_add(
-            frames, std::memory_order_relaxed);
         platform_fault(audio, os_status(rendered));
         return rendered;
     }
@@ -678,7 +648,6 @@ OSStatus input_callback(void *context, AudioUnitRenderActionFlags *flags,
         platform_fault(audio, status);
         return kAudio_ParamError;
     }
-    audio->captured_frames.fetch_add(frames, std::memory_order_relaxed);
     return noErr;
 }
 
@@ -835,8 +804,8 @@ int create_units(LfmPlatformAudio *audio) {
 
 int retire_endpoints(LfmPlatformAudio *audio) {
     if (!audio) return LFM_STATUS_INVALID_ARGUMENT;
-    release_active(audio, true);
-    LfmPcmLeaseV1 ready{};
+    release_active(audio);
+    LfmPcmLease ready{};
     while (ready_pop(&audio->ready, &ready)) {
         /* Callback admission is closed and no hardware consumer can observe
          * these records now. The authoritative FIFO is drained below so both
@@ -847,8 +816,6 @@ int retire_endpoints(LfmPlatformAudio *audio) {
         const int status = lfm_internal_playback_consumer_discard_all(
             audio->playback, &dropped);
         if (status != 0) return status;
-        audio->dropped_playback_frames.fetch_add(
-            dropped, std::memory_order_relaxed);
     }
     if (audio->capture) {
         const int status = lfm_capture_producer_destroy(audio->capture);
@@ -882,12 +849,9 @@ int retire_endpoints_once(LfmPlatformAudio *audio) {
 
 extern "C" {
 
-int lfm_platform_audio_default_config(LfmPlatformAudioConfigV1 *out) {
+int lfm_platform_audio_default_config(LfmPlatformAudioConfig *out) {
     if (!out) return LFM_STATUS_INVALID_ARGUMENT;
-    *out = {
-        .size = sizeof(LfmPlatformAudioConfigV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
-    };
+    *out = {};
 #if defined(__APPLE__)
     AudioDeviceID input = kAudioObjectUnknown;
     AudioDeviceID output = kAudioObjectUnknown;
@@ -922,18 +886,14 @@ int lfm_platform_audio_default_config(LfmPlatformAudioConfigV1 *out) {
 }
 
 int lfm_platform_audio_create(
-    LfmSession *session, const LfmPlatformAudioConfigV1 *config,
+    LfmSession *session, const LfmPlatformAudioConfig *config,
     LfmPlatformAudio **out) {
     if (!session || !config || !out) return LFM_STATUS_INVALID_ARGUMENT;
     *out = nullptr;
-    if (config->size != sizeof(*config) ||
-        config->abi_version != LFM_RUNTIME_ABI_VERSION) {
-        return LFM_STATUS_ABI_MISMATCH;
-    }
 #if !defined(__APPLE__)
     return LFM_STATUS_UNSUPPORTED;
 #else
-    LfmPlatformAudioConfigV1 current{};
+    LfmPlatformAudioConfig current{};
     int status = lfm_platform_audio_default_config(&current);
     if (status != 0) return status;
     if (current.capture_device != config->capture_device ||
@@ -962,9 +922,7 @@ int lfm_platform_audio_create(
         status = lfm_playback_consumer_create(session, &audio->playback);
     }
     if (status == 0) status = create_units(audio);
-    const LfmPlatformAudioBindingV1 binding = {
-        .size = sizeof(LfmPlatformAudioBindingV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
+    const LfmPlatformAudioBinding binding = {
         .context = audio,
         .playback_ready = accept_playback,
         .playback_flush = flush_context,
@@ -1002,7 +960,7 @@ int lfm_platform_audio_start(LfmPlatformAudio *audio) {
         return LFM_STATUS_BUSY;
     }
     int setup = install_listeners(audio);
-    LfmPlatformAudioConfigV1 current{};
+    LfmPlatformAudioConfig current{};
     if (setup == 0) setup = lfm_platform_audio_default_config(&current);
     if (setup == 0 &&
         (current.capture_device != audio->config.capture_device ||
@@ -1112,80 +1070,6 @@ int lfm_platform_audio_retire(LfmPlatformAudio *audio) {
 #endif
     audio->physical_state.store(PLATFORM_RETIRED,
                                 std::memory_order_release);
-    return 0;
-}
-
-int lfm_internal_platform_audio_callback_retirement_test(void) {
-    LfmPlatformAudio audio{};
-    if (!enter_playback_callback(&audio)) return LFM_STATUS_INTERNAL;
-    const int status = lfm_platform_audio_retire(&audio);
-    if (status != 0 ||
-        audio.endpoints_state.load(std::memory_order_acquire) !=
-            ENDPOINTS_LIVE) {
-        return LFM_STATUS_INTERNAL;
-    }
-    leave_playback_callback(&audio);
-    if (audio.endpoints_state.load(std::memory_order_acquire) !=
-            ENDPOINTS_LIVE ||
-        audio.callback_gate.value.load(std::memory_order_acquire) !=
-            CALLBACK_CLOSED) {
-        return LFM_STATUS_INTERNAL;
-    }
-    if (finish_retirement_context(&audio) != 0 ||
-        audio.endpoints_state.load(std::memory_order_acquire) !=
-            ENDPOINTS_RETIRED) {
-        return LFM_STATUS_INTERNAL;
-    }
-    LfmPlatformAudio starting{};
-    starting.physical_state.store(PLATFORM_STARTING,
-                                  std::memory_order_release);
-    if (lfm_platform_audio_retire(&starting) != LFM_STATUS_WOULD_BLOCK ||
-        starting.physical_state.load(std::memory_order_acquire) !=
-            PLATFORM_RETIRE_REQUESTED ||
-        publish_physical_started(&starting) != LFM_STATUS_CANCELLED ||
-        starting.physical_state.load(std::memory_order_acquire) !=
-            PLATFORM_RETIRE_REQUESTED) {
-        return LFM_STATUS_INTERNAL;
-    }
-    /* The in-flight start call owns this terminal publication after disposing
-     * its physical units. A later administrative retire observes completion. */
-    starting.physical_state.store(PLATFORM_RETIRED,
-                                  std::memory_order_release);
-    if (lfm_platform_audio_retire(&starting) != 0) {
-        return LFM_STATUS_INTERNAL;
-    }
-    return 0;
-}
-
-int lfm_platform_audio_snapshot(const LfmPlatformAudio *audio,
-                                LfmPlatformAudioSnapshotV1 *out) {
-    if (!audio || !out) return LFM_STATUS_INVALID_ARGUMENT;
-    *out = {
-        .size = sizeof(LfmPlatformAudioSnapshotV1),
-        .abi_version = LFM_RUNTIME_ABI_VERSION,
-        .started = audio->started.load(std::memory_order_acquire) ? 1u : 0u,
-        .capture_enabled =
-            audio->capture_enabled.load(std::memory_order_acquire) ? 1u : 0u,
-        .terminal_status =
-            audio->terminal_status.load(std::memory_order_acquire),
-        .reserved0 = 0,
-        .captured_frames =
-            audio->captured_frames.load(std::memory_order_relaxed),
-        .dropped_capture_frames =
-            audio->dropped_capture_frames.load(std::memory_order_relaxed),
-        .played_frames =
-            audio->played_frames.load(std::memory_order_relaxed),
-        .silent_playback_frames =
-            audio->silent_playback_frames.load(std::memory_order_relaxed),
-        .playback_leases =
-            audio->playback_leases.load(std::memory_order_relaxed),
-        .playback_releases =
-            audio->playback_releases.load(std::memory_order_relaxed),
-        .claimed_playback_frames =
-            audio->claimed_playback_frames.load(std::memory_order_relaxed),
-        .dropped_playback_frames =
-            audio->dropped_playback_frames.load(std::memory_order_relaxed),
-    };
     return 0;
 }
 

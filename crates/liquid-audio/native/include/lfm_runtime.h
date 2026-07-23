@@ -11,11 +11,6 @@
 extern "C" {
 #endif
 
-/* The immutable native model/accounting ABI remains versioned independently
- * from the runtime lifecycle ABI. Numerical model metadata is intentionally not
- * part of this header. */
-#define LFM_MODEL_ABI_VERSION 5u
-
 /* `payload_read_coverage` says which setup-time payload sources contribute to
  * the counters below. `LFM_MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE` is a
  * separate claim: it must remain clear until every possible source is routed
@@ -27,9 +22,7 @@ extern "C" {
 #define LFM_MODEL_PAYLOAD_READ_TOKENIZER (1u << 3)
 #define LFM_MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE (1u << 0)
 
-typedef struct LfmModelMemoryV2 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmModelMemory {
     uint64_t source_bytes;
     uint64_t segment_bytes;
     uint64_t segment_constructed_bytes;
@@ -72,56 +65,40 @@ typedef struct LfmModelMemoryV2 {
     uint64_t post_readiness_allocation_bytes;
     uint8_t weight_identity_digest[32];
     uint8_t weight_content_digest[32];
-    uint64_t reserved[2];
-} LfmModelMemoryV2;
+} LfmModelMemory;
 
-typedef struct LfmRuntimeConfigV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmRuntimeConfig {
     uint32_t coordination_workers;
     uint32_t kernel_lanes;
     uint32_t event_capacity;
     uint32_t session_capacity;
-    uint32_t reserved0;
-    uint32_t reserved1;
     uint64_t flags;
-    uint64_t reserved[4];
-} LfmRuntimeConfigV1;
+} LfmRuntimeConfig;
 
-typedef struct LfmRuntimeSnapshotV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmRuntimeSnapshot {
     uint64_t runtime_epoch;
     uint32_t state;
     uint32_t kernel_lanes;
     uint32_t live_models;
     uint32_t live_sessions;
-    uint64_t reserved[4];
-} LfmRuntimeSnapshotV1;
+} LfmRuntimeSnapshot;
 
 /* Sampling is control policy, not a numerical model surface. Logits, sampler
  * scratch, and PRNG state stay inside the opaque conversation. */
-typedef struct LfmSamplingPolicyV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmSamplingPolicy {
     uint32_t flags;
     uint32_t top_k;
     double temperature;
-    uint64_t reserved;
-} LfmSamplingPolicyV1;
+} LfmSamplingPolicy;
 
 #define LFM_SAMPLING_GREEDY 1u
 
-typedef struct LfmConversationOptionsV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmConversationOptions {
     uint32_t flags;
-    uint32_t reserved0;
     uint64_t seed;
-    LfmSamplingPolicyV1 text;
-    LfmSamplingPolicyV1 audio;
-    uint64_t reserved[4];
-} LfmConversationOptionsV1;
+    LfmSamplingPolicy text;
+    LfmSamplingPolicy audio;
+} LfmConversationOptions;
 
 #define LFM_CONVERSATION_SEED_SYSTEM 1u
 
@@ -130,13 +107,13 @@ typedef struct LfmConversationOptionsV1 {
 #define LFM_RUNTIME_STOPPING 2u
 #define LFM_RUNTIME_JOINED 3u
 
-LFM_PUBLIC_API int lfm_runtime_create(const LfmRuntimeConfigV1 *config,
+LFM_PUBLIC_API int lfm_runtime_create(const LfmRuntimeConfig *config,
                                       LfmRuntime **out);
 LFM_PUBLIC_API int lfm_runtime_start(LfmRuntime *runtime);
 LFM_PUBLIC_API void lfm_runtime_request_stop(LfmRuntime *runtime);
 LFM_PUBLIC_API int lfm_runtime_join(LfmRuntime *runtime);
 LFM_PUBLIC_API int lfm_runtime_snapshot(const LfmRuntime *runtime,
-                                        LfmRuntimeSnapshotV1 *out);
+                                        LfmRuntimeSnapshot *out);
 LFM_PUBLIC_API int lfm_runtime_destroy(LfmRuntime *runtime);
 
 /* Product lifecycle open. It publishes a model child only after validating
@@ -149,7 +126,7 @@ LFM_PUBLIC_API int lfm_runtime_model_open(
  * shape, vocabulary, or numerical-plan metadata crosses this boundary. */
 LFM_PUBLIC_API int lfm_runtime_model_memory(const LfmRuntime *runtime,
                                             const LfmModel *model,
-                                            LfmModelMemoryV2 *out);
+                                            LfmModelMemory *out);
 LFM_PUBLIC_API int lfm_runtime_model_close(LfmRuntime *runtime,
                                            LfmModel *model);
 
@@ -159,7 +136,7 @@ LFM_PUBLIC_API int lfm_runtime_model_close(LfmRuntime *runtime,
  * exposed through this boundary. */
 LFM_PUBLIC_API int lfm_runtime_conversation_create(
     LfmRuntime *runtime, LfmModel *model,
-    const LfmConversationOptionsV1 *options, LfmConversation **out,
+    const LfmConversationOptions *options, LfmConversation **out,
     char *error, size_t error_length);
 LFM_PUBLIC_API int
 lfm_runtime_conversation_close(LfmRuntime *runtime,

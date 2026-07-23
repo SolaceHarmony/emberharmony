@@ -13,7 +13,6 @@ extern "C" {
 #define LFM_PRNG_ALIGNOF(type) _Alignof(type)
 #endif
 
-#define LFM_PRNG_ABI_VERSION 1u
 #define LFM_PRNG_BLOCK_BYTES 64u
 #define LFM_PRNG_FLAG_SYSTEM_SEEDED 1u
 #define LFM_PRNG_FLAG_EXHAUSTED 2u
@@ -30,41 +29,38 @@ extern "C" {
  * `block` and `cursor` preserve partially consumed output. The complete object
  * is pointer-free and may be copied into a quiescent conversation snapshot.
  */
-typedef struct __attribute__((aligned(64))) LfmPrngStateV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct __attribute__((aligned(64))) LfmPrngState {
     uint32_t cursor;
     uint32_t flags;
     uint32_t core[16];
     uint32_t block[16];
-    uint8_t reserved[48];
-} LfmPrngStateV1;
+} LfmPrngState;
 
 /* Seed from the platform CSPRNG. Apple uses SecRandomCopyBytes through the
  * architecture assembly thunk; supported non-Apple hosts use their kernel RNG. */
-int lfm_prng_seed_system(LfmPrngStateV1 *state);
+int lfm_prng_seed_system(LfmPrngState *state);
 
 /* Deterministic conformance/replay seed. `key` is 32 bytes and `nonce` is 8
  * bytes. Production entropy should normally use lfm_prng_seed_system. */
-int lfm_prng_seed_material(LfmPrngStateV1 *state, const uint8_t *key,
+int lfm_prng_seed_material(LfmPrngState *state, const uint8_t *key,
                            const uint8_t *nonce);
 
 /* Deterministic conversation seed. SplitMix64 expands the public 64-bit seed
  * into the ChaCha key and nonce; generation then uses the same snapshotable
  * stream as system-seeded conversations. */
-int lfm_prng_seed_u64(LfmPrngStateV1 *state, uint64_t seed);
+int lfm_prng_seed_u64(LfmPrngState *state, uint64_t seed);
 
 /* Fill caller-owned output and advance `state` in place. ChaCha block expansion
  * is implemented by the selected architecture assembly kernel. */
-int lfm_prng_fill_u64(LfmPrngStateV1 *state, uint64_t *out, size_t count);
+int lfm_prng_fill_u64(LfmPrngState *state, uint64_t *out, size_t count);
 
-/* Architecture assembly leaf. Exposed for ABI/link tests, not model policy. */
+/* Architecture assembly leaf used by the sole native PRNG path. */
 void lfm_chacha20_block(const uint32_t input[16], uint32_t output[16]);
 
-LFM_PRNG_STATIC_ASSERT(sizeof(LfmPrngStateV1) == 192,
-                       "LfmPrngStateV1 must remain snapshot-stable");
-LFM_PRNG_STATIC_ASSERT(LFM_PRNG_ALIGNOF(LfmPrngStateV1) == 64,
-                       "LfmPrngStateV1 must remain cache-line aligned");
+LFM_PRNG_STATIC_ASSERT(sizeof(LfmPrngState) == 192,
+                       "LfmPrngState must remain snapshot-stable");
+LFM_PRNG_STATIC_ASSERT(LFM_PRNG_ALIGNOF(LfmPrngState) == 64,
+                       "LfmPrngState must remain cache-line aligned");
 
 #undef LFM_PRNG_STATIC_ASSERT
 #undef LFM_PRNG_ALIGNOF

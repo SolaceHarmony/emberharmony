@@ -91,16 +91,18 @@ bound tensor bytes, formula-derived immutable bytes, compatibility-copy bytes,
 load time, worker count, and task count. Production rejects a model unless
 `compatibility_copied_bytes == 0`.
 
-The standalone C++23 host and its hostile-lifecycle gate are built without a
+The standalone C++23 host and native tests are built without a
 Rust launcher:
 
 ```sh
 make -C crates/liquid-audio/native/tools
 crates/liquid-audio/native/tools/build/lfm-weight-segment \
   serve /absolute/checkpoint com.solaceharmony.lfm.host
-crates/liquid-audio/native/tools/build/lfm-host-mailbox-gate \
+crates/liquid-audio/native/tools/build/lfm-host-mailbox-test \
   /absolute/checkpoint
-crates/liquid-audio/native/tools/build/lfm-native-speech-gate \
+crates/liquid-audio/native/tools/build/lfm-native-weight-test \
+  /absolute/checkpoint
+crates/liquid-audio/native/tools/build/lfm-native-speech-test \
   /absolute/checkpoint 8 silent
 ```
 
@@ -120,14 +122,14 @@ aggregate capacity generation; consuming a cell resumes that exact ticket.
 The host owns client-slot admission and installs the client-death source before
 acknowledging the slot, so there is no orphanable client-side claim window.
 
-`lfm-host-mailbox-gate` proves multi-client attach, live-lease eviction refusal,
+`lfm-host-mailbox-test` proves multi-client attach, live-lease eviction refusal,
 client-death reclamation, capacity dehydration, stale-completion rejection,
 host death/restart generation changes, no numerical replay, and exact saved
 frame resumption. Its pipes report child readiness only; product operations and
 all model storage stay in native shared buffers. Its one-shot watchdog can fail
 the executable but never advances the state machine.
 
-`lfm-native-speech-gate` is the standalone production-path output gate. It is
+`lfm-native-speech-test` is the standalone production-path output test. It is
 linked directly from the C++23 runtime/model, kcoro C runtime, architecture
 `.S` leaves, and Apple frameworks; it has no Rust launcher or Rust runtime. Two
 complete native agents exchange through in-memory audio-token/PCM buffers. The
@@ -135,26 +137,7 @@ gate runs the fixed-seed exchange twice and hashes every terminal PCM sample in
 memory, so build-vs-attach identity is tested without writing or rereading a WAV
 file. `buffered` and `stream` replace `silent` only when a human is listening.
 
-## Load benchmark
-
-The real-checkpoint gate is an opt-in native example and never downloads or
-silently substitutes a fixture:
-
-```sh
-LFM_MODEL_DIR=/absolute/checkpoint \
-  cargo run --release -p liquid-audio --example bench_native_load
-```
-
-It explicitly evicts before every build sample, alternates the exact builder
-with one and four I/O workers, and separately measures persisted attaches. It
-validates that every run publishes the same content-tree digest and emits
-cold/warm-build and attach p50/p95, build GiB/s, RSS, ownership bytes, payload
-reads, worker count, and task count as JSON. Attach samples must report zero
-tensor-payload reads. Cold
-samples use a platform cache-bypass/eviction facility; when none is available,
-the cold report is `null` rather than warm data under a misleading label. The
-process exits unsuccessfully if the four-worker p50 or p95 regresses the serial
-baseline. `LFM_LOAD_BENCH_RUNS` changes the default five samples per mode.
+## Model image ownership
 
 Native LFM2.5 output binds the Detokenizer catalog of the model-owned combined
 image. It does not reopen the submodel and never constructs the legacy Mimi

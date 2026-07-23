@@ -73,7 +73,7 @@ LFM_SYM(lfm_sesame_selected_magnitudes):
     ret
 
 // void lfm_sesame_selected_magnitudes_window(
-//     const LfmSesameWindowV1 *window, const float *real_table,
+//     const LfmSesameWindow *window, const float *real_table,
 //     const float *imag_table, float *smoothed_magnitudes,
 //     size_t selected_bins)
 //
@@ -183,7 +183,7 @@ LFM_SYM(lfm_sesame_selected_magnitudes_window):
 .endm
 
 // void lfm_sesame_selected_magnitudes_scatter(
-//     const LfmSesameScatterWindowV1 *window, const float *real_table,
+//     const LfmSesameScatterWindow *window, const float *real_table,
 //     const float *imag_table, float *smoothed_magnitudes,
 //     size_t selected_bins)
 //

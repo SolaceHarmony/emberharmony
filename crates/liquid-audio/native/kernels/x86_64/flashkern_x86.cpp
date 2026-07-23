@@ -146,7 +146,7 @@ static void gemm_bf16_avx2(const uint16_t *A, const uint16_t *B, float *C,
 }
 } // namespace
 
-extern "C" void lfm_bf16_gemm_f32_v2(const uint16_t *A, const uint16_t *B, float *C,
+extern "C" void lfm_bf16_gemm_f32(const uint16_t *A, const uint16_t *B, float *C,
                                      int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     gemm_bf16_avx2(A, B, C, M, N, K);

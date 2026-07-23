@@ -132,7 +132,7 @@ bool mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
 }
 
 bool span_chain_valid(const LfmF32SpanChain *chain) {
-    if (!chain || chain->reserved0 != 0 || chain->count == 0 ||
+    if (!chain || chain->count == 0 ||
         chain->count > LFM_F32_SPAN_CHAIN_CAPACITY || chain->length == 0) {
         return false;
     }
@@ -505,8 +505,6 @@ bool resampler_stream_length(const LfmResamplerStream &stream,
 extern "C" int lfm_frontend_create(const LfmFrontendConfig *config, LfmFrontend **out) {
     if (!config || !out) return -EINVAL;
     *out = nullptr;
-    if (config->size < sizeof(LfmFrontendConfig) || config->abi_version != LFM_FRONTEND_ABI)
-        return -EINVAL;
     if (config->sample_rate == 0 || config->n_window_size == 0 ||
         config->n_window_stride == 0 || config->n_fft == 0 || config->nfilt == 0 ||
         config->n_window_size > config->n_fft ||

@@ -1,8 +1,4 @@
-//! Shared managed-thread primitive for the native voice layer.
-//!
-//! Provider sessions, LiveKit helper loops, delegated turns, and model downloads
-//! all use this rather than each subsystem carrying its own orphan-prone handle
-//! list.
+//! Managed background thread ownership for desktop model downloads.
 
 use std::{
     sync::{Arc, Mutex},
@@ -15,22 +11,6 @@ pub(crate) struct ThreadManager {
 }
 
 impl ThreadManager {
-    pub(crate) fn spawn(
-        &self,
-        name: &str,
-        f: impl FnOnce() + Send + 'static,
-    ) -> Result<(), String> {
-        let handle = ThreadBuilder::new()
-            .name(name.into())
-            .spawn(f)
-            .map_err(|e| format!("voice thread spawn failed: {e}"))?;
-        self.handles
-            .lock()
-            .map_err(|_| "voice thread manager lock poisoned".to_string())?
-            .push(handle);
-        Ok(())
-    }
-
     pub(crate) fn spawn_if_idle(
         &self,
         name: &str,
@@ -94,11 +74,6 @@ impl ThreadManager {
                 .extend(live);
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tracked_len(&self) -> usize {
-        self.handles.lock().unwrap().len()
     }
 }
 

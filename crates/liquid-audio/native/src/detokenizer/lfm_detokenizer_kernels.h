@@ -63,7 +63,6 @@ typedef struct LfmDetokRmsArgs {
     float *output;
     uint64_t columns;
     float epsilon;
-    uint32_t reserved;
 } LfmDetokRmsArgs;
 
 typedef struct LfmDetokConvArgs {
@@ -106,7 +105,6 @@ typedef struct LfmDetokEmitArgs {
     float *pcm;
     uint64_t count;
     float epsilon;
-    uint32_t reserved;
 } LfmDetokEmitArgs;
 
 #ifdef __cplusplus

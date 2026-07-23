@@ -1,6 +1,4 @@
-// Native production Conformer encoder + audio adapter ABI. The deleted
-// Rust/Candle implementation survives only as an offline oracle, never as a
-// linked fallback.
+// Native production Conformer encoder + audio adapter.
 //
 // Execution: one segment is one retained Flashkern ticket. Every fixed-team
 // final return advances a ticket-owned program cursor and eagerly dispatches
@@ -31,14 +29,11 @@
 extern "C" {
 #endif
 
-#define LFM_CONFORMER_ABI 1u
 
 typedef struct LfmConformer LfmConformer;
 typedef struct LfmConformerWorkspace LfmConformerWorkspace;
 
 typedef struct LfmConformerGeometry {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t feat_in;        // mel bins (128)
     uint32_t d_model;        // 512
     uint32_t n_layers;       // 17
@@ -49,7 +44,6 @@ typedef struct LfmConformerGeometry {
     uint32_t conv_channels;  // 256
     uint32_t adapter_hidden; // 2048
     uint32_t adapter_out;    // 2048 (backbone hidden)
-    uint64_t reserved[4];
 } LfmConformerGeometry;
 
 // Binds every encoder/adapter weight as byte views into the resident
@@ -59,7 +53,7 @@ typedef struct LfmConformerGeometry {
 // `weights` is the native model's private LfmWeightImage handle. `engine` is
 // the runtime-owned Flashkern engine created internally by
 // lfm_engine_new_status through lfm_runtime_create; the engine constructor and
-// weight image are not exposed to product Rust. Returns 0; -EINVAL on nulls/bad
+// weight image are private native owners. Returns 0; -EINVAL on nulls/bad
 // geometry; -ENOENT with `error` filled when a required weight field is
 // missing or mis-shaped.
 LFM_INTERNAL_API int lfm_conformer_create(

@@ -153,7 +153,7 @@ static void gemv_impl(const uint16_t *A, const uint16_t *B, float *C, int N, int
     }
 }
 
-extern "C" void lfm_bf16_gemm_f32_v2(const uint16_t *A, const uint16_t *B,
+extern "C" void lfm_bf16_gemm_f32(const uint16_t *A, const uint16_t *B,
                                       float *C, int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     for (int m = 0; m < M; ++m) {

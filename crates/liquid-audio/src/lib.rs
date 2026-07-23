@@ -1,25 +1,12 @@
-//! Native LFM2-Audio host surface.
+//! Desktop control data and model snapshot download support.
 //!
-//! Model computation and checkpoint interpretation live behind the opaque
-//! C++/kcoro/Flashkern runtime. No Rust framework model or numerical fallback
-//! remains in the workspace.
+//! Inference, scheduling, checkpoint interpretation, PCM, and model/session
+//! lifetime are owned by the standalone C++23 host. This crate has no native
+//! linkage and no in-process inference surface.
 
-mod ffi;
-pub mod native_voice;
+mod control;
 pub mod utils;
-mod voice_api;
-#[path = "runtime/voice_runtime.rs"]
-pub mod voice_runtime;
 
-pub use native_voice::{
-    default_platform_audio_config, NativeConversationVault, NativeLfm2VoiceEngine,
-    NativeVoiceModel, NativeVoiceModelMemory, NativeVoiceRuntimeConfig, NativeVoiceSampling,
-};
+pub use control::AudioStatsSnapshot;
 #[cfg(feature = "download")]
 pub use utils::{snapshot_download_to, snapshot_download_with, DownloadProgress};
-pub use voice_api::{
-    EngineProgress, PlatformAudioConfig, PlatformAudioSnapshot, VoiceEngine, VoiceEvent,
-};
-pub use voice_runtime::{
-    AudioStatsSnapshot, RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime,
-};

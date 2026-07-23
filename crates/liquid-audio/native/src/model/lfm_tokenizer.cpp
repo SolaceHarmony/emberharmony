@@ -275,7 +275,7 @@ struct LfmTokenizer {
     std::vector<std::string> added;
     std::vector<uint8_t> special;
     std::vector<std::pair<std::string, uint32_t>> special_text;
-    LfmTokenizerSpecialV1 control{};
+    LfmTokenizerSpecial control{};
 };
 
 /* One allocation owns this header and both trailing planes. The encode path
@@ -735,13 +735,10 @@ static int tokenizer_open(const char *path,
                       return left.first.size() > right.first.size();
                   });
         tokenizer->control = {
-            .size = sizeof(LfmTokenizerSpecialV1),
-            .abi_version = LFM_TOKENIZER_ABI_VERSION,
             .im_start = required_special(*tokenizer, "<|im_start|>"),
             .im_end = required_special(*tokenizer, "<|im_end|>"),
             .text_end = required_special(*tokenizer, "<|text_end|>"),
             .audio_start = required_special(*tokenizer, "<|audio_start|>"),
-            .reserved = {},
         };
         *out = tokenizer.release();
         return 0;
@@ -773,11 +770,8 @@ int lfm_tokenizer_open_owned(const char *path,
 extern "C" void lfm_tokenizer_close(LfmTokenizer *tokenizer) { delete tokenizer; }
 
 extern "C" int lfm_tokenizer_special(const LfmTokenizer *tokenizer,
-                                      LfmTokenizerSpecialV1 *out) {
-    if (!tokenizer || !out || out->size < sizeof(*out) ||
-        out->abi_version != LFM_TOKENIZER_ABI_VERSION) {
-        return -EINVAL;
-    }
+                                      LfmTokenizerSpecial *out) {
+    if (!tokenizer || !out) return -EINVAL;
     *out = tokenizer->control;
     return 0;
 }
@@ -823,18 +817,12 @@ extern "C" void lfm_tokenizer_workspace_destroy(
 
 extern "C" int lfm_tokenizer_workspace_info(
     const LfmTokenizerWorkspace *workspace,
-    LfmTokenizerWorkspaceInfoV1 *out) {
-    if (!workspace || !out || out->size < sizeof(*out) ||
-        out->abi_version != LFM_TOKENIZER_ABI_VERSION) {
-        return -EINVAL;
-    }
+    LfmTokenizerWorkspaceInfo *out) {
+    if (!workspace || !out) return -EINVAL;
     *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_TOKENIZER_ABI_VERSION,
         .max_input_bytes = workspace->max_input_bytes,
         .storage_bytes = workspace->storage_bytes,
         .encode_calls = workspace->encode_calls,
-        .reserved = {},
     };
     return 0;
 }

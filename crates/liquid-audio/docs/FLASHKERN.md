@@ -81,7 +81,7 @@ The following production families still have numerical bodies in
 
 | Family | Representative symbols | Required assembly shape |
 |---|---|---|
-| BF16 GEMM/GEMV | `lfm_bf16_gemm_f32_v2`, `lfm_bf16_gemv_f32`, `lfm_bf16_gemm_nt_f32` | direct checkpoint-layout row streaming for decode and multi-row prefill; no packed or widened weight image |
+| BF16 GEMM/GEMV | `lfm_bf16_gemm_f32`, `lfm_bf16_gemv_f32`, `lfm_bf16_gemm_nt_f32` | direct checkpoint-layout row streaming for decode and multi-row prefill; no packed or widened weight image |
 | integer GEMM | `lfm_s8_gemm_s32` | I8MM/AVX-512 integer tiles |
 | reductions/permutation | `lfm_reduce_*`, `lfm_permute_u8` | vector lanes with fixed tail order |
 | convolution | `lfm_depthwise_*`, `lfm_conv1d_update_*` | row-owned streaming kernels; destination writes only |

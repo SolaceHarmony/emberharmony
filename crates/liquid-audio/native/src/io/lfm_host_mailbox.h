@@ -1,11 +1,10 @@
 #ifndef LFM_HOST_MAILBOX_H
 #define LFM_HOST_MAILBOX_H
 
-/* Private native host mailbox. This is a C++/kcoro ownership seam, not a
- * product ABI. Only the shared records carry a layout version because they
- * must be rejected safely across process/generation boundaries. Model
- * pointers and payloads never cross it; Mach messages carry wake and port
- * registration edges only. */
+/* Private native host mailbox. This is a C++/kcoro ownership seam. Git carries
+ * its history; the running tree has one shared-memory layout. Model pointers
+ * and payloads never cross it; Mach messages carry wake and port registration
+ * edges only. */
 
 #include "kc_identity.h"
 #include "kc_runtime.h"
@@ -18,7 +17,6 @@
 
 namespace lfm::host {
 
-constexpr uint32_t kLayoutVersion = 1;
 constexpr uint32_t kClientCapacity = 8;
 constexpr uint32_t kRingCapacity = 8;
 constexpr uint32_t kTestService = 1u << 0;
@@ -57,8 +55,6 @@ static_assert(sizeof(CheckpointIdentity) == 32);
 
 /* One sequence word plus one request fills one 128-byte Apple cache line. */
 struct HostRequest {
-    uint32_t size;
-    uint32_t layout_version;
     kc_ticket_id ticket;
     kc_ticket_id parent;
     uint64_t host_generation;
@@ -68,14 +64,12 @@ struct HostRequest {
     uint32_t operation;
     uint32_t flags;
 };
-static_assert(sizeof(HostRequest) == 120);
+static_assert(sizeof(HostRequest) == 112);
 static_assert(std::is_trivially_copyable_v<HostRequest>);
 
 /* QueryStatus packs active clients into result_flags[15:0] and active leases
  * into result_flags[31:16]. Every completion retains request lineage. */
 struct HostCompletion {
-    uint32_t size;
-    uint32_t layout_version;
     kc_ticket_id ticket;
     kc_ticket_id parent;
     uint64_t host_generation;
@@ -85,9 +79,8 @@ struct HostCompletion {
     uint32_t operation;
     int32_t status;
     uint32_t result_flags;
-    uint32_t reserved;
 };
-static_assert(sizeof(HostCompletion) == 128);
+static_assert(sizeof(HostCompletion) == 120);
 static_assert(std::is_trivially_copyable_v<HostCompletion>);
 
 struct HostSnapshot {

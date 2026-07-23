@@ -9,9 +9,9 @@
 extern "C" {
 #endif
 
-/* Native adapters and native-only integration gates mount their retained
- * continuations on the model runtime's bounded worker pool. This is deliberately
- * private: product hosts receive opaque lifecycle handles, never an executor. */
+/* Native host services mount their retained continuations on the model
+ * runtime's bounded worker pool. This is deliberately private: callers receive
+ * opaque lifecycle handles, never an executor. */
 kc_runtime_t *lfm_internal_runtime_coordination(LfmRuntime *runtime);
 
 /* Native model-to-model PCM handoff. This is not a capture-device seam:
@@ -24,8 +24,8 @@ kc_runtime_t *lfm_internal_runtime_coordination(LfmRuntime *runtime);
  * fabricated silence participates in this transition. */
 int lfm_internal_session_submit_pcm_spans(
     LfmSession *session, const LfmF32Span *spans, uint32_t span_count,
-    uint32_t sample_rate, const LfmTicketIdV1 *parent,
-    LfmTicketIdV1 *out_ticket);
+    uint32_t sample_rate, const LfmTicketId *parent,
+    LfmTicketId *out_ticket);
 
 #ifdef __cplusplus
 } /* extern "C" */

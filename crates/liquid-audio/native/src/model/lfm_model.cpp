@@ -1,4 +1,4 @@
-#include "lfm_model.h"
+#include "lfm_runtime.h"
 #include "lfm_model_internal.h"
 
 #include "flashkern_depth.h"
@@ -373,8 +373,6 @@ View bind_tensor(const LfmWeightImage *weights, const std::string &name,
                  std::initializer_list<uint64_t> shape,
                  BindingLedger *bindings) {
     View view;
-    view.value.size = sizeof(view.value);
-    view.value.abi_version = LFM_WEIGHT_ABI_VERSION;
     const int status = lfm_weights_find(weights, name.c_str(), &view.value);
     if (status != LFM_WEIGHT_OK) {
         fail(status, "missing model tensor '" + name + "'");
@@ -396,8 +394,6 @@ View bind_tensor(const LfmWeightImage *weights, const std::string &name,
 bool bind_optional_tensor(const LfmWeightImage *weights,
                           const std::string &name, View *out,
                           BindingLedger *bindings) {
-    out->value.size = sizeof(out->value);
-    out->value.abi_version = LFM_WEIGHT_ABI_VERSION;
     if (lfm_weights_find(weights, name.c_str(), &out->value) != LFM_WEIGHT_OK) {
         return false;
     }
@@ -408,8 +404,6 @@ bool bind_optional_tensor(const LfmWeightImage *weights,
 View bind_matrix(const LfmWeightImage *weights, const std::string &name,
                  uint64_t columns, BindingLedger *bindings) {
     View view;
-    view.value.size = sizeof(view.value);
-    view.value.abi_version = LFM_WEIGHT_ABI_VERSION;
     const int status = lfm_weights_find(weights, name.c_str(), &view.value);
     if (status != LFM_WEIGHT_OK) fail(status, "missing model tensor '" + name + "'");
     if (view.value.dtype != LFM_DTYPE_BF16 || view.value.rank != 2 ||
@@ -420,7 +414,7 @@ View bind_matrix(const LfmWeightImage *weights, const std::string &name,
     return view;
 }
 
-LfmDepthBufferV1 depth_buffer(const View &view) {
+LfmDepthBuffer depth_buffer(const View &view) {
     if (view.value.elements > std::numeric_limits<size_t>::max()) {
         fail(-EOVERFLOW, "depthformer tensor exceeds the native address space");
     }
@@ -430,7 +424,7 @@ LfmDepthBufferV1 depth_buffer(const View &view) {
     };
 }
 
-LfmDepthBufferV1 depth_buffer(const std::vector<float> &values) {
+LfmDepthBuffer depth_buffer(const std::vector<float> &values) {
     return {
         .address = reinterpret_cast<uintptr_t>(values.data()),
         .count = values.size(),
@@ -507,7 +501,7 @@ struct LfmModel {
     LfmAudioDetokenizerPlan *detokenizer = nullptr;
     uint64_t plan_id = 0;
     uint64_t depth_plan_id = 0;
-    LfmWeightLoadStatsV2 weight_stats{};
+    LfmWeightLoadStats weight_stats{};
     uint64_t load_ns = 0;
     uint32_t hidden = 0;
     uint32_t ffn = 0;
@@ -522,7 +516,7 @@ struct LfmModel {
     uint32_t interleaved_text = 0;
     uint32_t interleaved_audio = 0;
     size_t audio_rows = 0;
-    LfmTokenizerSpecialV1 special{};
+    LfmTokenizerSpecial special{};
     std::vector<uint32_t> codebook_offsets;
     std::vector<uint32_t> initial_turn_tokens;
     std::vector<uint32_t> next_turn_tokens;
@@ -603,10 +597,10 @@ struct LfmConversation {
     std::vector<uint16_t> adapted;
     std::array<uint32_t, LFM_TEXT_COMMAND_MAX_BYTES> token_scratch{};
     size_t token_count = 0;
-    LfmSamplerConfigV1 text_sampler{};
-    LfmSamplerConfigV1 audio_sampler{};
-    alignas(64) LfmPrngStateV1 initial_prng{};
-    alignas(64) LfmPrngStateV1 prng{};
+    LfmSamplerConfig text_sampler{};
+    LfmSamplerConfig audio_sampler{};
+    alignas(64) LfmPrngState initial_prng{};
+    alignas(64) LfmPrngState prng{};
     LfmContextWindowState window{};
     size_t rope_half = 0;
     size_t prepared_samples = 0;
@@ -1552,9 +1546,7 @@ int submit_admission_audio(ConversationAdmission &admission) {
         admission.pcm.length > conversation.prepared_samples) {
         return -EINVAL;
     }
-    const LfmAudioEncodePassV2 pass = {
-        .size = sizeof(LfmAudioEncodePassV2),
-        .abi_version = LFM_AUDIO_PASS_ABI,
+    const LfmAudioEncodePass pass = {
         .resampler = conversation.resampler,
         .resampler_workspace = conversation.resampler_workspace,
         .frontend = model->frontend,
@@ -1611,7 +1603,7 @@ int submit_admission_prefill(ConversationAdmission &admission,
         sample && count == remaining ? &conversation.text_sampler : nullptr,
         sample && count == remaining ? &conversation.prng : nullptr,
         sample && count == remaining ? &admission.sampled : nullptr,
-        conversation.model->lanes, nullptr,
+        conversation.model->lanes,
         continue_admission, &admission, &admission.route);
     if (status == 0 && admission.ticket.sequence == 0) {
         admission.ticket = admission.route.ticket;
@@ -2352,11 +2344,11 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             const size_t qkv_rows = depth_dim + depth_kv_width;
             const size_t depth_projection = multiply(codebooks, depth_dim,
                                                      "depthformer projection rows");
-            std::vector<LfmDepthLayerV1> depth_descriptors(depth_layers);
+            std::vector<LfmDepthLayer> depth_descriptors(depth_layers);
             for (size_t layer = 0; layer < depth_layers; ++layer) {
                 const std::string root_name = depth_layer_root(layer);
                 const std::string attention = root_name + "operator.";
-                LfmDepthLayerV1 &desc = depth_descriptors[layer];
+                LfmDepthLayer &desc = depth_descriptors[layer];
                 desc.qkv_w = depth_buffer(tensor(weights, attention + "qkv_proj.weight",
                                                  {qkv_rows, depth_dim}));
                 desc.out_w = depth_buffer(tensor(weights, attention + "out_proj.weight",
@@ -2383,7 +2375,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
                                                 {depth_projection, hidden});
             const View depth_linear_b = tensor(weights, "depth_linear.bias",
                                                 {depth_projection});
-            std::vector<LfmDepthHeadV1> depth_heads_table(codebooks);
+            std::vector<LfmDepthHead> depth_heads_table(codebooks);
             uint64_t depth_vocabulary = 0;
             for (size_t codebook = 0; codebook < codebooks; ++codebook) {
                 const std::string root_name = "depth_embeddings." +
@@ -2415,9 +2407,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
 
             build_rope_f32(codebooks, depth_head_dim, depth_theta,
                            &depth_rope_cos, &depth_rope_sin);
-            const LfmDepthPlanV1 depth_plan = {
-                .size = sizeof(depth_plan),
-                .abi_version = LFM_DEPTH_ABI_VERSION,
+            const LfmDepthPlan depth_plan = {
                 .dim = (uint32_t)depth_dim,
                 .heads = (uint32_t)depth_heads,
                 .kv_heads = (uint32_t)depth_kv_heads,
@@ -2468,8 +2458,6 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
                 fail(-EINVAL, "model preprocessor geometry is invalid");
             }
             const LfmFrontendConfig frontend_config = {
-                .size = sizeof(LfmFrontendConfig),
-                .abi_version = LFM_FRONTEND_ABI,
                 .sample_rate = (uint32_t)rate,
                 .n_window_size = (uint32_t)window_samples,
                 .n_window_stride = (uint32_t)stride_samples,
@@ -2477,11 +2465,9 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
                 .nfilt = (uint32_t)features,
                 .exact_pad = boolean(preprocessor, "exact_pad", false) ? 1u : 0u,
                 .pad_to = (uint32_t)pad_to,
-                .reserved0 = 0,
                 .preemph = 0.97,
                 .log_zero_guard_value = std::ldexp(1.0, -24),
                 .mag_power = 2.0,
-                .reserved = {0, 0, 0, 0},
             };
             status = lfm_frontend_create(&frontend_config, &frontend);
             if (status != 0) fail(status, "native frontend rejected model geometry");
@@ -2530,8 +2516,6 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
                 fail(-EINVAL, "native Conformer geometry is invalid or unsupported");
             }
             const LfmConformerGeometry conformer_geometry = {
-                .size = sizeof(LfmConformerGeometry),
-                .abi_version = LFM_CONFORMER_ABI,
                 .feat_in = (uint32_t)feat_in,
                 .d_model = (uint32_t)d_model,
                 .n_layers = (uint32_t)encoder_layers,
@@ -2542,7 +2526,6 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
                 .conv_channels = (uint32_t)conv_channels,
                 .adapter_hidden = (uint32_t)hidden,
                 .adapter_out = (uint32_t)hidden,
-                .reserved = {0, 0, 0, 0},
             };
             char conformer_error[512] = {};
             status = lfm_conformer_create(engine, weights, &conformer_geometry,
@@ -2588,9 +2571,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->detokenizer = detokenizer;
         model->plan_id = plan_id;
         model->depth_plan_id = depth_plan_id;
-        LfmWeightLoadStatsV2 load_stats = {
-            .size = sizeof(LfmWeightLoadStatsV2),
-            .abi_version = LFM_WEIGHT_ABI_VERSION,
+        LfmWeightLoadStats load_stats = {
         };
         status = lfm_weights_load_stats(weights, &load_stats);
         if (status != LFM_WEIGHT_OK) {
@@ -2649,8 +2630,6 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->audio_rows = audio_rows;
         if (tokenizer) {
             model->special = {
-                .size = sizeof(LfmTokenizerSpecialV1),
-                .abi_version = LFM_TOKENIZER_ABI_VERSION,
             };
             status = lfm_tokenizer_special(tokenizer, &model->special);
             if (status != 0) fail(status, "cannot resolve native tokenizer control IDs");
@@ -2773,15 +2752,10 @@ extern "C" int lfm_model_close(LfmModel *model) {
 }
 
 extern "C" int lfm_conversation_create(LfmModel *model,
-                                        const LfmConversationConfigV1 *config,
+                                        const LfmConversationConfig *config,
                                         LfmConversation **out,
                                         char *error, size_t error_length) {
-    if (!model || !config || !out || config->size < sizeof(*config) ||
-        config->abi_version != LFM_MODEL_ABI_VERSION ||
-        config->text_sampler.size < sizeof(config->text_sampler) ||
-        config->text_sampler.abi_version != LFM_SAMPLE_ABI_VERSION ||
-        config->audio_sampler.size < sizeof(config->audio_sampler) ||
-        config->audio_sampler.abi_version != LFM_SAMPLE_ABI_VERSION) {
+    if (!model || !config || !out) {
         return -EINVAL;
     }
     *out = nullptr;
@@ -2905,14 +2879,9 @@ extern "C" int lfm_conversation_close(LfmConversation *conversation) {
     return 0;
 }
 
-extern "C" int lfm_model_info(const LfmModel *model, LfmModelInfoV1 *out) {
-    if (!model || !out || out->size < sizeof(*out) ||
-        out->abi_version != LFM_MODEL_ABI_VERSION) {
-        return -EINVAL;
-    }
+extern "C" int lfm_model_info(const LfmModel *model, LfmModelInfo *out) {
+    if (!model || !out) return -EINVAL;
     *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_MODEL_ABI_VERSION,
         .resident_bytes = model->weight_stats.segment_bytes,
         .plan_id = model->plan_id,
         .depth_plan_id = model->depth_plan_id,
@@ -2927,19 +2896,13 @@ extern "C" int lfm_model_info(const LfmModel *model, LfmModelInfoV1 *out) {
             (model->frontend != nullptr ? LFM_MODEL_CAP_FRONTEND : 0u) |
             (model->conformer != nullptr ? LFM_MODEL_CAP_CONFORMER : 0u) |
             (model->detokenizer != nullptr ? LFM_MODEL_CAP_DETOKENIZER : 0u),
-        .reserved = {},
     };
     return 0;
 }
 
-extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV2 *out) {
-    if (!model || !out || out->size < sizeof(*out) ||
-        out->abi_version != LFM_MODEL_ABI_VERSION) {
-        return -EINVAL;
-    }
+extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemory *out) {
+    if (!model || !out) return -EINVAL;
     *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_MODEL_ABI_VERSION,
         .source_bytes = model->weight_stats.source_bytes,
         .segment_bytes = model->weight_stats.segment_bytes,
         .segment_constructed_bytes =
@@ -3000,7 +2963,6 @@ extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV2 *out) {
                 std::memory_order_acquire),
         .weight_identity_digest = {},
         .weight_content_digest = {},
-        .reserved = {},
     };
     std::memcpy(out->weight_identity_digest,
                 model->weight_stats.identity_digest,
@@ -3009,578 +2971,4 @@ extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV2 *out) {
                 model->weight_stats.content_digest,
                 sizeof(out->weight_content_digest));
     return 0;
-}
-
-/* Focused native contract probe. It drives the real conversation playback
- * preparation with independently sealed preprocessor and detokenizer rates;
- * no inference state, checkpoint view, or PCM plane is created. */
-extern "C" LFM_INTERNAL_API int lfm_internal_playback_rate_contract_test(
-    uint32_t preprocessor_rate, uint32_t playback_rate,
-    uint32_t *out_preprocessor_rate, uint32_t *out_audio_output_rate,
-    uint64_t *out_playback_frames, uint32_t *out_direct) {
-    if (preprocessor_rate == 0 || playback_rate == 0 ||
-        !out_preprocessor_rate || !out_audio_output_rate ||
-        !out_playback_frames ||
-        !out_direct) {
-        return -EINVAL;
-    }
-    *out_preprocessor_rate = 0;
-    *out_audio_output_rate = 0;
-    *out_playback_frames = 0;
-    *out_direct = 0;
-
-    LfmModel model;
-    model.preprocessor_rate = preprocessor_rate;
-    model.audio_output_rate = LFM_DETOKENIZER_SAMPLE_RATE;
-    LfmConversation conversation;
-    conversation.model = &model;
-    size_t frames = 0;
-    const int status = prepare_playback_claimed(
-        conversation, playback_rate, &frames);
-    if (status != 0) return status;
-    *out_preprocessor_rate = model.preprocessor_rate;
-    *out_audio_output_rate = model.audio_output_rate;
-    *out_playback_frames = (uint64_t)frames;
-    *out_direct = conversation.playback_resampler_stream ? 0u : 1u;
-    return 0;
-}
-
-/* Focused preparation-policy gate. The real capture resampler/workspace and
- * playback stream are prepared through the production decision path. Opaque
- * frontend/Conformer handles are never dereferenced because the capture
- * high-water mark is already prepared; they only satisfy the same complete
- * resource predicate a production conversation established immediately
- * before this path. Every post-seal call below reaches prepare_pcm_claimed. */
-extern "C" LFM_INTERNAL_API int
-lfm_internal_conversation_allocation_seal_test(
-    LfmModelMemoryV2 *after_compatible, LfmModelMemoryV2 *after_rejected,
-    int *out_growth_status, int *out_capture_rate_status,
-    int *out_playback_rate_status) {
-    if (!after_compatible || after_compatible->size < sizeof(*after_compatible) ||
-        after_compatible->abi_version != LFM_MODEL_ABI_VERSION ||
-        !after_rejected || after_rejected->size < sizeof(*after_rejected) ||
-        after_rejected->abi_version != LFM_MODEL_ABI_VERSION ||
-        !out_growth_status || !out_capture_rate_status ||
-        !out_playback_rate_status) {
-        return -EINVAL;
-    }
-
-    LfmModel model;
-    model.preprocessor_rate = 16000;
-    model.audio_output_rate = LFM_DETOKENIZER_SAMPLE_RATE;
-    model.mel_features = 128;
-    model.hidden = 512;
-    model.frontend = reinterpret_cast<LfmFrontend *>(uintptr_t{1});
-    model.conformer = reinterpret_cast<LfmConformer *>(uintptr_t{1});
-
-    LfmConversation conversation;
-    conversation.model = &model;
-    int status = lfm_resampler_create(16000, model.preprocessor_rate,
-                                      &conversation.resampler);
-    if (status != 0) return status;
-    status = lfm_resampler_workspace_create(&conversation.resampler_workspace);
-    if (status != 0) return status;
-    status = lfm_resampler_workspace_reserve(
-        conversation.resampler, conversation.resampler_workspace, 3200);
-    if (status != 0) return status;
-    conversation.prepared_samples = 3200;
-    conversation.prepared_rate = 16000;
-    conversation.frontend_workspace =
-        reinterpret_cast<LfmFrontendWorkspace *>(uintptr_t{1});
-    conversation.conformer_workspace =
-        reinterpret_cast<LfmConformerWorkspace *>(uintptr_t{1});
-
-    size_t frames = 0;
-    status = prepare_pcm_claimed(conversation, 3200, 16000, 48000, &frames);
-    if (status == 0 && !conversation.allocation_sealed) status = -EFAULT;
-    if (status == 0) {
-        status = prepare_pcm_claimed(conversation, 3200, 16000, 48000,
-                                     &frames);
-    }
-    if (status == 0) {
-        status = prepare_pcm_claimed(conversation, 1600, 16000, 48000,
-                                     &frames);
-    }
-    if (status == 0) status = lfm_model_memory(&model, after_compatible);
-
-    LfmResampler *const capture_plan = conversation.resampler;
-    LfmResamplerWorkspace *const capture_workspace =
-        conversation.resampler_workspace;
-    LfmResamplerStream *const playback_plan =
-        conversation.playback_resampler_stream;
-    const size_t prepared_samples = conversation.prepared_samples;
-    const uint32_t prepared_rate = conversation.prepared_rate;
-    const size_t playback_frames = conversation.playback_frames;
-    const uint32_t playback_rate = conversation.playback_rate;
-    if (status == 0) {
-        *out_growth_status = prepare_pcm_claimed(
-            conversation, 6400, 16000, 48000, &frames);
-        *out_capture_rate_status = prepare_pcm_claimed(
-            conversation, 3200, 48000, 48000, &frames);
-        *out_playback_rate_status = prepare_pcm_claimed(
-            conversation, 3200, 16000, 24000, &frames);
-        if (conversation.resampler != capture_plan ||
-            conversation.resampler_workspace != capture_workspace ||
-            conversation.playback_resampler_stream != playback_plan ||
-            conversation.prepared_samples != prepared_samples ||
-            conversation.prepared_rate != prepared_rate ||
-            conversation.playback_frames != playback_frames ||
-            conversation.playback_rate != playback_rate) {
-            status = -EFAULT;
-        }
-    }
-    if (status == 0) status = lfm_model_memory(&model, after_rejected);
-
-    conversation.frontend_workspace = nullptr;
-    conversation.conformer_workspace = nullptr;
-    model.frontend = nullptr;
-    model.conformer = nullptr;
-    return status;
-}
-
-/* Focused non-production fault entry. The caller supplies tiny stack buffers;
- * both operations go through the same record-before-operation helpers used by
- * model construction. No numerical backend or checkpoint tensor is involved. */
-extern "C" LFM_INTERNAL_API int lfm_internal_model_accounting_fault_test(
-    const uint8_t *source, uint8_t *loaded, uint8_t *rejected, size_t bytes,
-    LfmModelMemoryV2 *out, int *out_read_status,
-    int *out_weight_status, int *out_policy_status) {
-    if (!source || !loaded || !rejected || bytes == 0 || !out ||
-        out->size < sizeof(*out) ||
-        out->abi_version != LFM_MODEL_ABI_VERSION || !out_read_status ||
-        !out_weight_status || !out_policy_status) {
-        return -EINVAL;
-    }
-
-    ModelAccounting accounting;
-    const LfmPayloadReadOwner owner = accounting.reader();
-    int status = 0;
-    {
-        LfmPayloadReadScope source_scope(
-            &owner, LFM_MODEL_PAYLOAD_READ_CONFIG, (uint64_t)bytes);
-        status = source_scope.status();
-        if (status != 0) return status;
-        std::memcpy(loaded, source, bytes);
-        status = source_scope.record(LFM_MODEL_PAYLOAD_READ_CONFIG,
-                                     (uint64_t)bytes);
-        if (status != 0) return status;
-    }
-    status = accounting.weight(WeightKind::Compatibility, (uint64_t)bytes);
-    if (status != 0) return status;
-    std::memcpy(loaded, source, bytes);
-    status = accounting.publish(LFM_MODEL_PAYLOAD_READ_CONFIG);
-    if (status != 0) return status;
-
-    {
-        LfmPayloadReadScope rejected_scope(
-            &owner, LFM_MODEL_PAYLOAD_READ_CONFIG, (uint64_t)bytes);
-        *out_read_status = rejected_scope.status();
-        if (*out_read_status == 0) {
-            std::memcpy(rejected, source, bytes);
-            *out_read_status = rejected_scope.record(
-                LFM_MODEL_PAYLOAD_READ_CONFIG, (uint64_t)bytes);
-        }
-    }
-    *out_weight_status = accounting.weight(WeightKind::Compatibility,
-                                           (uint64_t)bytes);
-    if (*out_weight_status == 0) std::memcpy(rejected, source, bytes);
-    *out_policy_status = accounting.weight_policy();
-    *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_MODEL_ABI_VERSION,
-        .directly_bound_bytes = accounting.directly_bound_bytes.load(
-            std::memory_order_acquire),
-        .derived_immutable_bytes = accounting.derived_immutable_bytes.load(
-            std::memory_order_acquire),
-        .materialized_weight_bytes =
-            accounting.materialized_weight_bytes.load(
-                std::memory_order_acquire),
-        .compatibility_copied_bytes =
-            accounting.compatibility_copied_bytes.load(
-                std::memory_order_acquire),
-        .payload_read_calls = accounting.payload_read_calls.load(
-            std::memory_order_acquire),
-        .payload_read_bytes = accounting.payload_read_bytes.load(
-            std::memory_order_acquire),
-        .post_publication_read_calls =
-            accounting.post_publication_read_calls.load(
-                std::memory_order_acquire),
-        .post_publication_read_bytes =
-            accounting.post_publication_read_bytes.load(
-                std::memory_order_acquire),
-        .post_publication_materialization_attempts =
-            accounting.post_publication_materialization_attempts.load(
-                std::memory_order_acquire),
-        .post_publication_materialization_bytes =
-            accounting.post_publication_materialization_bytes.load(
-                std::memory_order_acquire),
-        .publication_generation =
-            accounting.publication_generation.load(std::memory_order_acquire),
-        .payload_read_coverage =
-            accounting.payload_read_coverage.load(std::memory_order_acquire),
-        .accounting_flags = accounting.flags.load(std::memory_order_acquire),
-        .post_readiness_allocation_attempts =
-            accounting.post_readiness_allocation_attempts.load(
-                std::memory_order_acquire),
-        .post_readiness_allocation_bytes =
-            accounting.post_readiness_allocation_bytes.load(
-                std::memory_order_acquire),
-        .reserved = {},
-    };
-    return 0;
-}
-
-/* Actual source-entrypoint gate: after publication, each implementation must
- * return before inspecting or opening `path`. A nonexistent sentinel makes a
- * misplaced gate self-identify as an I/O error instead of -EPERM. */
-extern "C" LFM_INTERNAL_API int lfm_internal_model_source_gate_test(
-    const char *path, int *config_status, int *weights_status,
-    int *tokenizer_status) {
-    if (!path || !config_status || !weights_status || !tokenizer_status) {
-        return -EINVAL;
-    }
-    ModelAccounting accounting;
-    const LfmPayloadReadOwner owner = accounting.reader();
-    {
-        LfmPayloadReadScope install(
-            &owner, LFM_MODEL_PAYLOAD_READ_CONFIG |
-                        LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
-                        LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX |
-                        LFM_MODEL_PAYLOAD_READ_TOKENIZER);
-        if (install.status() != 0) return install.status();
-    }
-    int status = accounting.publish(
-        LFM_MODEL_PAYLOAD_READ_CONFIG |
-        LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
-        LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX |
-        LFM_MODEL_PAYLOAD_READ_TOKENIZER);
-    if (status != 0) return status;
-
-    try {
-        (void)read_json(&owner, fs::path(path));
-        *config_status = 0;
-    } catch (const ModelError &error) {
-        *config_status = error.status();
-    }
-
-    LfmWeightImage *weights = nullptr;
-    char weight_error[128] = {};
-    *weights_status = lfm_weights_open_owned(
-        path, &owner, &weights, weight_error, sizeof(weight_error));
-    if (weights) lfm_weights_close(weights);
-
-    LfmTokenizer *tokenizer = nullptr;
-    char tokenizer_error[128] = {};
-    *tokenizer_status = lfm_tokenizer_open_owned(
-        path, &owner, &tokenizer, tokenizer_error,
-        sizeof(tokenizer_error));
-    if (tokenizer) lfm_tokenizer_close(tokenizer);
-    return 0;
-}
-
-namespace {
-
-/* Test-scoped inner-voice listening probe. It replays the production PCM
- * admission shape (audio encode, then turn prefix, then adapted rows through
- * the prefill seam) but feeds exactly ONE adapted row per pass and asks the
- * greedy text head for a sample at every row. When the caller provides a
- * readout array, every row pass additionally reports the top-k/entropy
- * readout of the text head and of the Depthformer codebook-0 head through
- * the engine's test-only sample-seam readout. Sampled ids and readouts are
- * reported into caller arrays only; context commits are byte-identical to a
- * production admission over the same rows. No assistant suffix is fed and no
- * generation begins, so the probed conversation ends holding just the user
- * audio turn. */
-enum : uint32_t {
-    LISTEN_PROBE_ENCODE = 0,
-    LISTEN_PROBE_PREFIX = 1,
-    LISTEN_PROBE_ROWS = 2,
-    LISTEN_PROBE_TERMINAL = 3,
-};
-
-struct ListenProbeForTest {
-    LfmConversation *conversation = nullptr;
-    LfmAudioRouteHandle route{};
-    LfmAudioRouteNotify notify = nullptr;
-    void *notify_context = nullptr;
-    LfmF32SpanChain pcm{};
-    uint64_t adapted_values = 0;
-    uint32_t *tokens = nullptr;
-    uint64_t *row_ns = nullptr;
-    LfmListenReadoutForTest *readouts = nullptr;
-    size_t capacity = 0;
-    size_t rows = 0;
-    size_t offset = 0;
-    size_t chunk = 0;
-    uint32_t phase = LISTEN_PROBE_TERMINAL;
-    int status = -EINPROGRESS;
-    bool complete = false;
-    bool initial_prefix = false;
-    std::chrono::steady_clock::time_point node_started{};
-    uint64_t encode_ns = 0;
-};
-
-int submit_listen_probe_node(ListenProbeForTest &probe);
-void continue_listen_probe(void *context);
-
-void finish_listen_probe(ListenProbeForTest &probe, int status) {
-    if (probe.complete) std::abort();
-    probe.status = status;
-    probe.phase = LISTEN_PROBE_TERMINAL;
-    probe.complete = true;
-    probe.notify(probe.notify_context);
-}
-
-int submit_listen_probe_audio(ListenProbeForTest &probe) {
-    LfmConversation &conversation = *probe.conversation;
-    LfmModel *model = conversation.model;
-    if (!model || probe.pcm.count == 0 || probe.pcm.length == 0 ||
-        !model->frontend || !model->conformer ||
-        !conversation.frontend_workspace ||
-        !conversation.conformer_workspace || !conversation.resampler ||
-        !conversation.resampler_workspace ||
-        probe.pcm.length > conversation.prepared_samples) {
-        return -EINVAL;
-    }
-    const LfmAudioEncodePassV2 pass = {
-        .size = sizeof(LfmAudioEncodePassV2),
-        .abi_version = LFM_AUDIO_PASS_ABI,
-        .resampler = conversation.resampler,
-        .resampler_workspace = conversation.resampler_workspace,
-        .frontend = model->frontend,
-        .frontend_workspace = conversation.frontend_workspace,
-        .conformer = model->conformer,
-        .conformer_workspace = conversation.conformer_workspace,
-        .pcm = probe.pcm,
-        .resampled = conversation.resampled.empty()
-                         ? nullptr
-                         : conversation.resampled.data(),
-        .resampled_capacity = conversation.resampled.size(),
-        .mel = conversation.mel_bf16.data(),
-        .mel_capacity = conversation.mel_bf16.size(),
-        .adapted = conversation.adapted.data(),
-        .adapted_capacity = conversation.adapted.size(),
-    };
-    return lfm_engine_audio_encode_submit(
-        model->engine, model->plan_id, &pass, &probe.adapted_values,
-        continue_listen_probe, &probe, &probe.route);
-}
-
-int submit_listen_probe_prefill(ListenProbeForTest &probe,
-                                const uint32_t *ids,
-                                const uint16_t *provided, size_t remaining,
-                                uint32_t kind, uint32_t *out_token,
-                                LfmListenReadoutForTest *readout) {
-    LfmConversation &conversation = *probe.conversation;
-    size_t count = 0;
-    int status = lfm_context_window_prefill_chunk(
-        &conversation.window, remaining, LFM_PREFILL_MAX_ROWS, &count);
-    if (status != 0) return status;
-    /* A sampled pass must cover exactly the one probed row. */
-    if (out_token && count != 1) return -EPROTO;
-    status = reserve_context(conversation, count);
-    if (status != 0) return status;
-    probe.chunk = count;
-    return lfm_engine_prefill_submit(
-        conversation.model->engine, conversation.model->plan_id,
-        conversation.prefill_workspace, ids, provided, count, kind,
-        conversation.states.data(), conversation.states.size(),
-        (size_t)conversation.window.position,
-        conversation.rope_cos.empty()
-            ? nullptr
-            : conversation.rope_cos.data() +
-                  conversation.window.start * conversation.rope_half,
-        conversation.rope_sin.empty()
-            ? nullptr
-            : conversation.rope_sin.data() +
-                  conversation.window.start * conversation.rope_half,
-        conversation.rope_cos.size() -
-            conversation.window.start * conversation.rope_half,
-        conversation.hidden.data(), conversation.hidden.size(),
-        out_token ? &conversation.text_sampler : nullptr, nullptr,
-        out_token, conversation.model->lanes, readout,
-        continue_listen_probe, &probe, &probe.route);
-}
-
-int collect_listen_probe_node(ListenProbeForTest &probe) {
-    LfmConversation &conversation = *probe.conversation;
-    LfmModel *model = conversation.model;
-    const uint64_t elapsed =
-        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - probe.node_started)
-            .count();
-    if (probe.phase == LISTEN_PROBE_ENCODE) {
-        probe.encode_ns = elapsed;
-        if (!model || model->hidden == 0 || probe.adapted_values == 0 ||
-            probe.adapted_values % model->hidden != 0) {
-            return -EINVAL;
-        }
-        const size_t rows = (size_t)(probe.adapted_values / model->hidden);
-        const std::vector<uint32_t> &prefix = probe.initial_prefix
-            ? model->initial_turn_tokens
-            : model->next_turn_tokens;
-        if (rows > probe.capacity || prefix.size() > model->max_context ||
-            rows > model->max_context - prefix.size()) {
-            return -ENOSPC;
-        }
-        const int status = admit_context(conversation,
-                                         prefix.size() + rows);
-        if (status != 0) return status;
-        probe.rows = rows;
-        probe.phase = LISTEN_PROBE_PREFIX;
-        probe.offset = 0;
-        return 0;
-    }
-    for (size_t row = 0; row < probe.chunk; ++row) {
-        const int status = commit_context(conversation);
-        if (status != 0) return status;
-    }
-    conversation.hidden_ready = true;
-    if (probe.phase == LISTEN_PROBE_ROWS) probe.row_ns[probe.offset] = elapsed;
-    probe.offset += probe.chunk;
-    probe.chunk = 0;
-    return 0;
-}
-
-int submit_listen_probe_node(ListenProbeForTest &probe) {
-    LfmConversation &conversation = *probe.conversation;
-    LfmModel *model = conversation.model;
-    for (;;) {
-        const std::vector<uint32_t> &prefix = probe.initial_prefix
-            ? model->initial_turn_tokens
-            : model->next_turn_tokens;
-        if (probe.phase == LISTEN_PROBE_ENCODE) {
-            probe.node_started = std::chrono::steady_clock::now();
-            return submit_listen_probe_audio(probe);
-        }
-        if (probe.phase == LISTEN_PROBE_PREFIX) {
-            if (probe.offset < prefix.size()) {
-                return submit_listen_probe_prefill(
-                    probe, prefix.data() + probe.offset, nullptr,
-                    prefix.size() - probe.offset, 0, nullptr, nullptr);
-            }
-            probe.phase = LISTEN_PROBE_ROWS;
-            probe.offset = 0;
-            continue;
-        }
-        if (probe.phase == LISTEN_PROBE_ROWS) {
-            if (probe.offset < probe.rows) {
-                probe.node_started = std::chrono::steady_clock::now();
-                LfmListenReadoutForTest *readout = probe.readouts
-                    ? probe.readouts + probe.offset
-                    : nullptr;
-                if (readout) {
-                    *readout = {};
-                    readout->depth_id = model->depth_plan_id;
-                }
-                return submit_listen_probe_prefill(
-                    probe, nullptr,
-                    conversation.adapted.data() +
-                        probe.offset * model->hidden,
-                    1, 2, probe.tokens + probe.offset, readout);
-            }
-            finish_listen_probe(probe, 0);
-            return 0;
-        }
-        return -EPROTO;
-    }
-}
-
-void continue_listen_probe(void *context) {
-    ListenProbeForTest *probe = static_cast<ListenProbeForTest *>(context);
-    if (!probe || !probe->conversation || probe->complete) std::abort();
-    int status = lfm_engine_audio_route_collect(
-        probe->conversation->model->engine, &probe->route);
-    if (status == -EINPROGRESS) status = -EPROTO;
-    if (status == 0) status = collect_listen_probe_node(*probe);
-    if (status == 0) status = submit_listen_probe_node(*probe);
-    if (status != 0) finish_listen_probe(*probe, status);
-}
-
-} // namespace
-
-extern "C" LFM_INTERNAL_API int
-lfm_internal_conversation_listen_probe_submit_for_test(
-    LfmConversation *conversation, const float *pcm, size_t sample_count,
-    uint32_t sample_rate, uint32_t *out_tokens, uint64_t *out_row_ns,
-    LfmListenReadoutForTest *out_readouts, size_t row_capacity,
-    LfmAudioRouteNotify notify, void *notify_context, void **out_probe) {
-    if (!conversation || !pcm || sample_count == 0 || sample_rate == 0 ||
-        !out_tokens || !out_row_ns || row_capacity == 0 || !notify ||
-        !notify_context || !out_probe) {
-        return -EINVAL;
-    }
-    *out_probe = nullptr;
-    const LfmF32Span span = {
-        .data = pcm,
-        .length = sample_count,
-    };
-    LfmF32SpanChain chain{};
-    int status = lfm_f32_span_chain_init(&span, 1, &chain);
-    if (status != 0) return status;
-    ConversationClaim claim(conversation,
-                            LFM_CONVERSATION_OPERATION_LISTEN_PROBE);
-    if (!claim) return -EBUSY;
-    LfmModel *model = conversation->model;
-    if (!model || !model->frontend || !model->conformer ||
-        model->hidden == 0) {
-        return -ENOTSUP;
-    }
-    if (conversation->generation_active && !conversation->generation_ended) {
-        return -EALREADY;
-    }
-    if (sample_rate != conversation->prepared_rate ||
-        sample_count > conversation->prepared_samples) {
-        return -EINVAL;
-    }
-    /* The readout is meaningful only as a deterministic argmax trajectory. */
-    if ((conversation->text_sampler.flags & LFM_SAMPLE_FLAG_GREEDY) == 0) {
-        return -EINVAL;
-    }
-    /* The dual-head readout needs the Depthformer codebook-0 head. */
-    if (out_readouts && model->depth_plan_id == 0) return -ENOTSUP;
-    std::unique_ptr<ListenProbeForTest> probe(
-        new (std::nothrow) ListenProbeForTest());
-    if (!probe) return -ENOMEM;
-    probe->conversation = conversation;
-    probe->notify = notify;
-    probe->notify_context = notify_context;
-    probe->pcm = chain;
-    probe->tokens = out_tokens;
-    probe->row_ns = out_row_ns;
-    probe->readouts = out_readouts;
-    probe->capacity = row_capacity;
-    probe->phase = LISTEN_PROBE_ENCODE;
-    probe->initial_prefix = conversation->window.cursor == 0;
-    status = submit_listen_probe_node(*probe);
-    if (status != 0) return status;
-    *out_probe = probe.release();
-    claim.detach();
-    return 0;
-}
-
-extern "C" LFM_INTERNAL_API int
-lfm_internal_conversation_listen_probe_collect_for_test(
-    LfmConversation *conversation, void *probe_pointer, uint64_t *out_rows,
-    uint64_t *out_encode_ns) {
-    if (!conversation || !probe_pointer || !out_rows || !out_encode_ns) {
-        return -EINVAL;
-    }
-    ListenProbeForTest *probe =
-        static_cast<ListenProbeForTest *>(probe_pointer);
-    if (probe->conversation != conversation) return -ESTALE;
-    if (!probe->complete) return -EINPROGRESS;
-    const int status = probe->status;
-    *out_rows = probe->rows;
-    *out_encode_ns = probe->encode_ns;
-    delete probe;
-    conversation->active_operation.store(LFM_CONVERSATION_OPERATION_NONE,
-                                         std::memory_order_relaxed);
-    conversation->active.clear(std::memory_order_release);
-    return status;
-}
-
-const std::atomic<uint32_t> *lfm_conversation_operation_view_native(
-    const LfmConversation *conversation) {
-    return conversation ? &conversation->active_operation : nullptr;
 }

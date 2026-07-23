@@ -10,36 +10,29 @@
 extern "C" {
 #endif
 
-#define LFM_TOKENIZER_ABI_VERSION 1u
 
 typedef struct LfmTokenizer LfmTokenizer;
 typedef struct LfmTokenizerWorkspace LfmTokenizerWorkspace;
 
-typedef struct LfmTokenizerSpecialV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmTokenizerSpecial {
     uint32_t im_start;
     uint32_t im_end;
     uint32_t text_end;
     uint32_t audio_start;
-    uint32_t reserved[4];
-} LfmTokenizerSpecialV1;
+} LfmTokenizerSpecial;
 
-typedef struct LfmTokenizerWorkspaceInfoV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmTokenizerWorkspaceInfo {
     uint64_t max_input_bytes;
     uint64_t storage_bytes;
     uint64_t encode_calls;
-    uint64_t reserved[4];
-} LfmTokenizerWorkspaceInfoV1;
+} LfmTokenizerWorkspaceInfo;
 
-/* Private model-construction API. It is not part of the Rust/product ABI. */
+/* Private native model-construction interface. */
 int lfm_tokenizer_open(const char *path, LfmTokenizer **out,
                        char *error, size_t error_length);
 void lfm_tokenizer_close(LfmTokenizer *tokenizer);
 int lfm_tokenizer_special(const LfmTokenizer *tokenizer,
-                          LfmTokenizerSpecialV1 *out);
+                          LfmTokenizerSpecial *out);
 
 /* Fixed-capacity hot-path storage. Creation performs exactly one allocation;
  * encode_bounded never grows it or materializes strings/symbol vectors. */
@@ -47,7 +40,7 @@ int lfm_tokenizer_workspace_create(size_t max_input_bytes,
                                    LfmTokenizerWorkspace **out);
 void lfm_tokenizer_workspace_destroy(LfmTokenizerWorkspace *workspace);
 int lfm_tokenizer_workspace_info(const LfmTokenizerWorkspace *workspace,
-                                 LfmTokenizerWorkspaceInfoV1 *out);
+                                 LfmTokenizerWorkspaceInfo *out);
 
 /* Allocation-free ByteLevel+BPE encoding into caller-owned storage. Input or
  * output beyond the readiness bound returns -ENOBUFS; malformed UTF-8 returns

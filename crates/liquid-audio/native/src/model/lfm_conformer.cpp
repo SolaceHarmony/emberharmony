@@ -277,7 +277,6 @@ int workspace_needs(const LfmConformer *c, uint64_t frames,
 int bind(const LfmWeightImage *img, const std::string &name, View &v,
          std::initializer_list<uint64_t> expect, char *err, size_t errlen) {
     LfmTensorView tv{};
-    tv.size = sizeof(tv);
     if (lfm_weights_find(img, name.c_str(), &tv) != 0) {
         std::snprintf(err, errlen, "conformer bind: missing '%s'", name.c_str());
         return -ENOENT;
@@ -351,9 +350,6 @@ extern "C" int lfm_conformer_create(void *engine, const void *weights,
                                      LfmConformer **out, char *error,
                                     size_t error_length) {
     if (!engine || !weights || !geometry || !out) return -EINVAL;
-    if (geometry->size < sizeof(LfmConformerGeometry) ||
-        geometry->abi_version != LFM_CONFORMER_ABI)
-        return -EINVAL;
     const LfmWeightImage *img = (const LfmWeightImage *)weights;
     const LfmConformerGeometry &g = *geometry;
     if (g.d_model == 0 || g.n_layers == 0 || g.n_heads == 0 ||

@@ -41,9 +41,8 @@ static uint64_t splitmix64(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
-static bool state_valid(const LfmPrngStateV1 *state) {
-    if (!state || state->size != sizeof(*state) ||
-        state->abi_version != LFM_PRNG_ABI_VERSION ||
+static bool state_valid(const LfmPrngState *state) {
+    if (!state ||
         state->cursor > LFM_PRNG_BLOCK_BYTES || (state->cursor & 7u) != 0) {
         return false;
     }
@@ -53,11 +52,9 @@ static bool state_valid(const LfmPrngStateV1 *state) {
     return true;
 }
 
-static void seed_material(LfmPrngStateV1 *state, const uint8_t *key,
+static void seed_material(LfmPrngState *state, const uint8_t *key,
                           const uint8_t *nonce, uint32_t flags) {
     std::memset(state, 0, sizeof(*state));
-    state->size = sizeof(*state);
-    state->abi_version = LFM_PRNG_ABI_VERSION;
     state->cursor = LFM_PRNG_BLOCK_BYTES;
     state->flags = flags;
     for (size_t i = 0; i < 4; ++i) state->core[i] = CHACHA_CONSTANTS[i];
@@ -111,7 +108,7 @@ static void erase(void *memory, size_t size) {
 
 } // namespace
 
-extern "C" int lfm_prng_seed_material(LfmPrngStateV1 *state,
+extern "C" int lfm_prng_seed_material(LfmPrngState *state,
                                         const uint8_t *key,
                                         const uint8_t *nonce) {
     if (!state || !key || !nonce) return -EINVAL;
@@ -119,7 +116,7 @@ extern "C" int lfm_prng_seed_material(LfmPrngStateV1 *state,
     return 0;
 }
 
-extern "C" int lfm_prng_seed_u64(LfmPrngStateV1 *state, uint64_t seed) {
+extern "C" int lfm_prng_seed_u64(LfmPrngState *state, uint64_t seed) {
     if (!state) return -EINVAL;
     alignas(8) uint8_t material[40];
     uint64_t stream = seed;
@@ -131,7 +128,7 @@ extern "C" int lfm_prng_seed_u64(LfmPrngStateV1 *state, uint64_t seed) {
     return 0;
 }
 
-extern "C" int lfm_prng_seed_system(LfmPrngStateV1 *state) {
+extern "C" int lfm_prng_seed_system(LfmPrngState *state) {
     if (!state) return -EINVAL;
     alignas(16) uint8_t entropy[40];
     int rc = system_entropy(entropy, sizeof(entropy));
@@ -142,7 +139,7 @@ extern "C" int lfm_prng_seed_system(LfmPrngStateV1 *state) {
     return rc;
 }
 
-extern "C" int lfm_prng_fill_u64(LfmPrngStateV1 *state, uint64_t *out,
+extern "C" int lfm_prng_fill_u64(LfmPrngState *state, uint64_t *out,
                                    size_t count) {
     if (!state_valid(state) || (!out && count != 0)) return -EINVAL;
 

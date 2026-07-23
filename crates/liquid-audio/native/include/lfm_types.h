@@ -9,7 +9,6 @@
 extern "C" {
 #endif
 
-#define LFM_RUNTIME_ABI_VERSION 4u
 #define LFM_TEXT_COMMAND_MAX_BYTES 2048u
 
 typedef struct LfmRuntime LfmRuntime;
@@ -17,7 +16,7 @@ typedef struct LfmModel LfmModel;
 typedef struct LfmConversation LfmConversation;
 typedef struct LfmSession LfmSession;
 
-typedef enum LfmStatusV1 {
+typedef enum LfmStatus {
     LFM_STATUS_OK = 0,
     LFM_STATUS_INVALID_ARGUMENT = -22,
     LFM_STATUS_OUT_OF_MEMORY = -12,
@@ -25,13 +24,12 @@ typedef enum LfmStatusV1 {
     LFM_STATUS_WOULD_BLOCK = -11,
     LFM_STATUS_STALE = -116,
     LFM_STATUS_CANCELLED = -125,
-    LFM_STATUS_ABI_MISMATCH = -1001,
     LFM_STATUS_HOST_SINK = -1002,
     LFM_STATUS_INTERNAL = -1003,
     LFM_STATUS_UNSUPPORTED = -1004,
-} LfmStatusV1;
+} LfmStatus;
 
-typedef kc_ticket_id LfmTicketIdV1;
+typedef kc_ticket_id LfmTicketId;
 
 #define LFM_TICKET_SESSION KC_TICKET_KIND_SESSION
 #define LFM_TICKET_TURN KC_TICKET_KIND_TURN

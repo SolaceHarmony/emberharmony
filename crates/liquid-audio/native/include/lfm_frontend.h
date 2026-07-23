@@ -30,7 +30,6 @@
 extern "C" {
 #endif
 
-#define LFM_FRONTEND_ABI 1u
 
 typedef struct LfmFrontend LfmFrontend;
 typedef struct LfmFrontendWorkspace LfmFrontendWorkspace;
@@ -58,7 +57,6 @@ typedef struct LfmF32Span {
 #define LFM_F32_SPAN_CHAIN_CAPACITY 2u
 typedef struct LfmF32SpanChain {
     uint32_t count;
-    uint32_t reserved0;
     uint64_t length;
     LfmF32Span spans[LFM_F32_SPAN_CHAIN_CAPACITY];
 } LfmF32SpanChain;
@@ -70,8 +68,6 @@ LFM_INTERNAL_API int lfm_f32_span_chain_init(
     const LfmF32Span *spans, uint32_t span_count, LfmF32SpanChain *out);
 
 typedef struct LfmFrontendConfig {
-    uint32_t size;
-    uint32_t abi_version;
     uint32_t sample_rate;     // e.g. 16000
     uint32_t n_window_size;   // win_length in samples (400)
     uint32_t n_window_stride; // hop_length in samples (160)
@@ -79,11 +75,9 @@ typedef struct LfmFrontendConfig {
     uint32_t nfilt;           // mel bins (128)
     uint32_t exact_pad;       // 0: torch.stft center=True; 1: NeMo exact_pad
     uint32_t pad_to;          // pad frame count to a multiple (0 = off)
-    uint32_t reserved0;
     double preemph;              // 0.97 (0.0 disables)
     double log_zero_guard_value; // 2^-24
     double mag_power;            // must be 2.0 (only production regime admitted)
-    uint64_t reserved[4];
 } LfmFrontendConfig;
 
 // 0 on success; -EINVAL on a malformed config; -EOPNOTSUPP when mag_power is

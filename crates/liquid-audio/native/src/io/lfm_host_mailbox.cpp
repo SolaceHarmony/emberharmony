@@ -395,7 +395,7 @@ struct Server {
     int fd{-1};
     Mailbox *mailbox{nullptr};
     LfmWeightImage *image{nullptr};
-    LfmWeightLoadStatsV2 weights{};
+    LfmWeightLoadStats weights{};
     kc_runtime_t *runtime{nullptr};
     koro_cont_t *continuation{nullptr};
     kc_ticket_id identity{};
@@ -522,8 +522,6 @@ int map_mailbox_client(Client *client, char *error,
     client->mailbox = static_cast<Mailbox *>(memory);
     const MailboxHeader &header = client->mailbox->header;
     if (std::memcmp(header.magic, kMailboxMagic, sizeof(kMailboxMagic)) != 0 ||
-        header.size != kMailboxBytes ||
-        header.layout_version != kLayoutVersion ||
         load(&header.state) != kMailboxReady ||
         header.host_generation != client->host_generation ||
         header.host_uid != static_cast<uint64_t>(geteuid()) ||
@@ -661,8 +659,6 @@ void fault_client(Client *client) {
             continue;
         }
         entry.completion = {
-            .size = sizeof(HostCompletion),
-            .layout_version = kLayoutVersion,
             .ticket = entry.request.ticket,
             .parent = entry.request.parent,
             .host_generation = entry.request.host_generation,
@@ -692,8 +688,6 @@ void client_drain(Client *client) {
     HostCompletion completion{};
     while (completion_pop(slot, &completion)) {
         const bool identity_valid =
-            completion.size == sizeof(completion) &&
-            completion.layout_version == kLayoutVersion &&
             completion.host_generation == client->host_generation &&
             completion.client_generation == client->client_generation &&
             identity_equal(completion.checkpoint_identity,
@@ -1007,8 +1001,6 @@ int create_mailbox(Server *server, char *error,
     header.host_uid = static_cast<uint64_t>(geteuid());
     store(&header.state, kMailboxInitializing);
     std::memcpy(header.magic, kMailboxMagic, sizeof(kMailboxMagic));
-    header.size = kMailboxBytes;
-    header.layout_version = kLayoutVersion;
     header.client_capacity = kClientCapacity;
     header.ring_capacity = kRingCapacity;
     header.segment_generation = server->weights.generation;
@@ -1346,9 +1338,7 @@ bool request_valid(const Server *server,
                    uint32_t index, const HostRequest &request) {
     const ClientControl &control =
         server->mailbox->client(index).control();
-    return request.size == sizeof(request) &&
-           request.layout_version == kLayoutVersion &&
-           ticket_valid(request.ticket) && ticket_valid(request.parent) &&
+    return ticket_valid(request.ticket) && ticket_valid(request.parent) &&
            request.host_generation ==
                server->mailbox->header.host_generation &&
            request.client_generation == control.client_generation &&
@@ -1362,8 +1352,6 @@ HostCompletion execute_request(Server *server,
                                     uint32_t index,
                                     const HostRequest &request) {
     HostCompletion completion{
-        .size = sizeof(completion),
-        .layout_version = kLayoutVersion,
         .ticket = request.ticket,
         .parent = request.parent,
         .host_generation = request.host_generation,
@@ -1612,8 +1600,6 @@ Status server_create(const ServerConfig &config, Server **out,
         return IoError;
     }
     server->weights = {
-        .size = sizeof(server->weights),
-        .abi_version = LFM_WEIGHT_ABI_VERSION,
     };
     if (lfm_weights_load_stats(server->image, &server->weights) !=
         LFM_WEIGHT_OK) {
@@ -1876,8 +1862,6 @@ Status client_submit(Client *client, Operation operation,
         return status;
     }
     HostRequest request{
-        .size = sizeof(request),
-        .layout_version = kLayoutVersion,
         .ticket = identity,
         .parent = parent,
         .host_generation = client->host_generation,
@@ -2139,8 +2123,6 @@ Status inject_stale_completion(Client *client,
                                     std::memory_order_release);
     const kc_ticket_id identity = koro_cont_identity(continuation);
     HostCompletion completion{
-        .size = sizeof(completion),
-        .layout_version = kLayoutVersion,
         .ticket = identity,
         .parent = identity,
         .host_generation = client->host_generation + 1,

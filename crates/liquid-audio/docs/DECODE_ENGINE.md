@@ -7,8 +7,8 @@ This document has two registers, kept strictly apart:
 - **As-built** sections describe what is in the working tree *now*, verified against the
   source (`native/src/io/safetensors.cpp`, `native/src/model/lfm_model.cpp`,
   `native/src/runtime/voice_session.cpp`, `native/src/engine/flashkern_engine.cpp`,
-  `src/native_voice.rs`, and `native/kernels/*`). If it says "as-built", the code
-  does it.
+  `native/src/runtime/lfm_platform_audio.cpp`, and `native/kernels/*`). If it
+  says "as-built", the code does it.
 - **The contract** and **Build order → Planned** sections describe *agreed design* that is
   not yet built. Nothing in a "planned" block is running today.
 
@@ -304,14 +304,13 @@ Depthformer programs plus the lower-level kernel inventory.
 | LFM2.5 audio detokenizer | typed retained `REQ_AUDIO_DETOKENIZE` program; required F32 detokenizer views from the same image; paired AArch64/x86_64 assembly owns every non-opaque payload operation; register/cache FIFO materializes only at causal state, quorum, AMX, or vForce seams; PCM writes directly into a playback lease | `native/src/detokenizer/`, `native/kernels/*/flashkern_detokenizer.S`, `native/src/engine/flashkern_engine.cpp`, `native/src/runtime/voice_session.cpp` |
 | Mimi | retained native archive with a distinct `MIMI` image component; no LFM2.5 loader or route edge; reserved for native Moshi | `native/src/mimi/`, `docs/MIMI_PORT.md` |
 | generation/session | native ticketed text/PCM admission and recurrence, reliable events, interruption epochs, stop/join | `native/src/runtime/voice_session.cpp` |
-| desktop production host | opaque native runtime/model/conversation/session; no Rust model construction or Candle fallback | `src/native_voice.rs`, `packages/desktop/src-tauri/src/voice/runtime.rs` |
+| desktop host cutover | the desktop is UI/control only and fails LFM2 startup until the standalone host session mailbox is mounted; no in-process substitute remains | `packages/desktop/src-tauri/src/voice/runtime.rs`, `native/src/io/lfm_host_mailbox.cpp` |
 
 ### Single native graph
 
-- The default `liquid-audio` feature graph contains the opaque native runtime and
-  does not enable Candle or Moshi. Desktop LFM2 construction calls
-  `NativeVoiceModel::open_with_config`; it never constructs `LFM2AudioModel`, a
-  Candle device, or a Rust safetensors builder.
+- The `liquid-audio` Rust crate contains control records and checkpoint download
+  support only. It has no native linkage or in-process inference entry point.
+  Native model construction is compiled directly as C++23.
 - The legacy Rust model, training surface, direct numerical rims, Candle, and
   callable oracle feature were deleted after the native path landed. Captured
   immutable fixtures remain evidence; they are not a second execution graph.
@@ -328,47 +327,15 @@ Depthformer programs plus the lower-level kernel inventory.
 
 ## 5. Verification practices
 
-The production graph is tested independently of the Candle oracle. Oracle parity
-tests remain valuable during kernel development, but passing them cannot make an
-oracle owner reachable from the release graph.
+kcoro coordination is characterized by standalone C++23 tests under
+`crates/kcoro-sys/vendor/kcoro_arena/tests`. Native model code is compiled and
+tested directly from `native/CMakeLists.txt` or `native/tools/Makefile`; Rust
+does not launch, observe, or shadow inference. Routine cleanup runs unit and
+compile tests only. The real-checkpoint speech exchange is a separate release
+acceptance step after the ownership cleanup is complete.
 
-### Current focused production gates
-
-The 2026-07-16 aarch64 run used:
-
-```text
-cargo test -p liquid-audio \
-  --test native_voice_session --test native_mixed_turn \
-  --test native_tokenizer --test native_context_rollover \
-  --test native_safetensors -- --nocapture
-```
-
-It passed **32 tests** with two explicit opt-in gates ignored: 17/18 native image
-and schema tests, 8/9 session/lease tests, 3/3 rollover tests, 2/2 mixed-turn
-admission tests, and 2/2 native tokenizer tests. The session run measured 100,000
-allocation-free ticket/lease cycles in 0.030 s (about 3.38 million cycles/s).
-`engine_idle_zero_spin` separately passed at 0.003% cold-idle and 0.004%
-post-pass process CPU with eight parked lanes. `cargo check -p liquid-audio
---no-default-features` also passed.
-
-The ignored gates are explicit rather than silent: the one-million-cycle soak is
-opt-in, and complete model memory accounting requires `LFM_MODEL_DIR` plus the
-main and released audio-detokenizer checkpoint. The latter asserts one
-lifecycle-owned image and
-`compatibility_copied_bytes == 0` when the real fixture is supplied.
-
-The rollover and model-schema fixtures also pass through the x86_64/Rosetta
-build. They cover absolute RoPE range identity, latest-window retention,
-whole-action admission with causal incremental eviction, shared-model conversation fairness, equal-byte-count
-wrong dtypes/shapes, missing middle layers, and mixed vocabulary/codebook
-rejection. Do not generalize that statement into a full native Moshi gate.
-
-### Historical oracle evidence
-
-Captured immutable fixtures and historical reports preserve the evidence used
-while porting frontend, Conformer, ShortConv, GEMM/GEMV, Depthformer, Mimi,
-grouped GQA, and seeded waveform output. The executable Rust/Candle oracle was
-deleted; current gates exercise the native implementation directly.
+Historical captured evidence may explain a formula, but it is not a callable
+second graph and cannot select production behavior.
 
 ---
 

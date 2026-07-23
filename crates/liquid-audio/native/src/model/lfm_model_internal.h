@@ -22,20 +22,14 @@
 #define LFM_INPUT_MAX_IDS 8u
 #define LFM_AUDIO_TOKEN_CAPACITY 64u
 
-typedef struct LfmConversationConfigV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmConversationConfig {
     uint32_t flags;
-    uint32_t reserved0;
     uint64_t seed;
-    LfmSamplerConfigV1 text_sampler;
-    LfmSamplerConfigV1 audio_sampler;
-    uint64_t reserved[4];
-} LfmConversationConfigV1;
+    LfmSamplerConfig text_sampler;
+    LfmSamplerConfig audio_sampler;
+} LfmConversationConfig;
 
-typedef struct LfmModelInfoV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmModelInfo {
     uint64_t resident_bytes;
     uint64_t plan_id;
     uint64_t depth_plan_id;
@@ -46,8 +40,7 @@ typedef struct LfmModelInfoV1 {
     uint32_t max_context;
     uint32_t codebooks;
     uint32_t capabilities;
-    uint32_t reserved[5];
-} LfmModelInfoV1;
+} LfmModelInfo;
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,11 +51,11 @@ LFM_INTERNAL_API int lfm_model_open(void *engine, const char *path,
                                   size_t error_length);
 LFM_INTERNAL_API int lfm_model_close(LfmModel *model);
 LFM_INTERNAL_API int lfm_model_info(const LfmModel *model,
-                                  LfmModelInfoV1 *out);
+                                  LfmModelInfo *out);
 LFM_INTERNAL_API int lfm_model_memory(const LfmModel *model,
-                                    LfmModelMemoryV2 *out);
+                                    LfmModelMemory *out);
 LFM_INTERNAL_API int lfm_conversation_create(
-    LfmModel *model, const LfmConversationConfigV1 *config,
+    LfmModel *model, const LfmConversationConfig *config,
     LfmConversation **out, char *error, size_t error_length);
 LFM_INTERNAL_API int lfm_conversation_reset(LfmConversation *conversation);
 LFM_INTERNAL_API int lfm_conversation_close(LfmConversation *conversation);
@@ -106,7 +99,6 @@ struct LfmContextWindowMove {
     uint64_t source;
     uint64_t retained;
     uint32_t compact;
-    uint32_t reserved;
 };
 
 /* Private pointer-free admission plan used by the mixed-turn implementation
@@ -146,34 +138,12 @@ extern "C" int lfm_mixed_turn_plan(size_t capacity, size_t prefix_tokens,
                                      size_t text_tokens, size_t audio_rows,
                                      size_t assistant_tokens,
                                      LfmMixedTurnPlan *out);
-/* Private publication decision kept testable without exposing codec codes in
- * the product ABI: 1 = decode/publish PCM, 0 = recurrence-only EOAudio. */
+/* Private publication decision: 1 = decode/publish PCM, 0 =
+ * recurrence-only EOAudio. */
 extern "C" LFM_INTERNAL_API int lfm_native_emission_needs_pcm(
     const LfmNativeEmission *emission);
 
-/* Test-scoped inner-voice listening probe. Feeds one user audio turn through
- * the production admission prefill seam ONE adapted row per pass, sampling
- * the greedy text head at every row into `out_tokens` and recording per-row
- * wall time into `out_row_ns`. `out_readouts` is optional: when non-null it
- * must hold `row_capacity` records and every row pass also reports top-k ids
- * with natural-log probabilities plus full-distribution entropy for the text
- * head and the Depthformer codebook-0 head (see LfmListenReadoutForTest).
- * Sampled ids and readouts are reported only, never committed; context
- * commits match a production admission over the same prefix and rows.
- * Submit rings `notify` once at terminal; collect returns -EINPROGRESS until
- * then and releases the probe record on any terminal status. */
-extern "C" LFM_INTERNAL_API int
-lfm_internal_conversation_listen_probe_submit_for_test(
-    LfmConversation *conversation, const float *pcm, size_t sample_count,
-    uint32_t sample_rate, uint32_t *out_tokens, uint64_t *out_row_ns,
-    LfmListenReadoutForTest *out_readouts, size_t row_capacity,
-    LfmAudioRouteNotify notify, void *notify_context, void **out_probe);
-extern "C" LFM_INTERNAL_API int
-lfm_internal_conversation_listen_probe_collect_for_test(
-    LfmConversation *conversation, void *probe, uint64_t *out_rows,
-    uint64_t *out_encode_ns);
-
-/* Private session/model seam. No declaration in the product or Rust ABI. */
+/* Private native session/model seam. */
 LFM_INTERNAL_API int lfm_conversation_prepare_pcm_native(
     LfmConversation *conversation, size_t max_sample_count,
     uint32_t capture_rate, uint32_t playback_rate,
@@ -224,7 +194,4 @@ LFM_INTERNAL_API int lfm_conversation_interrupt_collect_native(
 LFM_INTERNAL_API int
 lfm_conversation_belongs_to(const LfmConversation *conversation,
                             const LfmModel *model);
-LFM_INTERNAL_API const std::atomic<uint32_t> *
-lfm_conversation_operation_view_native(const LfmConversation *conversation);
-
 #endif /* LFM_MODEL_INTERNAL_H */
