@@ -11,24 +11,22 @@ extern "C" {
 #define LFM_SAMPLE_STATIC_ASSERT(test, message) _Static_assert(test, message)
 #endif
 
-#define LFM_SAMPLE_ABI_VERSION 1u
 #define LFM_SAMPLE_FLAG_GREEDY 1u
 
 /* Policy is an inline control record. Logits, probability scratch, and the
  * conversation PRNG remain pointer-referenced native planes. */
-typedef struct LfmSamplerConfigV1 {
-    uint32_t size;
-    uint32_t abi_version;
+typedef struct LfmSamplerConfig {
     uint32_t flags;
     uint32_t top_k;
     double temperature;
-    uint64_t reserved;
-} LfmSamplerConfigV1;
+} LfmSamplerConfig;
 
-/* Architecture leaves. The engine divides the vocabulary into contiguous
- * lane-owned bands and calls these over disjoint slices between generation
- * fences. `scale` is the f32 form of Candle's affine 1/temperature factor;
- * `bf16_scale` is that same factor rounded to bf16 for bf16 input parity. */
+/* Hand-written architecture-assembly leaves. The engine divides the vocabulary
+ * into contiguous lane-owned bands and calls these over disjoint slices between
+ * generation fences. `scale` is the f32 form of the pinned 1/temperature factor;
+ * `bf16_scale` is that same factor rounded to bf16 for fixture parity. The
+ * remaining C++ top-k/collective routing is tracked migration debt; the final
+ * sampler control path only partitions work, crosses fences, and calls assembly. */
 uint32_t lfm_sampler_argmax_f32(const float *x, size_t count);
 uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count);
 float lfm_sampler_exp_sum_f32(const float *x, float *weights, size_t count,
@@ -39,8 +37,8 @@ float lfm_sampler_exp_sum_bf16(const uint16_t *x, float *weights, size_t count,
 uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count,
                                  float target);
 
-LFM_SAMPLE_STATIC_ASSERT(sizeof(LfmSamplerConfigV1) == 32,
-                         "LfmSamplerConfigV1 ABI changed");
+LFM_SAMPLE_STATIC_ASSERT(sizeof(LfmSamplerConfig) == 16,
+                         "LfmSamplerConfig layout must match Flashkern");
 
 #undef LFM_SAMPLE_STATIC_ASSERT
 

@@ -83,7 +83,7 @@ pub enum LocalVoiceEngine {
 
 impl Default for LocalVoiceEngine {
     fn default() -> Self {
-        Self::MoshiRealtime
+        Self::Lfm2Interleaved
     }
 }
 
@@ -217,8 +217,6 @@ pub struct Lfm2Settings {
     /// selected engine controls the run path instead of guessing from one folder.
     pub moshi_model_dir: Option<String>,
     pub device: Lfm2Device,
-    /// Energy-VAD threshold (mic_chat default 0.012).
-    pub vad_threshold: f32,
     /// Timestamped native voice call-graph diagnostics. Persisted and explicit;
     /// never inferred from the desktop process environment.
     pub trace: bool,
@@ -248,7 +246,6 @@ struct Lfm2SettingsSerde {
     model_dir: Option<String>,
     moshi_model_dir: Option<String>,
     device: Lfm2Device,
-    vad_threshold: f32,
     trace: bool,
     #[serde(deserialize_with = "de_asr", default = "Lfm2ModeSampling::asr_default")]
     asr: Lfm2ModeSampling,
@@ -275,7 +272,6 @@ impl Default for Lfm2SettingsSerde {
             model_dir: value.model_dir,
             moshi_model_dir: value.moshi_model_dir,
             device: value.device,
-            vad_threshold: value.vad_threshold,
             trace: value.trace,
             asr: value.asr,
             tts: value.tts,
@@ -313,7 +309,6 @@ impl<'de> Deserialize<'de> for Lfm2Settings {
             model_dir: value.model_dir,
             moshi_model_dir: value.moshi_model_dir,
             device: value.device,
-            vad_threshold: value.vad_threshold,
             trace: value.trace,
             asr: value.asr,
             tts: value.tts,
@@ -388,15 +383,6 @@ pub fn lfm2_model_dir(settings: &Lfm2Settings) -> Option<PathBuf> {
         .map(hf_snapshot_dir)
 }
 
-pub fn moshi_model_dir(settings: &Lfm2Settings) -> Option<PathBuf> {
-    settings
-        .moshi_model_dir
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(expand_user_path)
-        .map(hf_snapshot_dir)
-}
-
 /// The active LFM2-Audio directory iff it contains a local model snapshot. No repo-id
 /// fallback, no default — this is the fail-hard run-path resolver. `model`/`revision`
 /// are the download *source*; this is what the runtime actually loads.
@@ -415,7 +401,6 @@ impl Default for Lfm2Settings {
             model_dir: None,
             moshi_model_dir: None,
             device: Lfm2Device::default(),
-            vad_threshold: 0.012,
             trace: false,
             asr: Lfm2ModeSampling::asr_default(),
             tts: Lfm2ModeSampling::tts_default(),
@@ -540,7 +525,7 @@ mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["provider"], "off");
         assert_eq!(json["lastProvider"], "lfm2");
-        assert_eq!(json["lfm2"]["engine"], "moshiRealtime");
+        assert_eq!(json["lfm2"]["engine"], "lfm2Interleaved");
         assert_eq!(json["lfm2"]["trace"], false);
         // Per-mode regimes, camelCase groups. Interleaved = the live path.
         assert_eq!(json["lfm2"]["interleaved"]["maxTokens"], 8192);
@@ -558,11 +543,9 @@ mod tests {
         // CPU on every platform since the measured flip (engine work, 2026-07-09):
         // the lane-team engine leads Metal on both latency and underruns.
         assert_eq!(json["lfm2"]["device"], "cpu");
-        assert!(json["lfm2"]["vadThreshold"].is_number()); // exact-float compare is brittle
         let back: VoiceSettings = serde_json::from_value(json).unwrap();
         assert_eq!(back.provider, VoiceProvider::Off);
         assert_eq!(back.last_provider, Some(VoiceProvider::Lfm2));
-        assert_eq!(back.lfm2.vad_threshold, 0.012); // f32 round-trips losslessly
     }
 
     #[test]
@@ -573,7 +556,6 @@ mod tests {
         assert_eq!(v.provider, VoiceProvider::Lfm2);
         assert_eq!(v.last_provider, Some(VoiceProvider::Lfm2));
         assert_eq!(v.lfm2.device, Lfm2Device::Metal);
-        assert_eq!(v.lfm2.vad_threshold, 0.012); // filled from Default
         assert!(!v.lfm2.trace); // diagnostics stay off unless the stored settings enable them
         // Absent mode groups take the correct PER-MODE defaults (older
         // stores predate the groups entirely).
@@ -583,7 +565,7 @@ mod tests {
         assert_eq!(v.lfm2.asr.text_temperature, 0.0);
         assert_eq!(v.lfm2.asr.max_tokens, 100);
         assert_eq!(v.lfm2.tts.audio_top_k, 64);
-        assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
+        assert_eq!(v.lfm2.engine, LocalVoiceEngine::Lfm2Interleaved);
         assert_eq!(v.lfm2.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
     }
 
@@ -673,7 +655,6 @@ mod tests {
         };
         assert_eq!(lfm2_model_dir(&s), Some(snap.clone()));
         assert_eq!(lfm2_active_model_dir(&s), Some(snap.clone()));
-        assert_eq!(moshi_model_dir(&s), Some(snap));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -684,11 +665,11 @@ mod tests {
         assert_eq!(s.model_dir, None);
         assert_eq!(s.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
         assert_eq!(s.moshi_model_dir, None);
-        assert_eq!(s.engine, LocalVoiceEngine::MoshiRealtime);
+        assert_eq!(s.engine, LocalVoiceEngine::Lfm2Interleaved);
     }
 
     #[test]
-    fn stored_voice_settings_without_engine_use_moshi_realtime_default() {
+    fn stored_voice_settings_without_engine_use_native_lfm2_default() {
         let json = serde_json::json!({
             "provider": "lfm2",
             "lastProvider": "lfm2",
@@ -698,7 +679,7 @@ mod tests {
             }
         });
         let v = decode_voice_settings(json).unwrap();
-        assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
+        assert_eq!(v.lfm2.engine, LocalVoiceEngine::Lfm2Interleaved);
     }
 
     #[test]
@@ -760,21 +741,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(lfm2_active_model_dir(&s), None);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn moshi_model_dir_is_separate_from_lfm2_model_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "emberharmony-moshi-dir-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = Lfm2Settings {
-            moshi_model_dir: Some(dir.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        assert_eq!(moshi_model_dir(&s), Some(dir.clone()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

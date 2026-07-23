@@ -1,23 +1,12 @@
-name: Rust voice (liquid-audio-rs)
-run-name: rust-voice ${{ github.ref_name }} @ ${{ github.sha }}
-
-# Formalizes the liquid-audio-rs test suite in the build: every change to the crate
-# (or this workflow) builds + runs `cargo test` on both x86_64 Linux and arm64 macOS.
-# The macOS arm64 runner is where the hardware-specific paths actually execute — the
-# NEON BFMMLA bf16 GEMM kernel (FEAT_BF16) and the torch-parity intra-op thread policy
-# (`hw.perflevel0.physicalcpu`); on Linux those self-skip / fall back to physical cores,
-# so the run still proves the cfg fallbacks compile and the portable tests pass.
+name: Native voice (Flashkern/kcoro)
+run-name: native-voice ${{ github.ref_name }} @ ${{ github.sha }}
 
 on:
-  # PR-only (plus manual): the bare `push:` trigger fired on every commit to any branch,
-  # duplicating the pull_request run. PRs into dev/main already gate the crate.
   pull_request:
     branches: [dev, main]
     paths:
-      - "crates/liquid-audio/**"
-      - "crates/candle-flashfftconv/**"
-      - "crates/kcoro/**"
       - "crates/kcoro-sys/**"
+      - "crates/liquid-audio/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -28,21 +17,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: rust-voice-${{ github.ref }}
+  group: native-voice-${{ github.ref }}
   cancel-in-progress: true
-
-defaults:
-  run:
-    shell: bash
-    working-directory: crates/liquid-audio
 
 jobs:
   test:
-    name: build + test (${{ matrix.os }})
+    name: native build + test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest] # macos-latest is arm64 → real BFMMLA + perflevel0
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
@@ -53,51 +37,20 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: .
 
-      # cpal (dev-dep, used by the mic_chat example/tests) needs ALSA headers on Linux.
-      - name: Linux audio deps (cpal/ALSA)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-
-      # The link-only build used to leave kcoro's Cargo integration tests dormant.
-      # Execute the production ticket and expected-value wait adapters on both hosts.
-      - name: Test kcoro sys crate
+      - name: Test kcoro coordination substrate
         run: cargo test -p kcoro-sys --tests -- --nocapture
 
-      # The Rust coordinator is the realtime policy kernel. Its suite includes the
-      # 100,000-iteration terminal race, ring wrap/close gates, and stop admission.
-      - name: Test Rust kcoro coordinator
-        run: cargo test -p kcoro --all-targets -- --nocapture
+      - name: Build native voice targets
+        run: cargo build -p liquid-audio --all-targets
 
-      - name: Build (lib + examples + tests)
-        run: cargo build --all-targets
+      - name: Test native voice library
+        run: cargo test -p liquid-audio --lib -- --nocapture
 
-      - name: Test (library)
-        run: cargo test --lib -- --nocapture
+      - name: Test native voice integration gates
+        run: cargo test -p liquid-audio --tests -- --nocapture
 
-      # `cargo build --all-targets` only proves that integration binaries compile.
-      # Execute the hermetic integration suite; checkpoint/hardware e2e gates are
-      # explicitly `ignored` and have dedicated invocation commands in their files.
-      - name: Test (integration)
-        run: cargo test --tests -- --nocapture
-
-      # macOS only: the Accelerate (vecLib BLAS) CPU-matmul path is the torch backend on
-      # Apple Silicon. Compile-check it so the feature wiring can't rot unnoticed.
-      - name: Compile-check Accelerate feature (macOS)
-        if: runner.os == 'macOS'
-        run: cargo build --lib --features accelerate
-
-      # macOS only: the DEPLOYED numerics are bf16 Metal — the desktop app builds
-      # liquid-audio with `features=["metal"]`, and the flashfftconv Metal kernels
-      # (ShortConv's conv path — every backbone token) previously compiled in CI but
-      # were never EXECUTED. GitHub's arm64 macOS runners have a real Metal device;
-      # run the lib tests on it so the shipped code path is tested, not just built.
-      - name: Test (lib, Metal — the shipped code path)
-        if: runner.os == 'macOS'
-        run: cargo test --lib --features metal -- --nocapture
-
-      - name: Test (integration, Metal)
-        if: runner.os == 'macOS'
-        run: cargo test --tests --features metal -- --nocapture
+      # The ignored real-checkpoint truth gate is intentionally not made
+      # vacuous in generic CI. Release automation must provision the model and
+      # question.wav, invoke the exact ignored test, and retain its WAV/manifest
+      # artifacts.

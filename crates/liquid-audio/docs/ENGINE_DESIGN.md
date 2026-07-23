@@ -1,220 +1,289 @@
-# flashkern engine — the design (CPU as GPU)
+# Flashkern engine design
 
-This is the chassis design the piece-by-piece kernel work mounts onto. It is the concrete
-layer below DECODE_ENGINE.md's contract: the memory map, the kernel ABI, the tile library,
-and the adherence rules. Status: living target plus as-built notes. A phase is only live when
-its code path and parity oracle have landed.
+Status: current implementation plus explicitly marked next steps.
 
-The one-sentence target: **one resident weight image plus fixed mutable arenas,
-computed through pointers and shared memory by one C++ kernel program on a
-persistent lane team, handing compact completion facts to Rust once per pass.**
+## Boundary
 
-That sentence describes the CPU backend. Flashkern never owns Metal dispatch.
-Matrix coprocessing is a required peer path: CPU matrix opcodes remain first-class,
-and Apple GPU execution moves to a separate MLX C++/Metal engine selected by the
-model/device layer. The current Candle Metal path is temporary migration code.
+Flashkern is the CPU inference device:
 
-## 0. What "kernel" means here (the adherence rule that was broken)
+- native C++ owns the engine object, plans, request/pass slots, direct byte
+  views, scratch, model-stage selection, and numerical lifecycle;
+- kcoro owns every resident control worker, saved route/executor frame, fair
+  permit broker, typed mailbox, fixed-team member, generation callback, and
+  asynchronous retirement;
+- architecture assembly is the primary numerical implementation, with Apple
+  Accelerate/AMX admitted only behind an explicit large-matrix ABI;
+- Rust docks control/observation through opaque native handles only; native
+  platform callbacks own PCM;
+- Metal is not part of Flashkern.
 
-A kernel is ONE native program executed by the resident lane team, owning all control flow
-between published stages — layer loop included. Rust builds the context, rings the doorbell,
-and reads rings; it does not run between stages. AS-BUILT (2026-07-14): the WHOLE
-backbone token is one resident lane program (REQ_TOKEN_PASS: embed →
-every conv/attention layer → final norm → optional sample), and the complete
-Depthformer frame is a typed C++ `REQ_DEPTH_FRAME` program: projection, every
-codebook/layer, KV recurrence, logits, sampling, and sampled-embedding feedback.
-Rust installs pointer descriptors and rings one pass; it runs no numerical frame.
-The stage board described elsewhere in this file was replaced by generation fences
-(lane-uniform kernel); rayon executes nothing per-token. Current diagrams + numbers:
-DECODE_ENGINE.md §0.
+Production enters through `lfm_runtime_create`. That implementation creates the
+private engine with `lfm_engine_new_status` so deadline-backend failure can be
+reported before work is admitted. The deterministic manual-deadline
+constructors are private test interfaces only.
 
-## 1. Target arena — fixed capacities and stable pointers
+An operation never owns a sleeping thread. Its suspension is a stackless frame:
+saved program counter, fixed locals, exact ticket, and retained references to
+its `PassSlot`, route, conversation, or session records. A correlated callback
+makes that exact frame runnable on any free eligible worker. Only a resident
+kcoro worker whose complete ready predicate is empty may enter expected-value
+dormancy.
 
-The weight side is partly built. `native/src/io/safetensors.cpp` reads all selected
-shards once into one 64-byte-aligned immutable image and builds a tensor table over
-that image. It does not require mmap. Remaining Candle modules obtain explicit,
-counted payload copies through `ResidentWeights::candle_builder`; current native
-contexts therefore still capture some pointers into Candle compatibility storage.
+## Current Command Flow
 
-At cutover, weights are not copied into a mutable arena. Native model plans bind
-`name → { offset, shape, dtype }` directly over the resident image, and Candle no
-longer stands between the engine and those bytes.
+```mermaid
+sequenceDiagram
+    participant S as Native session/caller
+    participant R as Route frame
+    participant E as kc::TeamExecutor
+    participant T as kcoro fixed team
 
-The following mutable arena is target design, not an as-built inventory. Everything
-mutable ultimately lives in fixed-capacity 64-byte-aligned storage; growth is a
-runtime-construction decision, never a warmed-pass realloc. Layout for
-LFM2.5-Audio-1.5B, B=1,
-`max_ctx = 4096`, offsets rounded to 64:
-
-| region | shape | bytes | notes |
-|---|---|---|---|
-| doorbell + pass ctl | epoch u64, reason u32, pass_seq u64, lane park words | 256 | the ONLY cross-thread control words |
-| kv region | attn_layers × 2 × [8][4096][64] bf16 + len cursor/layer | ~8 MB × attn_layers | fixed cap: no growth realloc, ever; cursor rollback stays O(1) |
-| conv states | conv_layers × [2048][K−1] bf16 | 8 KB × conv_layers | kernel shifts in place; snapshot copies OUT (tiny) |
-| depth kv planes | 6 × 2 × [8][8][32] bf16 | 24 KB | cursor reset per frame |
-| activation planes | x, xn, h, qkv[6144], gu[2·8192], t[8192], attn[2048], y[2048] — ×2 (double-buffered for stage pipelining) | ~350 KB | all bf16 bits except in-register f32 |
-| logits plane | [65536] f32 → bf16 bits | 384 KB | largest head wins |
-| rope tables | backbone [4096][32] f32; depth [4096][16] f32 | 1.3 MB | copied ONCE at build for locality (ends the 6× per-Mha duplication) |
-| token ring | 1024 × u32 + rd/wr seq | 4 KB | descriptors, not Vecs |
-| pcm ring | 10 s × 24 kHz f32 + rd/wr seq | 960 KB | native platform playback callback reads; reserve/commit API |
-| sampler state | one native ChaCha20 stream image per conversation/generation | 192 B each | one draw order crosses text and every audio codebook; the current Rust rim owns the opaque image until native conversation ownership lands |
-| sampler scratch | [largest vocab] f32 weights + [largest vocab] f32 top-k heap + lane partials | ~512 KB at vocab 65,536 | engine-owned and reserved when heads are installed; no logit payload copy or warmed-pass allocation |
-
-Target mutable arena size is approximately 60–90 MB, dominated by fixed-cap KV.
-Every target kernel argument is `arena_base + offset` or `image_base + offset`.
-
-## 2. The kernel program — CURRENT: resident stage machine
-
-The discarded Rust `TileEngine` prototype proved the descriptor model and exposed the
-cost of a channel operation per tile. It has been deleted; git history is the archive.
-The live engine is `native/src/engine/flashkern_engine.cpp`: no numerical channels, no
-descriptor staging, no allocation inside a warmed pass, and no Rust between native stages.
-
-- **Persistent native team**: one stable pthread per logical lane, sized from the same
-  P-core policy as the rest of the CPU runtime. Numerical call stacks never migrate.
-- **Mounted command doorbell**: the C++ rim writes one borrowed request slot,
-  creates one generation-protected descriptor with `Engine*` as payload, and
-  invokes the registered Rust submitter. One safe Rust kcoro broker publishes the
-  128-byte SQ cell; dedicated Rust CQ ingress resolves the preallocated result
-  slot after lane 0 publishes the matching completion.
-- **Stage board, not channels**: every lane enters the same `run_stage`; the opening
-  fence's last arriver publishes `{kind, count, chunk}` and resets `next`. Workers race
-  `next.fetch_add()` dry, and the next generation fence proves all claimed tiles landed.
-- **Descriptors stay at the boundary**: the mounted ring carries fixed IDs and
-  scalars, while numerical pointers stay in the single engine request slot. The
-  target promotes that slot to an owned region-retaining descriptor. Inside the
-  engine hot loop, work is shared stage state and raw pointers, not per-tile
-  messages.
-- **Determinism remains explicit**: reductions that affect bits fold in fixed order. Tile
-  over-decomposition is allowed only where rows are independent or the oracle pins the
-  exact reduction order.
-- **As-built/live mount**: `REQ_TOKEN_PASS` executes embed, every native ShortConv or
-  attention block, each MLP, final norm, and optional logits over one team entry.
-  `REQ_DEPTH_FRAME` executes the complete Depthformer frame over the same fixed team.
-  Both backbone and Depthformer plans coexist by stable identity; a ticket selects
-  one immutable plan while the executor and scratch arena remain shared.
-- **As-built CPU streaming convolution**: `REQ_DEPTHWISE_STREAM` partitions full
-  `(batch, channel)` rows across the same fixed team. The C ABI borrows split
-  state/input/weight planes and separate output/state destinations, then publishes
-  one completion after the program-final fence. No Metal dispatch exists in this
-  request or anywhere else in Flashkern.
-- **As-built native sampler (2026-07-14)**: `run_sampler` at
-  `native/src/engine/flashkern_engine.cpp:831` is a fixed-lane collective over
-  pointer-borrowed F32/BF16 logits. Greedy selection uses one fence and no RNG;
-  stochastic selection uses three fences, engine-owned probability/top-k
-  scratch, and exactly one mutation of the shared ChaCha stream. The text head
-  calls it inside `REQ_TOKEN_PASS`; `run_depth_frame` calls it directly for each
-  codebook inside one `REQ_DEPTH_FRAME`, so neither path creates a per-draw or
-  per-codebook ticket. `REQ_SAMPLE` remains the standalone prefill/fallback and
-  conformance entry. `REQ_PRNG` independently pins stream/assembly behavior.
-  AArch64 and x86_64 assembly expand ChaCha20 blocks, and Apple
-  `SecRandomCopyBytes` supplies key/nonce material only at seed time.
-  Per-block request entries remain as parity fixtures; there is no alternate engine.
-
-Linkage has two distinct kcoro roles. `crates/kcoro` is the safe Rust product
-coordinator and owns the current broker future. The sibling `kcoro-sys` crate
-builds the vendored C conformance runtime and POSIX expected-value adapter; its C
-ticket scheduler is not on the production pass path. Flashkern uses the wait
-adapter but keeps its fixed numerical workers outside either coordination ready
-queue. On supported `aarch64`/`x86_64` GCC/Clang targets, the coordinator, wait
-substrate, architecture kernel, and native engine build unconditionally.
-Unsupported targets fail; there is no degraded engine branch.
-
-## 3. The tile library — simdgroup_matrix on NEON (not yet built; this specifies it)
-
-```cpp
-// fk_sg8x8: Metal simdgroup_float8x8. 16 f32 accum registers in BFMMLA 2×2 layout.
-struct fk_sg8x8 { float32x4_t t[4][4]; };
-void fk_sg_fill(fk_sg8x8&, float);
-void fk_sg_load_a(fk_bf16_panel&, const uint16_t* a, int lda);   // 8×8 bf16 → MMLA order
-void fk_sg_load_b(fk_bf16_panel&, const uint16_t* b, int ldb);
-void fk_sg_mma(fk_sg8x8& acc, const fk_bf16_panel& a, const fk_bf16_panel& b); // 16× BFMMLA
-void fk_sg_store(const fk_sg8x8&, float* c, int ldc);            // masked ragged edge
-void fk_sg_store_rb(const fk_sg8x8&, uint16_t* c, int ldc);      // fused RNE epilogue
+    S->>R: retain input leases + create route ticket
+    R->>E: publish validated pass request
+    E-->>T: dispatch generation
+    T->>T: claim assembly tiles; every member returns once
+    T-->>E: final return resumes exact executor frame
+    alt another route label
+        E-->>T: publish next generation on the same ticket
+    else terminal outcome
+        E-->>R: consume exact completion + resume route
+        R-->>S: make retained session delivery runnable
+        S->>S: validate ticket/epoch + release leases
+    end
 ```
 
-### 3b. Tile backends by target (portability matrix)
+`kc::TeamExecutor` validates one fixed-mailbox request through caller-supplied
+`begin`, dispatches logical team members through `run_member`, and invokes
+`advance` only after the exact final-return edge resumes its saved frame. It
+publishes and consumes the correlated completion before calling Flashkern's
+`finish`; it never shepherds the next stage inline from the returning member.
+`PassSlot::ProgramCursor` and request-specific records own every numerical
+value that survives a return. The former Flashkern-local bridge interpreter,
+generation counters, mailbox endpoints, and team callback are gone.
 
-| target | decode tiles (bandwidth-bound) | prefill tiles (compute-bound) | detection |
-|---|---|---|---|
-| Apple M1–M3 (macOS) | NEON BFMMLA / widening FMA | Accelerate sgemm → AMX (measured: §E4) | cfg + sysctl FEAT_* |
-| Apple M4+ (macOS) | same | Accelerate → SME (same call, architectural unit) | FEAT_SME sysctl |
-| Graviton 3/4, Neoverse V1/V2, Cortex-A78+ (Linux) | NEON BFMMLA / widening FMA | fk_sg8x8 BFMMLA; option: OpenBLAS `sbgemm` (bf16-in/f32-out — no widening tax, the non-Apple Accelerate analog) — adopt only by on-target measurement | HWCAP2_BF16 / HWCAP2_I8MM (built) |
-| SME/SME2 cores (Cortex-X4+, Dimensity 9300+) | NEON | FMOPA outer-product tiles as a first-class fk_sg backend (architectural, compiler-supported — unlike AMX) | HWCAP2_SME |
-| pre-bf16 ARMv8 (Pi 5 / Cortex-A76) | f32 FMLA broadcast microtile (4×4 baseline) | same | absence of BF16 |
-| x86-64 | AVX2 / VDPBF16PS (built) | same + AVX-512 tiles | CPUID (built) |
+`kc::PermitBroker` owns the fixed route records, generation leases, bounded
+admission, service-class/FIFO/age selection, and one retained continuation
+frame per route. Its single broker service only grants permits; it never
+interprets a route or submits numerical work. The granted route frame mounts
+one pass, dehydrates, and is resumed exactly by that pass completion. A
+multi-hop token → Depthformer → detokenizer route therefore continues in its
+own saved frame rather than re-entering one Flashkern-local route interpreter.
+Released pass or mailbox capacity publishes the successor edge for a preserved
+route. Records newer than a selector snapshot have age zero, and route capacity
+is independent from the age-promotion threshold.
 
-**Honest constraint (pre-bf16 row):** this model is bf16. The current CPU loader
-rejects a machine without the required bf16 kernel; it does not silently widen the
-checkpoint. A future explicit f32 portability backend would read about 2x weight
-bytes (~6 GB) against Pi-class ~17 GB/s bandwidth, implying a ~350+ ms/token
-floor. Pre-bf16 boards are therefore functional targets, not real-time ones, for
-this model. Real-time non-Apple targets are the bf16 rows (Graviton 3+,
-Neoverse, recent Cortex-A/X).
+An accepted submission carries only `{pass_slot, ticket_generation}`. The
+engine-owned slot retains its typed byte views, program cursor, continuation,
+and input/output/conversation leases until the exact terminal callback. There
+is no descriptor registry or hot-path lookup lock. Slot generation advances
+only after the callback releases or resubmits it; no callback context points
+into a caller's stack.
 
-x86 twin over VDPBF16PS/AVX2. Consumers: the GEMM (refactored to compose from it — the
-existing 4×4 BFMMLA loop becomes `fk_sg_mma` calls), prefill M>4 tiles, prefill attention
-(q·Kᵀ tiles), the monarch/fft fanout ports when they move from Rust to the program. One
-tile type, every matrix kernel composes from it — that is what "simdgroup_matrix
-equivalent" means, and it is the unit the rb-epilogue lands in.
+## Fixed Lanes
 
-## 4. Adherence rules (hard constraints, reviewable per diff)
+`lfm_engine_new_status`, reached through `lfm_runtime_create`, creates one
+bounded kcoro runtime, one `kc::TeamExecutor`, one `kc::PermitBroker`, a
+team-supervisor service, and the executor's stable logical `kc_team` on that
+same pool.
+Flashkern and `kc_team` create no lane pthreads. The runtime owns one
+infrastructure doorbell; there is no operation-owned idle registration or
+per-pass fence word.
 
-1. No heap allocation inside a pass. Planes are arena offsets; violation = review reject.
-2. No Candle type crosses the engine ABI. Ptr/len/offset only. Candle remains a
-   migration/reference owner today; no production inference owner remains at
-   target cutover.
-3. Pointer stability: fixed capacities; changing a capacity is an engine rebuild.
-4. Weight movement is theft: any transpose/pack/copy of a weight in a hot path must cite
-   this document's exception list (currently empty) in a comment, or it does not merge.
-5. Every phase lands with its oracle: byte tier (wav-hash flag-off) or ulp tier (flagged +
-   bound test) — stated in the PR, no silent tier changes (the fused_conv_decode A/B
-   regression is the cautionary case).
+Every member executes the same published stage program. Members fetch-add
+disjoint tiles and return after their complete assembly leaf. The final return
+publishes one edge to the executor frame. The resumed executor invokes the
+model-specific bounded transition and either publishes the next stage
+generation or the terminal completion record. Members do not block one another
+at a barrier; after returning they are simply available for the next generation
+and workers become dormant only if the entire pool has no work.
 
-## 5. Migration phases (each = one reviewable piece with an oracle)
+This is one team. The current engine may describe logical blocks for accounting,
+but it does not own two independent four-lane teams and cannot run two numerical
+programs concurrently. Independent `BlockDomain`s remain an unimplemented V2
+step.
 
-- **E1a native stage-machine mount**: ✅ **As-built.** The mandatory process
-  engine owns the fixed team and the MLP/layer parity entries. Construction
-  failure is fatal rather than a second production scheduler. Oracle: native MLP
-  bit parity vs the test-only composed reference.
-- **E1b full token-pass chassis**: ✅ **As-built.** `REQ_TOKEN_PASS` executes the
-  backbone decode step on the persistent team. Weight pointers and mutable state
-  still arrive through the borrowed compatibility request slot; direct resident
-  image binding and the complete target arena remain open.
-- **E2 frame pass**: ✅ **As-built typed frame.** `REQ_DEPTH_FRAME` owns the
-  projection, all Depthformer layers/codebooks, native zero-spin fences, logits,
-  sampler, and sampled-embedding recurrence. The Rust numerical callback,
-  `SpinBarrier`, logits Tensor rebuild, nested sampler ABI, and BF16 hidden copy
-  are deleted. The remaining outer migration is to bind the input/output slots and
-  shared RNG image directly to native conversation state instead of returning a
-  small Rust token `Vec`. Oracle: seeded token sequence plus the one-ticket typed
-  plan lifecycle test.
-- **E3 rings**: token/PCM rings live; per-token tensor construction deleted from the loop;
-  sampler v2. Oracle: e2e gates + allocation counter == 0 in-pass.
-- **E4 prefill pass**: chunked `lfm_prefill_pass`, streams during capture (the
-  doorbell-legal chunk boundary), kills the M>4 transpose exception and the conformer's
-  candle chain. **Tile backend: DECIDED BY MEASUREMENT (2026-07-08, on the target M2)** —
-  Accelerate `cblas_sgemm` (the sanctioned dispatcher to the AMX matrix units; SME on
-  M4+ via the same call) at ~1.0–1.5 TFLOP/s f32 vs our BFMMLA GEMM's ~55–61 GF/s at
-  prefill shapes: 19–28× including the bf16→f32 widening tax. Widening is tile/layer-
-  transient per turn (never a resident f32 weight copy — cites the movement rule's
-  exception list: this is the one entry, bounded and per-turn). Raw AMX via encodings
-  (corsix) is DEMOTED to "only if a measured gap vs Accelerate ever justifies
-  unsupported ISA" — currently it does not. fk_sg8x8/BFMMLA remains the decode-side and
-  non-macOS tile backend. Oracle: prefill-output parity vs candle at f32 tier
-  (measured rel ≈ 1e-5), behind an object-graph backend selector, reference = current
-  path. Decode stays NEON: sgemm at M=1 would mean widening the full weight per token —
-  theft; bandwidth floor unchanged.
-- **E5 codec**: native serial Mimi decode is built and production-swapped; mounting
-  it as a typed pass on the fixed lane team remains open. Oracle: chain parity and
-  wav parity per frame.
+## Math ABI
 
-## 6. Candle disposition
+C++ routes pointers, dimensions, strides, and stage identity. That is its target
+steady-state role; the remaining value-producing C++ called out below is an
+open transliteration gap, not an alternate numerical tier.
 
-Candle currently supplies compatibility tensor owners, unfinished numerical paths,
-temporary Metal execution, training tools, and parity references. That is migration
-state, not a permanent production boundary. CPU inference binds the native resident
-image and executes Flashkern C++/SIMD/assembly without Candle or Rust numerical
-callbacks. Apple GPU inference remains mandatory, but its replacement is a separate
-MLX C++/Metal device engine with its own command/memory boundary. It is not compiled
-into Flashkern. References and training tooling may remain outside shipped inference.
+Current hand-written assembly files include:
+
+- `native/kernels/aarch64/flashkern_math.S`
+- `native/kernels/x86_64/flashkern_math.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_prng.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_rope.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_sampler.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_frontend.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_conformer.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_sesame.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_capture_format.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_detokenizer.S`
+
+`flashkern_math.S` currently owns reciprocal RMS scaling, fixed-order f32
+reduction, strided BF16 sum-of-squares, BF16 bias addition, and exact BF16 NeoX
+rotary. Existing value-producing C++ code elsewhere in the engine and
+architecture `.cpp` files is migration debt and must move to assembly; it is not
+a sanctioned fallback tier.
+
+Production assembly leaves:
+
+- never allocate, throw, call Rust, publish a ticket, inspect stop state, or
+  perform I/O;
+- receive counted raw planes whose lifetime is retained by the pass slot;
+- write only declared disjoint destinations or a fence-owned serial result;
+- preserve the documented rounding and reduction order;
+- expose the same C ABI on AArch64 and x86_64.
+
+AMX/Accelerate remains the Apple matrix coprocessor. Its invocation must sit
+behind the architecture math ABI; C++ may select the leaf but may not prepare or
+evaluate model values in the pass scheduler.
+
+The private loader type named `LfmTensorView` is metadata over checkpoint bytes,
+not an owning tensor. Production never constructs a framework tensor or loads a
+checkpoint in Rust.
+
+## State And Memory
+
+Setup-time C++ containers build immutable plans, formula-derived tables, and
+workspace high-water marks. Production activation workspaces are reserved and
+sealed before session readiness. All model-sized allocation belongs before
+readiness:
+
+- immutable model and Depthformer plans;
+- per-lane panels and temporary accumulators;
+- QKV, attention, FFN, logits, sampler, FFT, and codec scratch;
+- generation-protected pass slots and descriptor table;
+- conversation-owned KV, convolution carry, sampler and codec state.
+
+No pass may resize a vector, allocate a stack-dependent variable-length buffer,
+or throw across `extern "C"`. Plan construction tracks maxima across every layer,
+not only the final layer geometry.
+
+Weights remain views into the resident model image; an individual checkpoint
+view may be unaligned and must be loaded safely by its architecture leaf.
+Activations and state mutate in declared native buffers. SQ/CQ records contain
+only fixed control facts and IDs.
+
+## Recurrence
+
+Recurrence belongs to a native route/session continuation:
+
+1. acquire a pass slot;
+2. retain model/conversation/input/output leases;
+3. publish native SQ;
+4. return to the runtime with durable route state;
+5. receive the final-team callback and publish the exact CQ;
+6. arbitrate terminal facts and commit/rollback state in the retained
+   continuation;
+7. release the slot or submit the next labeled native action.
+
+Missing PCM, playback capacity, or reliable-output capacity leaves the exact
+route/session frame dormant and releases the compute slot. Its retained records
+remain backing data; the corresponding producer callback makes the saved frame
+runnable. No host loop, timeout, or thread represents those resources. Rust
+handles only platform-audio and control edges.
+
+## Native Audio Policy
+
+The session consumes typed capture-chunk records over its preallocated native
+PCM arena. Every 20 ms of incoming samples, it runs the paired architecture
+Sesame leaf over the exact 256-sample Blackman-windowed 600–2400 Hz view. The
+detector, adaptive microphone state, sample-count thresholds, and pause
+generation belong to the native session. Rust does not run an RMS VAD.
+
+The 200 ms prepare gate currently records retained policy readiness only.
+Candidate-owned activation scratch and speculative numerical execution remain
+open work.
+
+The product device callback feeds exact played-sample evidence into the
+detector's independent playback adaptive state. The 700 ms echo tail and
+400 ms sustained microphone evidence drive the correlated barge-in edge.
+Real-device echo/AEC qualification remains open; Rust output RMS is telemetry
+only.
+
+## Correlated Deadlines
+
+Each numerical team generation is hard-supervised by a readiness-time
+`kc::TeamSupervisor`, which owns its `kc_deadline_source`, terminal
+arbitration, quorum observation, and `kc::FatalStore`. On macOS the source uses
+a monotonic GCD one-shot; non-Apple
+production runtime construction returns `LFM_STATUS_UNSUPPORTED` before
+admission, while private tests use a deterministic manual backend.
+
+Before dispatch, the engine copies pointer-free ticket, pass, stage, shape, and
+generation identity into retained supervision state and arms a one-second hard
+deadline. Each team member release-publishes its own generation-stamped entry
+and return. Normal final return retires the exact deadline. Completion and
+expiry race through one terminal CAS, so neither path can publish twice.
+
+If expiry wins, the supervisor captures the expected, entered, returned,
+never-entered, and entered-not-returned masks in a reserved fatal capsule,
+suppresses CQ/recurrence/scratch retirement, and aborts. There is no numerical
+retry or potentially-live scratch reuse.
+
+The capsule is copied into a setup-time-created, prefaulted, locked,
+file-backed shared mapping before `abort()`. Publication is bounded stores plus
+one release commit, so crash evidence survives without a failure-path
+allocation, format operation, or storage syscall. The one-second closed-table
+budget remains a conservative floor; calibrated per-stage/shape values and
+platform crash-report ingestion remain release work. Soft nudge/rebroadcast
+behavior is not part of production.
+
+## Teardown
+
+Stop closes mailbox admission and resumes the executor frame. Accepted work
+settles into terminal completion records, stale epochs lose publication
+authority, and all retained leases release exactly once. The
+canceled-and-empty mailbox is the terminal edge that retires the logical team;
+the team's final retirement callback resumes the executor, which retires its
+endpoint leases and publishes its own terminal callback. Its setup leases are
+destroyed only after submissions, completions, routes, pass slots, and retained
+I/O leases are all settled.
+
+There is no production synchronous compatibility wrapper. Concurrent callers
+either acquire a generation-protected slot or receive a bounded admission
+result before mutating payload state.
+
+## Verification
+
+Current tests include:
+
+- `kcoro-sys/tests/fixed_team.rs` for fixed membership, callback completion,
+  quorum snapshots, and stop/join ownership;
+- `kcoro_arena/tests/team_executor_contract.cpp` for saturated-mailbox
+  draining, multi-generation advancement, exact rejection completion,
+  coalesced-edge safety, and callback-proven retirement;
+- `kcoro_arena/tests/team_supervisor_contract.cpp` for deadline retirement,
+  terminal arbitration, fatal-store persistence, and both missing-lane
+  classes;
+- `engine_hard_supervision.rs` for deadline retirement, terminal arbitration,
+  product capsule content, and the native engine fault-injection seam;
+- `sesame_detector.rs` for exact browser evidence, circular windows, separate
+  stream state, and malformed input;
+- `native_voice_session.rs` for PCM leases, exact sample-clock policy, pause
+  deadline races, callback failure, stop, and no-operation-wait source gates;
+- `native_product_abi.rs` for the opaque production export allowlist;
+- an explicitly ignored real-checkpoint truth gate that drives typed input and
+  two audio turns on one retained conversation through native audio-token
+  generation and Mimi playback. Direct model-to-model conversation remains a
+  future native audio-token/code dock, never an acoustic VAD loopback.
+
+Required cutover gates:
+
+1. one million passes with exact descriptor/slot settlement;
+2. stop during every submit/dispatch/final-return/CQ phase;
+3. zero allocation after readiness;
+4. no C++ production numerical expressions;
+5. no Rust model/numerical symbol in the release graph;
+6. two or more conversations scheduled fairly over one model image;
+7. p50/p95/p99/max callback and pass latency against frozen baselines;
+8. ASan, UBSan, Linux TSan, AArch64, x86_64, and Rosetta gates;
+9. observable platform fatal diagnostics and benchmark-calibrated hard budgets;
+10. playback-fed Sesame/echo evidence instead of host RMS policy.
+
+Source-shape gates additionally reject production `wait_submitted_slot`, raw
+lane pthread creation, operation-scoped address parking, timer-driven progress,
+caller-stack continuation state, and completion channels. Fixed heap-backed
+stackless frames are required rather than forbidden.

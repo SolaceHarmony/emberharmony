@@ -1,11 +1,10 @@
 # Voice Frontend Design
 
-> **Current-hybrid document.** This records the shipped frontend seam. The
+> **Current production document.** This records the shipped frontend seam. The
 > normative native ticket observer and truthful capture/compute/playback meter
 > design is
 > [`specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md`](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
-> It is not an implementation claim. This file is updated in place when that
-> product gate passes; no legacy copy is retained.
+> It supplies the detailed observer contract; no legacy copy is retained.
 
 This document tracks the SolidJS side of the native desktop voice kernel described in
 `desktop-stack.md`. The key rule is simple: SolidJS is intent and rendering only. The Tauri
@@ -72,14 +71,13 @@ Both providers emit the same event stream over a Tauri `Channel<VoiceEvent>`:
 State { loading | idle | listening | thinking | speaking }
 Transcript { role, text }
 Level { rms }
-AudioClip { wav, ms }
 Ended { reason? }
 Error { message }
 ```
 
-For continuous native sessions, audio stays in Rust. The webview gets scalar `Level` updates for
-the meter, transcripts for display, and state transitions for controls. `AudioClip` remains in the
-contract for turn-style output, but the live desktop path should not ship PCM through webview IPC.
+For continuous native sessions, PCM stays in the native capture/playback docks; Rust owns only the
+platform callback endpoints. The webview gets scalar `Level` updates for the meter, transcripts for
+display, and state transitions for controls. PCM never crosses webview IPC.
 
 ## SolidJS Voice Context
 
@@ -108,8 +106,9 @@ setMicEnabled(enabled)    -> voice_set_mic_enabled(enabled)
 toggleMute()              -> setMicEnabled(!current)
 ```
 
-Provider switching, model directory changes, device changes, VAD threshold changes, LiveKit URL
-changes, and keychain credential writes are reconciled in Rust. The frontend dispatches the
+Provider switching, model directory changes, device changes, LiveKit URL changes, and keychain
+credential writes are reconciled in Rust. Sesame speech policy is native and has no frontend
+threshold control. The frontend dispatches the
 settings event so UI state refetches, but it must not decide which native session to stop.
 
 ## Prompt Input Integration

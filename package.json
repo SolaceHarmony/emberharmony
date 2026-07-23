@@ -71,11 +71,7 @@
       "livekit-client": "2.19.2",
       "@livekit/components-core": "0.12.13",
       "livekit-server-sdk": "2.15.4",
-      "@livekit/protocol": "1.46.6",
-      "@livekit/agents": "1.4.5",
-      "@livekit/agents-plugin-silero": "1.4.5",
-      "@livekit/agents-plugin-livekit": "1.4.5",
-      "@livekit/rtc-node": "0.13.29"
+      "@livekit/protocol": "1.46.6"
     }
   },
   "devDependencies": {

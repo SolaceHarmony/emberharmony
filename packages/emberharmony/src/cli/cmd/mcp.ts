@@ -106,6 +106,9 @@ export const McpListCommand = cmd({
             if (hasOAuth && hasStoredTokens) {
               hint = " (OAuth)"
             }
+          } else if (status.status === "connecting") {
+            statusIcon = "…"
+            statusText = "connecting"
           } else if (status.status === "disabled") {
             statusIcon = "○"
             statusText = "disabled"

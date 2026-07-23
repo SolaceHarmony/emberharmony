@@ -167,12 +167,7 @@ fn spawn_sidecar(app: &AppHandle, hostname: &str, port: u32, password: &str) -> 
         format!("serve --hostname {hostname} --port {port}").as_str(),
     )
     .env("EMBERHARMONY_SERVER_USERNAME", "emberharmony")
-    .env("EMBERHARMONY_SERVER_PASSWORD", password)
-    // Desktop voice is owned by the native Tauri kernel (`src/voice`): LFM2
-    // and LiveKit media/control both enter through Tauri commands. The server
-    // sidecar still serves sessions, but it must not spawn the legacy Bun
-    // voice agent worker in desktop mode.
-    .env("EMBERHARMONY_DESKTOP_NATIVE_VOICE", "1");
+    .env("EMBERHARMONY_SERVER_PASSWORD", password);
 
     let (mut rx, child) = command.spawn().expect("Failed to spawn emberharmony");
 

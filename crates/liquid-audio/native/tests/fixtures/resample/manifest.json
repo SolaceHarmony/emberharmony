@@ -1,0 +1,42 @@
+{
+  "algorithm": "torchaudio sinc_interp_hann, lowpass_filter_width=6, rolloff=0.99, f64 accumulate, truncate to ceil(new*len/orig)",
+  "artifacts": [
+    {
+      "dtype": "f32le",
+      "file": "input_ramp24_to16.bin",
+      "len": 6000
+    },
+    {
+      "dtype": "f32le",
+      "file": "output_ramp24_to16.bin",
+      "len": 4000,
+      "new_freq": 16000,
+      "orig_freq": 24000
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_tone48_to16.bin",
+      "len": 9600
+    },
+    {
+      "dtype": "f32le",
+      "file": "output_tone48_to16.bin",
+      "len": 3200,
+      "new_freq": 16000,
+      "orig_freq": 48000
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_tone16_to24.bin",
+      "len": 4000
+    },
+    {
+      "dtype": "f32le",
+      "file": "output_tone16_to24.bin",
+      "len": 6000,
+      "new_freq": 24000,
+      "orig_freq": 16000
+    }
+  ],
+  "generator": "resample.rs tests::dump_resample_fixtures (dies with this module)"
+}

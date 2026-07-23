@@ -290,8 +290,6 @@ export const dict = {
     "Folder containing model.safetensors, Mimi weights, and tokenizer_spm_32k_3.model",
   "settings.voice.row.device.title": "Compute device",
   "settings.voice.row.device.description": "Metal (Apple GPU) runs real-time; CPU is slower",
-  "settings.voice.row.vadThreshold.title": "Mic sensitivity",
-  "settings.voice.row.vadThreshold.description": "Energy threshold that starts a turn (default 0.012)",
   "settings.voice.row.trace.title": "Native voice diagnostics",
   "settings.voice.row.trace.description": "Write timestamped model and audio pipeline events to the application log",
   "settings.voice.section.mode.interleaved": "Conversation decoding (interleaved)",
@@ -346,6 +344,7 @@ export const dict = {
   "dialog.plugins.empty": "Plugins configured in emberharmony.json",
 
   "mcp.status.connected": "connected",
+  "mcp.status.connecting": "connecting",
   "mcp.status.failed": "failed",
   "mcp.status.needs_auth": "needs auth",
   "mcp.status.disabled": "disabled",

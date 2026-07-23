@@ -101,6 +101,7 @@ export function StatusPopover() {
 
   const toggleMcp = async (name: string) => {
     if (store.loading) return
+    if (sync.data.mcp[name]?.status === "connecting") return
     setStore("loading", name)
 
     try {
@@ -319,14 +320,14 @@ export function StatusPopover() {
                           type="button"
                           class="flex items-center gap-2 w-full h-8 pl-3 pr-2 py-1 rounded-md hover:bg-surface-raised-base-hover transition-colors text-left"
                           onClick={() => toggleMcp(item.name)}
-                          disabled={store.loading === item.name}
+                          disabled={store.loading === item.name || item.status === "connecting"}
                         >
                           <div
                             classList={{
                               "size-1.5 rounded-full shrink-0": true,
                               "bg-icon-success-base": item.status === "connected",
                               "bg-icon-critical-base": item.status === "failed",
-                              "bg-border-weak-base": item.status === "disabled",
+                              "bg-border-weak-base": item.status === "disabled" || item.status === "connecting",
                               "bg-icon-warning-base":
                                 item.status === "needs_auth" || item.status === "needs_client_registration",
                             }}
@@ -335,7 +336,7 @@ export function StatusPopover() {
                           <div onClick={(event) => event.stopPropagation()}>
                             <Switch
                               checked={enabled()}
-                              disabled={store.loading === item.name}
+                              disabled={store.loading === item.name || item.status === "connecting"}
                               onChange={() => toggleMcp(item.name)}
                             />
                           </div>

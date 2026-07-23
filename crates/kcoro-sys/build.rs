@@ -8,22 +8,11 @@ fn main() {
     let srcs = [
         "kcoro_stackless.c",
         "kc_runtime.c",
-        "kc_op.c",
-        "kc_ticket.c",
-        "koro_sched_stackless.c",
-        "kc_chan_stackless.c",
-        "kc_desc.c",
-        "kc_timer.c",
-        "kc_scope.c",
-        "kc_actor.c",
-        "kc_cancel.c",
-        "kc_admin.c",
-        "kc_wal.c",
-        "kc_checkpoint.c",
-        "kc_durable.c",
-        "kc_workflow.c",
-        "kc_shared.c",
-        "kc_transport.c",
+        "kc_service.c",
+        "kc_doorbell.c",
+        "kc_team.c",
+        "kc_fixed_scope.c",
+        "kc_deadline.c",
     ];
 
     let mut core = cc::Build::new();

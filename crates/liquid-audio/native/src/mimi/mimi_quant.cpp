@@ -18,10 +18,6 @@
 #include <cstdio>
 #include <cstring>
 
-#if defined(__ARM_NEON) && !defined(MIMI_SCALAR_REF)
-#include <arm_neon.h>
-#endif
-
 // ---------------------------------------------------------------------------
 // Compile-time shape facts for this checkpoint (mirror mimi_kernel.h enums).
 // ---------------------------------------------------------------------------
@@ -36,7 +32,9 @@ constexpr float kCbEps  = 1e-5f;           // EuclideanCodebook epsilon (f32)
 // ---------------------------------------------------------------------------
 // State (POD, carved from the arena at init; steady state never allocates).
 // Folded codebook tables and the raw output_proj weight views live here, plus
-// small scratch for the residual sum and the two per-RVQ 512-vectors.
+// one 256-value residual sum. Both projections write directly into the caller's
+// final embedding: first overwrites, rest accumulates. No projected plane is
+// materialized in conversation scratch.
 // ---------------------------------------------------------------------------
 struct MimiQuantState {
     // Folded effective embeddings, checkpoint row layout [bins, qdim] row-major.
@@ -46,49 +44,27 @@ struct MimiQuantState {
 
     // output_proj: conv1d(qdim -> model_dim, kernel 1, no bias). With kernel 1
     // and T=1 this is a pure gemv; weight [512,256,1] collapses to [512,256]
-    // row-major, exactly mimi_gemv_f32's [M=512,K=256] layout.
-    const float *out_proj_first;        // [kModelDim * kQDim]
-    const float *out_proj_rest;         // [kModelDim * kQDim]
+    // row-major, exactly the resident row-GEMV's [M=512,K=256] layout.
+    const uint8_t *out_proj_first;      // [kModelDim * kQDim] f32 bytes
+    const uint8_t *out_proj_rest;       // [kModelDim * kQDim] f32 bytes
 
     // Scratch (arena).
-    float *quant_rest;                  // [kQDim]  residual sum for rvq_rest
-    float *emb_first_out;               // [kModelDim] projected rvq_first
-    float *emb_rest_out;                // [kModelDim] projected rvq_rest
+    float *quant_rest;                  // [kQDim] residual sum for rvq_rest
 };
 
 // ===========================================================================
 // Small kernels. The only reduction here is the residual accumulation (an
 // elementwise add across codebooks) — order-independent per lane. Everything
-// else is copy or scalar division. mimi_gemv_f32 (shared, declared in the
-// header, implemented elsewhere) owns the projection dot-product order.
+// else is copy or scalar division. mimi_weight_gemv_rows_f32 (shared, declared
+// in the header, implemented elsewhere) owns the projection dot-product order.
 // ===========================================================================
 namespace {
 
-#ifdef MIMI_SCALAR_REF
-// Scalar reference sibling for the NEON accumulate (parity bisecting).
-// acc[i] += x[i] for i in [0,n); lanes independent, no cross-lane reduction.
-void vec_add_ref(float *acc, const float *x, int n) {
-    for (int i = 0; i < n; ++i) acc[i] += x[i];
-}
-#endif
-
 // acc[i] += x[i], i in [0,n). Elementwise add across a codebook contribution;
-// accumulation order is per-index only (no reduction across i), so NEON and
-// scalar agree bit-for-bit.
+// accumulation order is per-index only (no reduction across i). The shared
+// native sweep owns the architecture implementation.
 inline void vec_add(float *acc, const float *x, int n) {
-#ifdef MIMI_SCALAR_REF
-    vec_add_ref(acc, x, n);
-#elif defined(__ARM_NEON)
-    int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t a = vld1q_f32(acc + i);
-        float32x4_t b = vld1q_f32(x + i);
-        vst1q_f32(acc + i, vaddq_f32(a, b));
-    }
-    for (; i < n; ++i) acc[i] += x[i];
-#else
-    for (int i = 0; i < n; ++i) acc[i] += x[i];
-#endif
+    mimi_add_vec_f32(acc, x, acc, n);
 }
 
 // Fold one EuclideanCodebook: dst[k,d] = embedding_sum[k,d] / max(usage[k],eps).
@@ -96,13 +72,16 @@ inline void vec_add(float *acc, const float *x, int n) {
 //   embedding = embedding_sum.broadcast_div(cluster_usage.maximum(1e-5))
 // with Maximum defined as `if v1 < v2 { v2 } else { v1 }` (v1=usage, v2=eps,
 // eps cast to f32 first) and Div as plain f32 v1/v2. Row loop k outer, d inner.
-void fold_codebook(float *dst, const float *emb_sum, const float *usage) {
+void fold_codebook(float *dst, const uint8_t *emb_sum, const uint8_t *usage) {
     for (int k = 0; k < kBins; ++k) {
-        const float u = usage[k];
+        const float u = mimi_weight_load_f32(usage, k);
         const float denom = (u < kCbEps) ? kCbEps : u;  // candle Maximum tie rule
-        const float *src = emb_sum + (size_t)k * kQDim;
         float *out = dst + (size_t)k * kQDim;
-        for (int d = 0; d < kQDim; ++d) out[d] = src[d] / denom;
+        for (int d = 0; d < kQDim; ++d) {
+            out[d] = mimi_weight_load_f32(
+                         emb_sum, static_cast<uint64_t>(k) * kQDim + d) /
+                     denom;
+        }
     }
 }
 
@@ -115,26 +94,33 @@ inline uint32_t clamp_code(uint32_t c) {
 
 // Look up + validate one required f32 weight span. Returns nullptr and writes
 // err on missing/misshaped weight (no-fallbacks: init hard-fails upstream).
-const float *find_req(const MimiWeightTable *w, const char *name,
-                      uint64_t expect_len, char *err, size_t errlen) {
+const uint8_t *find_req(const MimiWeightTable *w, const char *name,
+                        int64_t d0, int64_t d1, int64_t d2, char *err,
+                        size_t errlen) {
     const MimiWeight *e = mimi_weight_find(w, name);
     if (e == nullptr) {
         if (errlen) snprintf(err, errlen, "mimi_quant: missing weight '%s'", name);
         return nullptr;
     }
-    if (e->len != expect_len) {
+    const uint32_t rank = d1 < 0 ? 1u : (d2 < 0 ? 2u : 3u);
+    const uint64_t expected = static_cast<uint64_t>(d0) *
+                              (rank >= 2 ? static_cast<uint64_t>(d1) : 1) *
+                              (rank >= 3 ? static_cast<uint64_t>(d2) : 1);
+    const bool shape = e->shape && e->ndim == rank && e->shape[0] == (uint64_t)d0 &&
+                       (rank < 2 || e->shape[1] == (uint64_t)d1) &&
+                       (rank < 3 || e->shape[2] == (uint64_t)d2) &&
+                       e->len == expected;
+    if (!shape) {
         if (errlen)
             snprintf(err, errlen,
-                     "mimi_quant: weight '%s' has %llu elems, expected %llu",
-                     name, (unsigned long long)e->len,
-                     (unsigned long long)expect_len);
+                     "mimi_quant: weight '%s' has wrong rank or shape", name);
         return nullptr;
     }
-    if (e->data == nullptr) {  // review P2: never hand back a null span
+    if (e->bytes == nullptr) {  // review P2: never hand back a null span
         if (errlen) snprintf(err, errlen, "mimi_quant: weight '%s' has null data", name);
         return nullptr;
     }
-    return e->data;
+    return e->bytes;
 }
 
 // Fold one codebook by name-prefix into arena, returning the folded table (or
@@ -144,17 +130,18 @@ const float *fold_codebook_by_prefix(const MimiWeightTable *w, MimiArena *a,
                                      size_t errlen) {
     char name[256];
     snprintf(name, sizeof(name), "%s._codebook.embedding_sum", prefix);
-    const float *emb_sum =
-        find_req(w, name, (uint64_t)kBins * kQDim, err, errlen);
+    const uint8_t *emb_sum =
+        find_req(w, name, kBins, kQDim, -1, err, errlen);
     if (!emb_sum) return nullptr;
 
     snprintf(name, sizeof(name), "%s._codebook.cluster_usage", prefix);
-    const float *usage = find_req(w, name, (uint64_t)kBins, err, errlen);
+    const uint8_t *usage = find_req(w, name, kBins, -1, -1, err, errlen);
     if (!usage) return nullptr;
 
     float *folded =
-        (float *)mimi_arena_alloc(a, (size_t)kBins * kQDim * sizeof(float));
-    fold_codebook(folded, emb_sum, usage);
+        (float *)mimi_arena_alloc_derived(
+            a, (size_t)kBins * kQDim * sizeof(float));
+    if (mimi_arena_building_derived(a)) fold_codebook(folded, emb_sum, usage);
     return folded;
 }
 
@@ -182,7 +169,7 @@ int mimi_quant_init(MimiQuantState **out, const MimiWeightTable *w,
 
     st->out_proj_first =
         find_req(w, "quantizer.rvq_first.output_proj.weight",
-                 (uint64_t)kModelDim * kQDim, err, errlen);
+                 kModelDim, kQDim, 1, err, errlen);
     if (!st->out_proj_first) return 3;
 
     // ---- rvq_rest: 7 codebooks (layers 0..6) + output_proj ---------------
@@ -199,13 +186,12 @@ int mimi_quant_init(MimiQuantState **out, const MimiWeightTable *w,
 
     st->out_proj_rest =
         find_req(w, "quantizer.rvq_rest.output_proj.weight",
-                 (uint64_t)kModelDim * kQDim, err, errlen);
+                 kModelDim, kQDim, 1, err, errlen);
     if (!st->out_proj_rest) return 5;
 
     // ---- scratch ---------------------------------------------------------
-    st->quant_rest    = (float *)mimi_arena_alloc(a, (size_t)kQDim * sizeof(float));
-    st->emb_first_out = (float *)mimi_arena_alloc(a, (size_t)kModelDim * sizeof(float));
-    st->emb_rest_out  = (float *)mimi_arena_alloc(a, (size_t)kModelDim * sizeof(float));
+    st->quant_rest =
+        (float *)mimi_arena_alloc(a, (size_t)kQDim * sizeof(float));
 
     *out = st;
     return 0;
@@ -233,8 +219,9 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
     // The lone lookup row IS the 256-vec; project it straight through.
     const uint32_t c0 = clamp_code(codes[0]);
     const float *row_first = st->emb_first + (size_t)c0 * kQDim;
-    mimi_gemv_f32(st->out_proj_first, row_first, /*bias*/ nullptr,
-                  st->emb_first_out, kModelDim, kQDim);
+    mimi_weight_gemv_rows_f32(st->out_proj_first, row_first,
+                              /*bias*/ nullptr, emb_out, 0, kModelDim,
+                              kQDim, /*accumulate*/ 0);
 
     // ---- rvq_rest (sum 7 lookups in 256-space, then project) -------------
     // quant_rest = emb_rest[0][codes[1]], then += emb_rest[j][codes[1+j]].
@@ -246,12 +233,13 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
         const uint32_t cj = clamp_code(codes[1 + j]);
         vec_add(st->quant_rest, st->emb_rest[j] + (size_t)cj * kQDim, kQDim);
     }
-    mimi_gemv_f32(st->out_proj_rest, st->quant_rest, /*bias*/ nullptr,
-                  st->emb_rest_out, kModelDim, kQDim);
-
     // ---- split sum in 512-space: first + rest ----------------------------
-    std::memcpy(emb_out, st->emb_first_out, (size_t)kModelDim * sizeof(float));
-    vec_add(emb_out, st->emb_rest_out, kModelDim);
+    // The completed rvq_rest dot for each output row is added only after its
+    // reduction, preserving the original two-projection rounding boundary and
+    // final f32 addition while avoiding both projected scratch planes.
+    mimi_weight_gemv_rows_f32(st->out_proj_rest, st->quant_rest,
+                              /*bias*/ nullptr, emb_out, 0, kModelDim,
+                              kQDim, /*accumulate*/ 1);
 }
 
 }  // extern "C"
@@ -268,8 +256,8 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
     then .t())                                   |   row is used directly; .t() is a no-op for T=1
   ResidualVectorQuantization::decode (residual   | mimi_quant_decode: memcpy layer0 then vec_add layers 1..6
     sum over layers)                             |
-  ResidualVectorQuantizer::decode (vq.decode     | mimi_quant_decode: mimi_gemv_f32 with out_proj_{first,rest}
-    then output_proj conv1d)                     |
+  ResidualVectorQuantizer::decode (vq.decode     | mimi_quant_decode: destination-direct row GEMV;
+    then output_proj conv1d)                     |   first overwrites, rest accumulates
   SplitResidualVectorQuantizer::decode           | mimi_quant_decode top level (first + rest)
   EuclideanCodebook::{encode,encode_slow,        | SKIPPED (encode-only / out of scope)
     encode_very_slow}, CodebookEncode CustomOp2  |
@@ -301,7 +289,7 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
   2. output_proj is candle_nn::conv1d_no_bias(qdim, dim, kernel=1, Default cfg)
      => stride 1, padding 0, dilation 1, groups 1, no bias. Weight [out,in,1].
      For a length-1 kernel on a T=1 frame this is exactly y[o]=sum_i W[o,i]*x[i],
-     delegated to mimi_gemv_f32(W[512x256], x[256], null, y[512], 512, 256).
+     delegated to mimi_weight_gemv_rows_f32 over W[512x256] and x[256].
      force_projection=true for BOTH rvqs => output_proj always exists (Some).
   3. VQ-level project_in/project_out are None (codebook_dim==dim==256), so there
      is no 256<->256 linear inside VectorQuantization; only the two conv1d
@@ -322,12 +310,14 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
     += lookup(layer1), += lookup(layer2), ... += lookup(layer6). Sequential in
     layer index, elementwise per dim (no cross-dim reduction). Matches
     ResidualVectorQuantization::decode (`layers[0]` then `enumerate().skip(1)`).
-  - output_proj dot products: owned by mimi_gemv_f32 (shared primitive); its
+  - output_proj dot products: owned by mimi_weight_gemv_rows_f32; its
     documented order is y[m]=sum_{k=0..255} W[m,k]*x[k], f32 accumulate.
-  - Split final sum: emb_out = emb_first_out; then += emb_rest_out, elementwise
-    over the 512 dims. Matches `quantized + rvq_rest.decode(...)`. The two
-    output_projs are applied to their own 256-vecs BEFORE this sum (proj-then-sum,
-    exactly as the Rust does — NOT folded into one projection).
+  - Split final sum: the first projection overwrites emb_out; each completed
+    rest dot is then added to the corresponding emb_out row. This is the same
+    f32 operation and ordering as `emb_first_out + emb_rest_out`, without
+    materializing either output plane. The two output projections still finish
+    their independent reductions BEFORE the sum (proj-then-sum, exactly as the
+    Rust does — NOT folded into one projection).
 
 (e) For the arbiter to re-check:
   - candle broadcast_div / Maximum semantics quoted above are from candle-core
@@ -335,8 +325,8 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
     re-verify the Maximum tie-break and the f32 scalar cast.
   - Whether the parity harness prefers a hard fault over clamp_code on OOB codes.
   - Arena budget: this unit folds 8 codebooks * 2048 * 256 * 4 B = 16 MiB into
-    the arena at init, plus ~4 KiB scratch. Confirm the arena is sized for it.
-  - NEON vec_add has a scalar sibling vec_add_ref under -DMIMI_SCALAR_REF; both
-    are bit-identical (elementwise add). fold_codebook and clamp are scalar-only
-    (init-time / trivial), so they need no _ref.
+    immutable derived plan storage, plus one 256-float (1 KiB) per-conversation
+    residual plane. The two former 512-float projected planes are gone.
+  - vec_add delegates to the shared architecture sweep. fold_codebook and clamp
+    are setup-time / trivial scalar control and have no alternate implementation.
 --------------------------------------------------------------------------- */

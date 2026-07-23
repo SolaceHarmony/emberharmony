@@ -1,5 +1,13 @@
 # liquid_audio → Rust port status
 
+> **Archived oracle history.** This file records the former Rust/Candle
+> transliteration and is not the production ownership ledger. Current LFM2.5
+> production is fully native; it loads main plus `audio_detokenizer/` into one
+> sealed image and routes output through `REQ_AUDIO_DETOKENIZE`. Rust loads no
+> weights and owns no model math. Native Mimi is retained only for future Moshi
+> and is not an LFM2.5 fallback. See `RUST_DELETION_PLAN.md`,
+> `DECODE_ENGINE.md`, and `AUDIO_DETOKENIZER_PORT.md`.
+
 Faithful on the executable inference/training surface, without compatibility
 methods that only returned their inputs or did nothing. Same IO model (the model is a
 **synchronous streaming generator** — async only at the websocket transport, per
@@ -89,8 +97,10 @@ Python's `forward_cached(x, cache) -> (out, cache)` is Rust's in-place
     repo. (candle-transformers' `mimi`, 0.9 *and* 0.10, uses the Encodec-style
     `encoder.layers.N`/weight-norm layout and can NOT load this checkpoint.)
 
-  The loader picks the LFM2 detokenizer if `audio_detokenizer/` is present, else
-  Mimi. Smoke-tested (`mimi_decode_smoke`): codes → finite 24 kHz audio, no torch.
+  The historical Rust loader picked the LFM2 detokenizer when
+  `audio_detokenizer/` was present and otherwise selected Mimi. That fallback
+  no longer exists in production: the native LFM2.5 loader requires the
+  released detokenizer and fails if it is absent.
   Fully vendoring the Mimi codec in-tree (mirroring `liquid_audio/moshi`, ~3.8k
   candle LOC) would drop the external crate — a documented option, not yet done.
 - **Parity**: ✅ verified against the real upstream + actual weights

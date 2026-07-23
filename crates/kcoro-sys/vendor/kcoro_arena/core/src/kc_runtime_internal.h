@@ -2,83 +2,84 @@
 #pragma once
 
 #include "kc_runtime.h"
-#include "kc_descriptor_internal.h"
+#include "kc_doorbell.h"
 #include "kcoro_port.h"
-#include "kcoro_stackless.h"
+#include "koro_internal.h"
 
 #include <stdatomic.h>
 
-struct kc_op;
-struct kc_chan;
-struct kc_scope;
-struct kc_ticket;
+struct kc_service;
+typedef void (*kc_runtime_test_claim_fn)(void *context, uint32_t worker,
+                                         uint32_t slot);
+typedef void (*kc_runtime_test_register_fn)(void *context,
+                                            struct kc_runtime *runtime,
+                                            uint32_t slot);
+
+enum { KC_RUNTIME_CONTINUATIONS_PER_WORKER = 64 };
+
+typedef struct kc_runtime_worker {
+    struct kc_runtime *runtime;
+    unsigned index;
+    KC_THREAD_T thread;
+} kc_runtime_worker;
 
 struct kc_runtime {
     atomic_uint refs;
     KC_MUTEX_T mu;
-    KC_COND_T work_cv;
-    KC_COND_T lifecycle_cv;
-    koro_cont_t *head;
-    koro_cont_t *tail;
-    size_t queued;
-    size_t running;
-    size_t waiting;
-    size_t active;
-    struct kc_op *ops_head;
-    size_t live_operations;
-    struct kc_chan *channels_head;
-    size_t live_channels;
-    struct kc_scope *scopes_head;
-    size_t live_scopes;
-    struct kc_ticket *tickets;
-    struct kc_ticket *completion_head;
-    struct kc_ticket *completion_tail;
-    uint32_t ticket_capacity;
-    uint32_t ticket_free_head;
-    size_t live_tickets;
-    size_t completion_queued;
-    size_t completion_running;
-    KC_MUTEX_T timer_mu;
-    KC_COND_T timer_cv;
-    KC_THREAD_T timer_thread;
-    struct kc_op *timer_head;
-    size_t live_timers;
-    int timer_started;
-    int timer_stop;
+    kc_doorbell_t *lifecycle_doorbell;
+    kc_doorbell_t *work_doorbell;
+    atomic_size_t queued;
+    atomic_size_t running;
+    atomic_size_t active;
+    atomic_uint lifecycle_waiters;
+    atomic_uint_fast64_t progress;
+    struct kc_service *services_head;
+    size_t live_services;
+    size_t live_continuations;
     unsigned worker_count;
-    KC_THREAD_T *workers;
-    uint64_t epoch;
+    kc_runtime_worker *workers;
+    size_t continuation_capacity;
+    size_t ready_word_count;
+    _Atomic(koro_cont_t *) *continuations;
+    atomic_uint *slot_gates;
+    atomic_uint_fast64_t *ready_words;
+    uint32_t *slot_generations;
+    atomic_uint next_ready_word;
+    atomic_uint next_affinity_worker;
+    atomic_uint test_claim_armed;
+    kc_runtime_test_claim_fn test_claim_pause;
+    void *test_claim_context;
+    atomic_uint test_register_armed;
+    kc_runtime_test_register_fn test_register_pause;
+    void *test_register_context;
+    uint64_t runtime_epoch;
     atomic_uint_fast64_t next_sequence;
-    size_t arena_segment_size;
-    kc_descriptor_registry descriptors;
     int accepting;
+    int starting;
     int started;
     int stop_requested;
-    int worker_stop;
+    atomic_uint worker_stop;
+    int joining;
     int joined;
-    int legacy_break;
     atomic_uint_fast64_t wake_requests;
     atomic_uint_fast64_t resumes;
-    atomic_uint_fast64_t terminal_causes[KC_CAUSE_FAILURE + 1];
 };
 
-kc_runtime_t *kc_runtime_default_get(void);
-void kc_runtime_default_clear(kc_runtime_t *runtime);
 void kc_runtime_retain_internal(kc_runtime_t *runtime);
 void kc_runtime_release_internal(kc_runtime_t *runtime);
-int kc_runtime_enqueue_internal(kc_runtime_t *runtime, koro_cont_t *cont,
-                                int from_state);
-void kc_runtime_wake_internal(koro_cont_t *cont);
-void kc_runtime_legacy_break(kc_runtime_t *runtime);
-uint64_t kc_runtime_next_sequence(kc_runtime_t *runtime);
-void kc_runtime_register_op(kc_runtime_t *runtime, struct kc_op *op);
-void kc_runtime_unregister_op(kc_runtime_t *runtime, struct kc_op *op);
-void kc_runtime_register_channel(kc_runtime_t *runtime, struct kc_chan *channel);
-void kc_runtime_unregister_channel(kc_runtime_t *runtime, struct kc_chan *channel);
-void kc_runtime_register_scope(kc_runtime_t *runtime, struct kc_scope *scope);
-void kc_runtime_unregister_scope(kc_runtime_t *runtime, struct kc_scope *scope);
-int kc_runtime_spawn_internal(kc_runtime_t *runtime, kc_runtime_step_fn step,
-                              void *arg, size_t local_size,
-                              void (*completion)(void *), void *context);
-int kc_runtime_timer_arm(struct kc_op *op, uint64_t deadline_ns);
-void kc_runtime_timer_disarm(struct kc_op *op);
+int kc_runtime_register_continuation_internal(kc_runtime_t *runtime,
+                                              koro_cont_t *continuation);
+int kc_runtime_unregister_continuation_internal(kc_runtime_t *runtime,
+                                                koro_cont_t *continuation);
+int kc_runtime_start_continuation_internal(koro_cont_t *continuation);
+int kc_runtime_resume_continuation_internal(koro_cont_t *continuation);
+void kc_runtime_publish_service_internal(kc_runtime_t *runtime,
+                                         const koro_cont_t *continuation);
+void kc_runtime_retire_service_internal(kc_runtime_t *runtime,
+                                        const koro_cont_t *continuation);
+void kc_runtime_ring_workers_internal(kc_runtime_t *runtime);
+int kc_runtime_work_realtime_safe_internal(const kc_runtime_t *runtime);
+int kc_runtime_is_current_worker_internal(const kc_runtime_t *runtime);
+int kc_runtime_is_current_cont_internal(const koro_cont_t *continuation);
+uint64_t kc_runtime_affinity_mask_internal(kc_runtime_t *runtime);
+void kc_runtime_signal_lifecycle_internal(kc_runtime_t *runtime);

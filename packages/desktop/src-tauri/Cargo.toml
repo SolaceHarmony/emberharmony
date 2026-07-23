@@ -34,7 +34,6 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-crossbeam-channel = "0.5"
 tokio = { version = "1.48.0", features = ["sync", "macros"] }
 listeners = "0.3"
 tauri-plugin-os = "2"
@@ -44,7 +43,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 uuid = { version = "1.19.0", features = ["v4"] }
 tauri-plugin-decorum = "1.1.1"
 comrak = { version = "0.50", default-features = false }
-candle-core = "0.9"
 # HF token storage in the OS keychain (macOS Keychain / Windows Credential Manager /
 # Linux Secret Service). The token never lands in the settings JSON — see voice::model.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
@@ -62,12 +60,9 @@ webkit2gtk = "=2.0.2"
 objc2 = "0.6"
 objc2-web-kit = "0.3"
 window-vibrancy = "0.7"
-# The native voice engine (pure-Rust LFM2-Audio realtime pipeline) compiled INTO the
-# desktop binary — capture → model → playback runs in-process on real OS threads (the
-# `RealtimePipeline` worker), driven directly by the `voice_start` Tauri command, with no
-# Bun/Node sidecar. On Apple Silicon the `metal` feature gives bf16 GPU generation =
-# real-time. See the root `crates/liquid-audio` native engine.
-liquid-audio = { path = "../../../crates/liquid-audio", features = ["metal"] }
+# Native Flashkern voice lifecycle and PCM dock. Candle/Metal is oracle-only and
+# is deliberately absent from the shipped desktop dependency graph.
+liquid-audio = { path = "../../../crates/liquid-audio" }
 
 # Linux CPU build of the same native runtime. Windows/MSVC is intentionally not a
 # release target until kcoro and flashkern have a real Windows port.

@@ -11,8 +11,8 @@ defines the native in-memory state that architecture will capture.
 ## Goal
 
 Create one native `LfmConversation` per live activity. Keep every numerical
-step, sampler, and state mutation native while the Rust kcoro continuation owns
-the recurrence policy:
+step, sampler, state mutation, and model recurrence decision native. Rust kcoro
+owns only the independent PCM/control docking continuations:
 
 ```text
 append input -> direct embedding assembly -> suffix prefill -> token pass
@@ -36,7 +36,7 @@ completed pass boundary; it does not reload weights or replay a text transcript.
 | full `prefill_inputs` | `lfm2_audio.rs:1169-1305` | Replace combined tensor + index selection with direct per-modality writes. |
 | suffix `prefill_suffix` | `lfm2_audio.rs:758-928` | Preserve cursor validation and encode only unforwarded ranges. |
 | native one-token rim | `lfm2_audio.rs:1428-1480` | Remove per-token `Vec`, Candle tensor reconstruction, and optional fallback. |
-| generation recurrence | `lfm2_audio.rs:1630-1743` | Move token pass, sample, append, and modality result production into C++; let Rust kcoro choose the next typed pass from compact CQ facts. |
+| generation recurrence | `lfm2_audio.rs:1630-1743` | Move token pass, sample, append, modality result production, and next-pass selection into native conversation control. Rust receives no per-pass CQ fact. |
 | sampling policy | `lfm2_audio.rs:199-281` and `flashkern_engine.cpp:776-896` | Native collective is mounted for greedy, temperature, threshold top-k with ties, and seeded categorical draws. Preserve the single shared draw stream across text and every audio codebook while moving its opaque state into `LfmConversation`. |
 | Depthformer fallback | `lfm2_audio.rs:1335-1359` | The native frame graph is mounted; retain only as a parity oracle until the token-exact/e2e gate, then delete it rather than shipping a legacy mode. |
 | native Depthformer rim | `lfm2_audio.rs:1361-1390`, `decode.rs:466-551`, and `flashkern_engine.cpp:run_depth_frame` | Typed C++ frame pass is built. Rust lane arithmetic, `REQ_CALL`, `SpinBarrier`, hidden-row copy, logits Tensor reconstruction, and nested sampler ABI are deleted. Move the small token result and RNG image into native conversation state next. |
@@ -257,16 +257,16 @@ prepare, preserving the shutdown rule already covered by the realtime tests.
 
 ## Callback-Driven Generation
 
-The resident coordinator owns this state machine. Native passes own every
-numerical box; Rust owns the policy edges between boxes:
+The resident native continuation owns this state machine. Native passes own
+every numerical box and native tickets own every policy edge between boxes:
 
 ```mermaid
 flowchart TD
-    READY["prefill complete"] --> DOOR{"Rust scope current and work remains?"}
+    READY["prefill complete"] --> DOOR{"native scope current and work remains?"}
     DOOR -->|yes| TOKEN["backbone token pass"]
     DOOR -->|no| CLOSE["finish or stale turn boundary"]
     TOKEN --> COMPLETE["native sample + state append + CQ"]
-    COMPLETE --> MODE{"Rust compact-result policy"}
+    COMPLETE --> MODE{"native modality policy"}
     MODE -->|text token| EVENT["publish bounded text event"]
     MODE -->|audio modality| DEPTH["typed native Depthformer pass"]
     DEPTH --> APPEND["native codebook state append + CQ"]
@@ -274,15 +274,16 @@ flowchart TD
     CODEC -->|yes| PCM["decode into playback reservation"]
     CODEC -->|no| EVENT
     PCM --> EVENT
-    EVENT --> NEXT["Rust continuation selects next typed pass"]
+    EVENT --> NEXT["native continuation selects next typed pass"]
     NEXT --> DOOR
 ```
 
 A **full token pass** includes backbone recurrence, the selected head,
-sampling, and append to conversation state. It owns one single-shot child ticket
-under the turn action. Flashkern completion publishes terminal facts and compact
-result IDs, then rings the Rust coordinator doorbell; the resumed continuation
-consumes that authoritative disposition and may create the next child.
+sampling, and append to conversation state. It owns one single-shot native child
+ticket under the turn action. Flashkern completion publishes terminal facts to
+the native CQ; the resumed native continuation consumes that authoritative
+disposition and may create the next child. Tokens and pass completions do not
+cross Rust.
 Stop/interrupt is inspected
 before dispatching the next token pass, not inside GEMV, attention, Depthformer,
 or codec kernels. A
@@ -342,7 +343,7 @@ Hot expansion is assembly on both production architectures:
 
 `REQ_PRNG` at `native/src/engine/flashkern_engine.cpp:159` and
 `lfm_engine_prng_fill` at `1663-1675` form a typed conformance leaf. It proves
-retained descriptor -> Rust kcoro SQ -> fixed Flashkern lanes -> CQ completion
+retained descriptor -> native SQ -> fixed Flashkern lanes -> native CQ completion
 without moving the state or output payload through a channel. It is deliberately
 **not** a ticket-per-draw product design.
 
@@ -367,8 +368,8 @@ The PRNG conformance tests in
 published zero-key/zero-nonce blocks, exact state/cursor advancement, replay
 from both empty and partially consumed block snapshots, real SQ/CQ/fence
 counters, and Apple system seeding. They pass on aarch64 and through the
-repository's local-only x86_64 Rosetta gate
-(`crates/liquid-audio/scripts/test-rosetta.sh`). A native x86_64 runner remains
+repository's local-only x86_64 Rosetta gate (`cargo test -p kcoro-sys -p
+liquid-audio --target x86_64-apple-darwin -- --test-threads=1`). A native x86_64 runner remains
 required for ISA features that Rosetta does not advertise; the SSE2 ChaCha block
 itself executes and passes under Rosetta.
 
@@ -384,35 +385,35 @@ advance, and clearing one plan leaves the other runnable.
 
 The probability policy mounts as one native subprogram of the token or
 Depthformer pass, not as a serial helper and not as a chain of kcoro tickets.
-The fixed Flashkern lanes are its CPU threadgroup. `lane_fence` is the exact
-equivalent of a GPU `threadgroup_barrier`: it publishes a logical generation,
-blocks declared peers through the zero-spin wait word, and lets the last arriver
-perform the bounded serial fold.
+The fixed Flashkern team is its CPU threadgroup. Each sampler phase is one
+non-suspending team generation. Every member returns; the final return performs
+the bounded serial fold and advances the same ticket's durable sampler phase.
+No lane or host thread waits at an internal barrier.
 
 The stage plan is:
 
 1. Partition the vocabulary into stable contiguous lane shards. Each lane reads
    logits in place, applies the configured temperature, and writes its local
    maximum to lane-private scratch.
-2. Fence. The last arriver folds maxima in lane order. The as-built threshold
-   top-k scan uses an engine-owned, preallocated min-heap containing values only;
+2. Full-team return. The final return folds maxima in lane order. The as-built
+   threshold top-k scan uses an engine-owned, preallocated min-heap containing values only;
    it never copies the logits payload, allocates during the pass, sorts a vector,
    or truncates boundary ties. A future measured optimization may shard candidate
    heaps per lane without changing the sampling ABI or draw order.
 3. Each lane computes masked `exp(logit - global_max)` weights and one local sum.
    The selected approximation and F32 rounding ladder are fixture-pinned.
-4. Fence. The last arriver folds sums in lane order and publishes deterministic
-   per-lane prefix intervals plus the total mass.
+4. Full-team return. The final return folds sums in lane order and publishes
+   deterministic per-lane prefix intervals plus the total mass.
 5. The serial section consumes exactly one value from the conversation's shared
    `LfmPrngStateV1` and maps it into `[0, total_mass)`. The one lane owning
    that interval scans only its shard to resolve the first crossing token.
-6. Fence. The winner publishes one token ID; native code appends it and advances
-   sampler/context state before the pass completion becomes visible.
+6. The terminal team return publishes one token ID; native code appends it and
+   advances sampler/context state before the pass completion becomes visible.
 
 Greedy mode uses the same first reduction and deterministic index tie-break,
 then skips probability and PRNG stages. Invalid configuration, empty support,
 or nonfinite-policy failure is detected before sampler or conversation mutation.
-Barrier count is plan metadata and a regression metric; adjacent stages may be
+Phase/dispatch count is plan metadata and a regression metric; adjacent stages may be
 fused only when the same parity fixtures prove the published generation facts
 are unchanged.
 
@@ -436,27 +437,18 @@ lane program:
 sampler callback, BF16 hidden copy, Rust lane arithmetic, `SpinBarrier`, and
 `REQ_CALL` dependency have disappeared. Each model installs an immutable plan;
 multiple plans coexist by identity, while C++ owns mutable frame scratch and KV.
-The remaining Candle op chain at `lfm2_audio.rs:1335-1359` is a parity seam to
-delete after the token-exact/e2e gate, not a supported final mode.
+The old Candle op chain remains source-only behind the offline `oracle` feature;
+it is not linked or reachable in the production graph and still awaits the
+physical oracle-crate move tracked by design 14.
 
 ## Codec Plan and State
 
-The current `NativeMimi` has the right arithmetic and the wrong ownership for
-the final runtime:
-
-- `mimi_decoder_new_from_file` opens a second resident image
-  (`native/src/mimi/mimi_decode.cpp:776-850`);
-- `MimiDecoder` owns a fixed 256 MiB arena (`mimi_decode.cpp:674-729`);
-- Rust serializes it with a mutex and allocates `Vec<f32>` per frame
-  (`mimi_native.rs:35-45`, `92-109`).
-
-Split it into:
+The production plan/state split is landed:
 
 ```c++
 struct MimiDecodePlan {             // model lifetime
-    LfmModelImageRef image;
-    MimiWeightBindings weights;
-    MimiShape shape;
+    WeightViewBindings weights;     // non-owning codec-component views
+    DerivedTables tables;           // formula-changing and accounted
 };
 
 struct MimiDecodeState {            // conversation lifetime
@@ -474,13 +466,15 @@ int mimi_decode_into(const MimiDecodePlan *, MimiDecodeState *,
 
 `MimiDecodePlan` binds views into the model component loaded in document 02.
 `MimiDecodeState` contains only mutable streaming state and right-sized scratch.
-The fixed native executor has exclusive ownership while the codec pass runs, so
-no Rust mutex is involved in codec arithmetic or state mutation.
+Typed `REQ_MIMI_DECODE` gives the native executor exclusive ownership while the
+codec pass runs, so no Rust mutex is involved in product codec arithmetic or
+state mutation. The old from-file `NativeMimi` wrapper is compiled only for the
+offline oracle and is absent from the production archive.
 
 Before decode, reserve a contiguous playback block of at least the codec's
 declared maximum output. `mimi_decode_into` writes directly to that reservation;
-publication advances its ready state. No PCM `Vec`, CPU Tensor, event payload,
-or second ring copy exists. The current stage sequence at
+publication advances its ready state. No production PCM `Vec`, CPU tensor
+object, event payload, or second ring copy exists. The current stage sequence at
 `mimi_decode.cpp:850-889` remains quantizer -> upsample -> transformer -> SEANet.
 
 Codec reset is a conversation operation. Playback flush advances output epoch
@@ -525,12 +519,9 @@ exact capture and ticket boundaries needed by spec 10:
   execute outside audio, fixed compute, completion, and coordination workers.
 
 The image, delta, WAL, branch, and compaction protocols remain owned by
-`specs/10-stateful-multi-agent-runtime.md:583-949`. In particular, long-running
-conversation images use immutable base/delta objects and A/B manifests. They do
-not use kcoro's current append-only `kc_wal_snapshot_write` implementation at
-`/Volumes/stuff/Projects/kotlinmania/kcoro_arena/core/src/kc_wal.c:535-580`.
-The WAL contains small transactional facts and checkpoint associations, not
-model-state pages.
+`specs/10-stateful-multi-agent-runtime.md:583-949`. Long-running conversation
+images use immutable base/delta objects and A/B manifests; their writer
+publishes a durable ticket edge back to the retained continuation.
 
 ## Implementation Order
 
@@ -542,13 +533,14 @@ model-state pages.
 6. Add suffix prefill with strict cursor/mark validation.
 7. **Partly complete:** text-head sampling, probability policy, and PRNG
    consumption now run in the token/frame pass. Move opaque stream ownership,
-   state append, and modality result production into `LfmConversation`, then
-   route only compact completion facts to the Rust coordinator.
+   state append, modality result production, and recurrence into
+   `LfmConversation`; expose only PCM/control/observer facts to Rust.
 8. **Complete:** mount Depthformer as `REQ_DEPTH_FRAME` without `REQ_CALL`, Rust
    lane arithmetic, `SpinBarrier`, hidden-row copy, or nested sampler ABI. Move
    its small result span and shared RNG image into native conversation state with
    the recurrence work in step 7.
-9. Split Mimi plan/state ownership and decode directly to playback blocks.
+9. **Complete:** split Mimi plan/state ownership and decode directly to playback
+   reservations through the typed native pass.
 10. Move native tokenizer piece decoding into the notification continuation.
 11. Mount speculative candidate commit/rollback.
 12. Expose quiesce, context switch, and dirty-range hooks needed by spec 10.
@@ -556,9 +548,11 @@ model-state pages.
     slots without mounting a disk writer on a model executor.
 14. Prove no Tauri command reaches the one-shot LFM2 custom detokenizer, capture
     any required fixtures, and delete it.
-15. Remove production `ChatState`, `ConversationState`, `Lfm2VoiceEngine`,
-   Candle cache, generation callbacks, and `NativeMimi` Rust rim only after all
-   gates pass.
+15. **Complete for the production graph:** remove `ChatState`,
+   `ConversationState`, `Lfm2VoiceEngine`, Candle cache, generation callbacks,
+   and the `NativeMimi` Rust rim from shipped inference. Remaining source is
+   oracle-feature-only and still needs the physical crate move tracked by
+   design 14.
 
 ## Acceptance Gates
 
@@ -582,8 +576,10 @@ model-state pages.
   pass is never left half-mutated.
 - A partial generated response is present in conversation state even when its
   playback epoch was flushed.
-- Mimi writes directly into the reserved playback block, allocates zero bytes
-  per frame, and shares immutable weights across conversations.
+- Mimi writes directly into an equal-rate playback block; otherwise its
+  conversation-owned codec plane feeds the prepared native resampler that writes
+  the device-rate block. Both paths allocate zero bytes per frame and share
+  immutable weights across conversations.
 - Switching between two hot conversations changes no model-weight address and
   resumes each at its exact next token/codec state.
 - Conversation quiesce reports zero active passes before image capture.

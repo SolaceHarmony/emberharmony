@@ -20,6 +20,7 @@ export const DialogSelectMcp: Component = () => {
 
   const toggle = async (name: string) => {
     if (loading()) return
+    if (sync.data.mcp[name]?.status === "connecting") return
     setLoading(name)
     const status = sync.data.mcp[name]
     if (status?.status === "connected") {
@@ -67,6 +68,9 @@ export const DialogSelectMcp: Component = () => {
                   <Show when={status() === "connected"}>
                     <span class="text-11-regular text-text-weaker">{language.t("mcp.status.connected")}</span>
                   </Show>
+                  <Show when={status() === "connecting"}>
+                    <span class="text-11-regular text-text-weaker">{language.t("mcp.status.connecting")}</span>
+                  </Show>
                   <Show when={status() === "failed"}>
                     <span class="text-11-regular text-text-weaker">{language.t("mcp.status.failed")}</span>
                   </Show>
@@ -85,7 +89,11 @@ export const DialogSelectMcp: Component = () => {
                 </Show>
               </div>
               <div onClick={(e) => e.stopPropagation()}>
-                <Switch checked={enabled()} disabled={loading() === i.name} onChange={() => toggle(i.name)} />
+                <Switch
+                  checked={enabled()}
+                  disabled={loading() === i.name || status() === "connecting"}
+                  onChange={() => toggle(i.name)}
+                />
               </div>
             </div>
           )

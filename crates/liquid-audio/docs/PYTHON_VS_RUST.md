@@ -1,14 +1,19 @@
-# Python vs Rust — `liquid_audio` → `liquid-audio-rs` Port Report
+# Historical Python vs Rust Oracle Port Report
+
+Status: **historical numerical archaeology, not a production architecture or
+current command guide.** The Rust/Candle inference port described below has
+been deleted. Production loads and executes the model only through native
+C++/kcoro/Flashkern. Git history, not a retained second inference or training
+path, preserves the implementation this report measured.
 
 Scope: the pure-Rust **candle** port of Liquid AI's `liquid_audio` (LFM2.5-Audio-1.5B)
 against the upstream Python. "Same" = verified numerically/structurally identical;
 "Differ" = a deliberate substitution, with the reason. No torch and no callable
 no-op shims for Python-only framework bookkeeping.
 
-All figures below were regenerated, not recalled:
-- `cargo test --lib` → **31 passed**
-- `cargo test --test parity --release -- --ignored` (vs Python-dumped golden tensors,
-  on `Device::Cpu`, f32) → **8/8 passed**
+When this historical record was produced, its deleted oracle harness reported
+31 unit gates and 8/8 Python-dumped golden cases on CPU f32. Those counts do not
+describe the current native suite.
 
 ---
 
@@ -38,7 +43,7 @@ intentional omissions rather than empty Rust methods.
 
 These are **f32 relative errors at the 1e-6 level** — i.e. the two implementations
 agree to f32 round-off. The depthformer is **exactly** equal token-for-token, and
-`examples/generate.rs` reproduces the upstream reference text token-for-token
+The deleted historical generator reproduced the upstream reference text token-for-token
 ("Handcrafted Woodworking, Precision Made for You").
 
 ### 1.4 Why it is *not* bit-identical — the cross-library floor (and what was repaired)
@@ -308,12 +313,14 @@ code path runs the faithful regime on CPU and Metal.
 
 ---
 
-## Reproduce
+## Current verification
 
 ```sh
-cd liquid-audio-rs
-export LFM_MODEL_DIR=../model
-cargo test --lib                                       # 31 passed
-cargo test --test parity --release -- --ignored --nocapture   # 8/8 byte-exact
-LFM_MODEL_DIR=../model cargo run --release --example generate # end-to-end, CPU BF16 via NEON
+cmake -S crates/kcoro-sys/vendor/kcoro_arena -B build/kcoro
+cmake --build build/kcoro
+ctest --test-dir build/kcoro
+make -C crates/liquid-audio/native/tools
 ```
+
+The comparisons above are historical formula evidence. They are not a
+callable Python/Rust/Candle path and cannot select production behavior.

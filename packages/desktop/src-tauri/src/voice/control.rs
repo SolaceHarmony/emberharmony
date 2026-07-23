@@ -11,7 +11,6 @@
 use crate::settings::{self, VoiceProvider, VoiceSettings};
 use crate::{ServerReadyData, ServerState};
 use liquid_audio::AudioStatsSnapshot;
-use liquid_audio::moshi::models::realtime_moshi_files;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -188,27 +187,23 @@ fn local_engine_mode(settings: &VoiceSettings) -> Result<Option<VoiceEngineMode>
 }
 
 fn local_model_ready(settings: &VoiceSettings) -> Result<bool, String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "Native voice is unavailable on this platform until a production monotonic deadline backend is installed."
+                .into(),
+        );
+    }
     match settings.lfm2.engine {
         settings::LocalVoiceEngine::Lfm2Interleaved => {
             let Some(dir) = settings::lfm2_active_model_dir(&settings.lfm2) else {
                 return Ok(false);
             };
-            if realtime_moshi_files(&dir)
-                .map_err(|e| format!("failed to inspect local voice model: {e}"))?
-                .is_some()
-            {
-                return Err("Selected local engine is LFM2-Audio, but the directory contains a Moshi realtime snapshot. Switch Local engine to Moshi realtime or choose an LFM2-Audio snapshot.".into());
-            }
-            Ok(true)
+            Ok(dir.is_dir())
         }
-        settings::LocalVoiceEngine::MoshiRealtime => {
-            let Some(dir) = settings::moshi_model_dir(&settings.lfm2) else {
-                return Ok(false);
-            };
-            realtime_moshi_files(&dir)
-                .map(|files| files.is_some())
-                .map_err(|e| format!("failed to inspect Moshi realtime snapshot: {e}"))
-        }
+        settings::LocalVoiceEngine::MoshiRealtime => Err(
+            "Moshi realtime inference is offline-oracle only in this release; select native LFM2 interleaved. No Candle fallback is linked."
+                .into(),
+        ),
     }
 }
 
@@ -303,10 +298,9 @@ pub enum Role {
 
 /// An event streamed to the webview during a voice session.
 ///
-/// Covers both the Phase-1 turn flow (the Liquid AI demo: `Transcript` streams the reply text,
-/// `AudioClip` delivers the decoded reply for an `<audio>` player) and the Phase-2 live flow
-/// (`Level` drives the visualizer since native audio never enters the webview as a track —
-/// see `FRONTEND_DESIGN.md`).
+/// Transcript and state records cross the UI boundary. Native PCM remains in
+/// the playback dock; `Level` is the lossy visualizer projection described in
+/// `FRONTEND_DESIGN.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum VoiceEvent {
@@ -317,49 +311,10 @@ pub enum VoiceEvent {
     /// audio amplitude (RMS) for the bar visualizer — the native path has no
     /// `MediaStreamTrack` in the webview, so the loop emits this instead.
     Level { rms: f32 },
-    /// the decoded audio reply as a WAV clip (turn mode → inline `<audio>` player).
-    AudioClip { wav: Vec<u8>, ms: u32 },
     /// the session ended (cleanly, or with a reason)
     Ended { reason: Option<String> },
     /// an error occurred
     Error { message: String },
-}
-
-/// The Liquid AI demo's three modes — same model, different system prompt + generate path.
-/// (`audio-model.js`: `Perform ASR.` / `Perform TTS. Use the UK female voice.` /
-/// `Respond with interleaved text and audio.`)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TurnMode {
-    /// audio in → text out (transcription). `generate_sequential`, text only.
-    Asr,
-    /// text in → audio out (speech). `generate_sequential`, text then audio.
-    Tts,
-    /// audio (± text) in → interleaved text + audio out. `generate_interleaved`.
-    Interleaved,
-}
-
-impl TurnMode {
-    /// The demo's per-mode system prompt (verbatim from `audio-model.js`).
-    pub fn system_prompt(self) -> &'static str {
-        match self {
-            TurnMode::Asr => "Perform ASR.",
-            TurnMode::Tts => "Perform TTS. Use the UK female voice.",
-            TurnMode::Interleaved => "Respond with interleaved text and audio.",
-        }
-    }
-
-    /// The mode's decoding regime from Settings. Defaults per mode mirror the
-    /// demo (`audio-model.js`): ASR greedy/100, TTS text 0.7 + audio
-    /// 0.8/top-64/1024 — except the interleaved budget, which is OUR raised
-    /// 8192 (the demo ships `DEFAULT_MAX_TOKENS_AUDIO = 1024` ≈ 1 min).
-    pub fn sampling(self, lfm2: &settings::Lfm2Settings) -> &settings::Lfm2ModeSampling {
-        match self {
-            TurnMode::Asr => &lfm2.asr,
-            TurnMode::Tts => &lfm2.tts,
-            TurnMode::Interleaved => &lfm2.interleaved,
-        }
-    }
 }
 
 /// Start a voice session for the configured provider.
@@ -554,12 +509,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), "{}").unwrap();
         let path = dir.to_string_lossy().into_owned();
-        // This test exercises the LFM2-Audio readiness path; the DEFAULT local
-        // engine is Moshi realtime (which inspects a different snapshot), so pin
-        // the engine the test is named for.
+        // This test exercises the LFM2-Audio snapshot resolver explicitly.
         let mut s = settings(VoiceProvider::Lfm2, Some(&path));
         s.lfm2.engine = crate::settings::LocalVoiceEngine::Lfm2Interleaved;
-        assert!(plan(&s).ready);
+        let result = plan(&s);
+        #[cfg(target_os = "macos")]
+        assert!(result.ready);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!result.ready);
+            assert!(result.detail.contains("monotonic deadline backend"));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

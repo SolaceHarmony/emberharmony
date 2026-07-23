@@ -13,7 +13,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,6 @@ use serde_json::{Value, json};
 
 const SESSION_BRIDGE_CONNECT_TIMEOUT_SECS: u64 = 10;
 const SESSION_BRIDGE_READ_TIMEOUT_SECS: u64 = 1;
-const SESSION_BRIDGE_CANCEL_POLL_MS: u64 = 50;
 const SESSION_BRIDGE_ERROR_BODY_CAP: usize = 8 * 1024;
 const SESSION_BRIDGE_SSE_BUFFER_CAP: usize = 256 * 1024;
 
@@ -65,6 +64,56 @@ pub struct SessionBridgeModel {
 pub enum SessionBridgeEvent {
     Delta { reply_id: String, text: String },
     Done,
+}
+
+/// Reset-free cancellation source shared by delegated turns. A turn captures
+/// one generation; cancellation advances it and publishes an async edge.
+/// Starting a later turn never clears state belonging to an older one.
+#[derive(Default)]
+pub struct CancelSignal {
+    generation: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelSignal {
+    pub fn scope(self: &Arc<Self>) -> CancelScope {
+        CancelScope {
+            signal: Arc::clone(self),
+            generation: self.generation.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+pub struct CancelScope {
+    signal: Arc<CancelSignal>,
+    generation: u64,
+}
+
+impl CancelScope {
+    pub fn is_cancelled(&self) -> bool {
+        self.signal.generation.load(Ordering::Acquire) != self.generation
+    }
+
+    pub fn cancel(&self) {
+        self.signal.cancel();
+    }
+
+    async fn cancelled(&self) {
+        let notified = self.signal.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+        debug_assert!(self.is_cancelled());
+    }
 }
 
 /// A parsed server SSE event, narrowed to the variants the turn loop cares about.
@@ -283,7 +332,7 @@ impl TurnReducer {
 pub async fn run_turn(
     cfg: SessionBridgeConfig,
     text: String,
-    cancel: Arc<AtomicBool>,
+    cancel: CancelScope,
     mut sink: impl FnMut(SessionBridgeEvent) -> bool + Send + 'static,
 ) -> Result<(), String> {
     if text.trim().is_empty() {
@@ -310,7 +359,7 @@ pub async fn run_turn(
     let start = Instant::now();
     let mut reducer = TurnReducer::new(&cfg.session_id, 0);
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
             abort_prompt(&client, &cfg).await;
             return Ok(());
         }
@@ -340,7 +389,7 @@ pub async fn run_turn(
                 // `next_event` yields Ok(None) BOTH for a closed SSE stream and for
                 // a cancellation racing the read — a user Stop mid-delegation must
                 // end the turn quietly, not surface as a session error.
-                if cancel.load(Ordering::SeqCst) {
+                if cancel.is_cancelled() {
                     abort_prompt(&client, &cfg).await;
                     return Ok(());
                 }
@@ -398,13 +447,18 @@ async fn open_events(
 
 async fn next_event(
     stream: &mut SseStream,
-    cancel: &Arc<AtomicBool>,
+    cancel: &CancelScope,
 ) -> Result<Option<SessionEvent>, String> {
     loop {
         if let Some(event) = drain_event(&mut stream.buffer) {
             return Ok(Some(event));
         }
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let cancelled = cancel.cancelled();
+        tokio::pin!(cancelled);
+        if cancel.is_cancelled() {
             return Ok(None);
         }
         let chunk = tokio::select! {
@@ -414,7 +468,7 @@ async fn next_event(
                 };
                 chunk?
             }
-            _ = wait_cancel(cancel) => {
+            _ = &mut cancelled => {
                 return Ok(None);
             }
         };
@@ -462,9 +516,9 @@ async fn post_prompt(
     client: &reqwest::Client,
     cfg: &SessionBridgeConfig,
     text: &str,
-    cancel: &Arc<AtomicBool>,
+    cancel: &CancelScope,
 ) -> Result<(), String> {
-    if cancel.load(Ordering::SeqCst) {
+    if cancel.is_cancelled() {
         return Ok(());
     }
     let mut body = json!({
@@ -506,17 +560,6 @@ async fn post_prompt(
     let status = response.status();
     let body = capped_error_body(response).await;
     Err(format!("session prompt failed: {status} {body}"))
-}
-
-async fn wait_cancel(cancel: &Arc<AtomicBool>) {
-    let mut poll = tokio::time::interval(Duration::from_millis(SESSION_BRIDGE_CANCEL_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            return;
-        }
-        poll.tick().await;
-    }
 }
 
 async fn capped_error_body(response: reqwest::Response) -> String {
@@ -614,7 +657,6 @@ pub(crate) fn url_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt as _;
 
     const SID: &str = "ses_test";
 
@@ -825,7 +867,7 @@ mod tests {
             .boxed(),
             buffer: Vec::new(),
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(CancelSignal::default()).scope();
 
         assert_eq!(
             next_event(&mut stream, &cancel).await.unwrap(),
@@ -857,7 +899,7 @@ mod tests {
                 .boxed(),
             buffer: Vec::new(),
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(CancelSignal::default()).scope();
         let err = next_event(&mut stream, &cancel).await.unwrap_err();
 
         assert!(err.contains("session event frame exceeded"));

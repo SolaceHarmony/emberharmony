@@ -1,197 +1,259 @@
-# Coordination Contract: Callbacks, the Docking Ring, and Structured Control
+# Coordination Contract
 
-Status: normative contract. This document governs the Rust coordinator
-direction and binds every layer boundary. Subsystem documents own their
-mechanics. The package head and documents 00, 01, 03, 07, 10, 11, and 12 are
-reconciled to this contract in the same implementation series.
+Status: normative. This file owns the meaning of callback-driven progress,
+scope control, and the product/native boundary.
 
-## Implemented Foundation And First Production Mount
+## One Sentence
 
-Commit `3a5b1431` adds `crates/kcoro` as a dependency-free Rust coordination
-kernel:
+Native kcoro docks asynchronous PCM streams and controls to a self-recurring
+native voice session; every forward step is caused by an exact event callback,
+and neither PCM, model math, nor model-pass decisions cross Rust.
 
-- fixed task capacity, dedicated workers, bounded drain per wake, and
-  generation-protected slot reuse;
-- one preallocated waker per spawned task, with no coordinator allocation on
-  publish, wake, or resume;
-- exact-once promise arbitration with a 100,000-iteration two-cause race;
-- inherited O(1)-update pause/cancel words that descendants observe by lineage;
-- bounded single-owner SPSC rings with register/recheck/wake behavior;
-- cache-aligned 128-byte submission and completion records. Submission carries
-  only descriptor identity and policy. Completion preserves execution, state,
-  publication, and cause plus up to eight inline token/codebook IDs.
-
-Commits `2a2adcea`, `95069bd5`, and `fa35a624` add the native SQ/CQ leaf,
-Flashkern mount, and retained descriptor pool. Commit `4f06a3d5` mounts the
-first production Rust endpoint owner:
-
-- one fixed-capacity broker future is the sole native SQ producer;
-- one dedicated ingress thread is the sole native CQ consumer and blocks in
-  the expected-value wait adapter without polling;
-- callback admission uses preallocated generation-protected result slots;
-- ingress validates ticket, conversation, and epoch before resolving exactly
-  one slot and waking the broker continuation;
-- teardown clears the C++ callback, closes bridge admission, joins ingress and
-  the Rust executor, then permits native bridge/lane destruction;
-- the C++ compatibility call remains synchronously blocked only because its
-  current pass descriptor borrows Candle-owned tensor pointers.
-
-The following remain open:
-
-- replace borrowed request storage with retained native pass slots and remove
-  the blocking compatibility caller;
-- connect scope transitions to one exact control doorbell and bounded wake
-  propagation;
-- implement service-class fairness, age promotion, pinned QoS, and measured
-  callback-to-continuation budgets;
-- move child ticket identity and recurrence policy out of `flashkern_engine.cpp`;
-- mount Tauri's persistent docking ring, native audio, and the full scope tree.
-
-### Foundation source map
-
-| Contract | Implemented source | Evidence |
-|---|---|---|
-| explicit bounded runtime lifecycle | `crates/kcoro/src/executor.rs:197-313` | zero workers/capacity/drain are rejected; stop admission is serialized before join and teardown |
-| no concurrent resume and no wake-time allocation | `executor.rs:324-573` | one waker is created at spawn; state arbitration distinguishes scheduled, running, and notified |
-| exact terminal claim and lost-wake-safe promise | `crates/kcoro/src/promise.rs:68-139` | one CAS winner, register/recheck future, and blocking wake ordered before user waker invocation |
-| single-owner bounded SQ/CQ semantics | `crates/kcoro/src/ring.rs:141-307` | release/acquire cells, full/closed results, register/recheck async waits, no endpoint cloning |
-| inherited pause/cancel epochs | `crates/kcoro/src/scope.rs:61-110` | one local word update; descendants derive the strongest ancestor control at a pass boundary |
-| fixed control records | `crates/kcoro/src/protocol.rs:135-260` | 128-byte aligned cells, generation-protected descriptor identity, four terminal facts, eight inline results |
-| race and lifecycle gates | `crates/kcoro/tests/terminal_race.rs:30`, `edge_runtime.rs:19`, `scope_control.rs:4`, `sq_cq.rs:20` | 100,000 terminal races plus wake, panic, stop, scope, capacity, wrap, and ABI tests |
-| sole SQ producer and exact slot admission | `crates/liquid-audio/src/compute/flashkern/coordinator.rs:155-380` at `4f06a3d5` | fixed slots/ring, nonwrapping generations, no per-pass allocation, one pending native command |
-| sole CQ ingress and teardown | `coordinator.rs:383-431`, `542-568`; `native_engine.rs:802-826` at `4f06a3d5` | blocking edge wait, exact identity validation, callback clearing, endpoint joins before bridge destroy |
-| mounted lifecycle gates | `native_engine.rs:1551-1625` at `4f06a3d5` | missing broker rejects without a descriptor leak; 10,000 mounted passes prove SQ/CQ/descriptor/result accounting |
-
-The exact mounted sequence, fixed capacities, synchronous borrowed-pointer
-guard, and current completion facts are recorded in
-[`KCORO_ARENA_INTEGRATION.md`](../../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).
-
-## The Contract
-
-1. **Everything is an edge.** The only legal waits anywhere in the stack are
-   hardware callbacks, doorbell-armed ring waits, and promise/ticket
-   resolution. No layer — kernel, coordinator, host, webview — discovers
-   progress, completion, queue state, or lifecycle by asking again. The
-   kernel's zero-spin wait words, the ticket's exactly-once terminal
-   delivery, and the UI's signal subscriptions are the same rule at three
-   altitudes.
-2. **One open channel per boundary.** Kernel ↔ coordinator: submission and
-   completion rings with doorbells. Coordinator ↔ host UI: one persistent
-   in-process docking ring — command tokens down, sampled records up.
-   Webview ↔ host: one persistent Tauri Channel each way; one-shot commands
-   resolve as promises. No boundary grows per-action plumbing; a new
-   capability is a new token kind on an existing channel.
-3. **The real-time path never crosses a process boundary.** The docking ring
-   is shared memory between the Tauri host and the coordinator in one
-   process. The only true IPC is webview ↔ host, which carries policy bits
-   and sampled state — both latency-tolerant by design.
-4. **The microphone is a kernel device.** Capture, VAD, endpointing, and
-   barge-in live below the ring. The host owns switches, with two distinct
-   semantics that must never be conflated:
-   - **privacy gate** (the user's mic switch): the device is stopped, the OS
-     capture indicator is honest, zero samples enter any ring;
-   - **attention gate** (coordinator policy): capture continues so barge-in
-     and reference-audio logic still work, but no frame is submitted to a
-     model.
-   The Tauri mic control is the privacy gate. Attention gating is a
-   coordinator policy token.
-5. **Reflexes live below the brain.** Barge-in detection, output-epoch
-   flush, and drain completion are native reflex arcs: they act first and
-   inform the coordinator through the completion ring. The UI stop button is
-   the slow path with global reach; the reflex is the fast path with local
-   reach. Neither waits on the other.
-6. **Rust coordination is monolingual.** The policy tree — sessions,
-   conversations, turns, drafts, advisor branches, persistence tasks — is
-   plain Rust coroutines owned by the Rust kcoro executor. FFI appears only
-   at ring leaves. No cross-language frame exists anywhere in the control
-   tree, which is what makes suspension and cancellation structural rather
-   than negotiated.
-7. **Control is structural, and it is three operations, not one.** Every
-   activity is a node in a scope tree; each scope carries a shared control
-   word (mode + epoch) that descendants inherit. **Park**: a parent awaits a
-   promise; its children keep running, because they are what resolves it.
-   **Pause**: an external freeze of a scope and all descendants — state
-   kept, standing work parked at the next boundary, resumable exactly there
-   (spec 10's hibernation primitive). **Cancel**: terminate the subtree,
-   invalidate its epoch, release its resources. Collapsing these into one
-   "suspend" deadlocks parents waiting on children they froze. Stop is O(1)
-   to initiate — one control-word change plus one doorbell — and bounded by
-   the longest admitted pass to complete. No teardown walks a linear chain.
-8. **Realtime progress never depends on Tauri, serialized IPC, polling, or
-   a monitoring loop.** Progress occurs only when an event resolves a
-   registered continuation. The Rust kcoro scheduler is part of the
-   resident runtime, not the host: dedicated thread(s) at pinned QoS, no
-   allocation on publish/wake/resume, bounded drain per wake, exact-once
-   scheduling. A Rust continuation on the token path is legitimate;
-   *arbitrary* Rust on a native realtime thread is not. Standing orders
-   remain the deadline instrument — a chain whose measured
-   callback-to-continuation budget cannot hold becomes one native unit —
-   not an ideology.
-9. **Big payloads never cross; control is inline tokens.** Weights, KV,
-   activations, PCM, mel, and snapshot pages stay in native memory and move
-   as generation-tagged handles. Token IDs, epochs, causes, and policy bits
-   are copied by value into ring cells — zero-copy is for tensors, not for
-   four-byte integers.
-10. **Observation is not monitoring.** Clock-driven sampling exists to serve
-    eyes (the visualizer, diagnostics) and is pushed at a configured rate.
-    It may be lossy, coalesced, and late. It may never gate, wake, retain,
-    or backpressure anything that computes.
-
-## Target Layer Diagram
+## The Three Planes
 
 ```mermaid
 flowchart TB
-    Webview["SolidJS webview: signals + promises"]
-    Host["Tauri Rust host: switches, settings, sampled views"]
-    Coord["Rust kcoro coordinator: conversation tree, tickets, policy"]
-    Kernel["Native kernel: Flashkern lanes, audio device, VAD, codec"]
+    Tauri["Tauri / UI host"]
+    Rust["Rust host control / observation"]
+    Native["Native session coordinator"]
+    Kernel["Flashkern lanes + assembly"]
 
-    Webview <-->|"persistent Tauri Channel (IPC)"| Host
-    Host <-->|"docking ring (in-process, shared memory)"| Coord
-    Coord <-->|"SQ/CQ rings + doorbells"| Kernel
-    Kernel -->|"reflex arcs act locally, report upward"| Kernel
+    Tauri -->|"commands/settings"| Rust
+    Rust <-->|"bounded control / observation"| Native
+    Audio["Native CoreAudio + PCM docks"] --> Native
+    Native <-->|"native pass SQ/CQ"| Kernel
+    Native -->|"sampled semantic/telemetry"| Rust
+    Rust -->|"coalesced observer events"| Tauri
 ```
 
-Only the coordinator-to-kernel SQ/CQ segment has its first production mount.
-The Tauri docking ring, native microphone/audio reflexes, conversation scope
-tree, and observer projection in this diagram remain open.
+1. **Realtime data plane:** native CoreAudio callbacks, PCM lease rings, native
+   model session, fixed lanes, assembly kernels, playback ring.
+2. **Control plane:** start, stop, interrupt, mic gate, settings, conversation
+   selection, snapshot request.
+3. **Observer plane:** text/state summaries, levels, queue depths, ticket phases,
+   latency counters, errors.
 
-## Target Cancellation And Suspension Semantics
+Observer traffic is never progress-bearing. A full observer queue drops or
+coalesces. It cannot cancel inference, block audio, retain a pass slot, or wake a
+model continuation.
 
-- The tree: session → conversation → turn → pass / draft / branch / task.
-- Each node holds a child cancellation token; a parent's cancel is a
-  broadcast, observed by Rust coroutines at their next await and by the
-  kernel at its next pass boundary via the epoch word.
-- A cancelled speculative subtree (drafts, advisor branches) vanishes
-  wholesale: marks restored, reservations released, nothing published.
-- A cancelled committed turn keeps its completed passes as model thought
-  (`execution=completed, state=committed, publication=stale`) — the
-  four-fact terminal record from document 12 survives into the CQ record
-  unchanged.
-- Pause differs from cancel: state is kept, standing work is parked at the
-  next boundary, and the subtree resumes exactly where it stopped. This is
-  the same primitive spec 10 needs for conversation hibernation. Park is
-  neither: a parked parent's children must keep running — they are what
-  resolves its promise.
+## Callback-Only Progress
 
-## Reconciliation Map
+A continuation can become runnable only because one registered source publishes
+an edge:
 
-| Document | Delta |
-|---|---|
-| 01 | The serialized host-callback table remains for lifecycle/semantic events; the hot boundary becomes the ring ABI. Ring layout, doorbell words, and token kinds become versioned structs. |
-| 03 | Coordinator ownership is Rust; native passes sample and mutate state, then CQ facts resolve the next Rust policy decision. Standing orders are an optional measured deadline tool. The fixed-lane executor contract is unchanged. |
-| 07 | Sampling, state append, Depthformer, and codec stay native. Rust receives compact result IDs and chooses the next typed pass without receiving logits or payload state. |
-| 10 | Rust is the coordination owner, while Tauri is only the host. Static enforcement requires zero Tauri/serialized-IPC progress edges, zero arbitrary Rust on native realtime threads, and zero numerical payload or math in Rust. |
-| 12 | Ticket lifecycle ownership moves to the Rust coordinator; the three planes, the four-fact terminal record, and the observer rules carry over verbatim. |
-| Mission (spec 11 head) | Realtime progress never depends on Tauri, serialized IPC, polling, or monitoring; progress occurs only when an event resolves a registered continuation. |
+- PCM capture data became available;
+- PCM playback space became available;
+- a native pass completion became terminal;
+- a child operation completed;
+- a deadline fired;
+- a cancellation/stop epoch advanced;
+- a control command was accepted;
+- a storage operation completed outside the realtime worker set.
 
-## Non-Goals
+The producer writes data, release-publishes the sequence, then rings the exact
+doorbell. The continuation records its expected sequence and rechecks its full
+predicate before returning `Dormant`; no thread remains attached to that
+operation. A resident runtime worker may enter indefinite OS-backed dormancy
+only when the runtime's complete ready predicate is empty. There is no
+monitoring loop, timed queue probe, sleep/retry, bounded spin, or periodic UI
+tick that discovers work.
 
-- No Tokio, async-std, or generic executor in the coordinator. The Rust
-  kcoro executor preserves the arena semantics: fixed preallocated slots,
-  exact-once completion, generation fencing, blocking worker waits,
-  bounded draining, no allocation on wake paths. The committed C substrate
-  is its conformance oracle; its race suites are the port's fixtures.
-- No webview participation in any completion path, ever.
-- No second control channel per feature. Tokens, not plumbing.
-- No mic semantics where "off" means "captured but ignored."
+This is promise semantics in systems form: the continuation is registered once
+and resumes because the promise resolves, not because a scheduler keeps asking.
+
+## Docking Ring Contract
+
+The native audio/control boundary has three bounded record paths:
+
+| Ring | Producer -> consumer | Cell | Payload ownership |
+|---|---|---|---|
+| capture | native OS callback -> native session | lease ID, epoch, format, offset, frames | preallocated PCM region retained until native release |
+| playback | native session -> native OS callback | lease ID, epoch, format, offset, frames | native PCM block retained until device consumption/release |
+| control/completion | Rust host <-> native session | command/result ID, scope, epoch, cause, small scalar fields | inline fixed record; no numerical payload |
+
+On macOS, CoreAudio renders capture directly into the preallocated native arena;
+playback still performs the final unavoidable movement into the ephemeral device
+buffer. No additional PCM copy is introduced by the dock, and Rust never
+inspects PCM.
+
+## Inner Native Contract
+
+The model pass ring is private to native code. C++ creates and retains a typed
+pass descriptor, publishes its ID to the native SQ, and leaves the continuation
+as durable ticket state. Fixed lanes execute assembly stages. The final member
+return publishes the exact completion edge; a runtime worker then resumes the
+continuation and may submit another pass immediately.
+
+No pass completion calls Rust. No Rust future owns a token, logits plane, KV
+lease, sampler state, or next-pass decision.
+
+## Scope Tree
+
+The Rust audio dock and native session each expose the same scope semantics over
+their own children. Control records carry scope ID and epoch so a root action can
+affect both sides without walking a linear call path.
+
+```text
+voice session
+|- capture stream
+|- playback stream
+|- native conversation
+|  |- active response
+|  |- predictive candidate
+|  `- background branch
+`- observer projection
+```
+
+### Suspend
+
+Suspend one continuation as durable state because it awaits a registered event.
+It owns no thread or waiter while suspended, and its children keep running. A
+parent awaiting child completions must not freeze those children.
+
+### Pause
+
+Pause blocks new work in a scope and descendants at legal boundaries. Existing
+native passes and active device callbacks settle. Buffered data remains owned and
+can be resumed without reconstruction.
+
+### Cancel
+
+Cancel advances the scope epoch, closes admission, and resolves every pending
+operation exactly once. Native assembly is never interrupted mid-operation; an
+active pass reaches its full boundary and then applies its terminal policy.
+
+### Stop
+
+Stop is root cancellation plus ordered teardown:
+
+1. advance control/output epoch;
+2. close new PCM and pass admission;
+3. flush stale playback leases;
+4. let accepted native passes publish terminal records;
+5. resolve and join dock children;
+6. join native dispatcher and lane team;
+7. prove zero live tickets, descriptors, PCM leases, callbacks, operation
+   waiters, and deadline children;
+8. destroy session/model/runtime in owner order.
+
+## Interrupt And Barge-In
+
+Barge-in is native-originated when VAD detects resumed speech:
+
+1. native advances the publication/output epoch;
+2. stale queued PCM is released and playback is flushed;
+3. the active numerical pass reaches its boundary;
+4. committed conversational thought can remain in context with
+   `publication=stale`;
+5. speculative candidate state rolls back as one subtree;
+6. the native session schedules the listening path;
+7. Rust and Tauri learn the result later through completion/observer records.
+
+A UI stop or interrupt sends the same epoch-bearing control command through the
+dock. Native behavior does not wait for a Tauri event round trip.
+
+## Ticket Facts
+
+Tickets report independent facts:
+
+```text
+execution:    not_dispatched | completed | failed
+state:        none | committed | rolled_back | poisoned
+publication:  none | committed | stale
+cause:        success | rejected | canceled | timed_out | stale_epoch | stop | fault
+```
+
+One atomic terminal claim chooses completion, close, cancellation, timeout, or
+shutdown. The winner unlinks the operation and publishes one callback. Losers
+observe terminal state and do nothing.
+
+At PCM granularity the same law applies to leases: accepted, consumed, flushed,
+canceled, or failed is terminal exactly once. Release callbacks run before slot
+generation recycling.
+
+## Multitasking And Conversation Switching
+
+One immutable model image can serve many conversation actors. At each native
+pass boundary the broker can choose another ready conversation, while the prior
+conversation's KV, convolution carry, sampler, codec, and workflow state remain
+parked in owned pages.
+
+Branches share immutable ancestor pages and copy only changed state pages. A
+branch may add a technical, affective, or rehearsal prompt, run a bounded number
+of native passes, and publish a small state delta. A later integration actor can
+consume those deltas and ask the ancestor model for the final utterance.
+
+None of these actors duplicates model weights or routes thought tokens through
+Rust. Rust sees audio and high-level lifecycle/observer facts only.
+
+## Scheduling Discipline
+
+### Rust dock
+
+- fixed capacity and explicit worker count;
+- no Tokio or generic work-stealing executor in the realtime dock;
+- one setup-time retained notifier edge per producer/continuation relation;
+- no allocation on publish/wake/resume;
+- bounded drain per wake with fairness across scopes;
+- platform QoS appropriate for audio I/O;
+- no model or numerical FFI symbols in its link surface.
+
+### Native session
+
+- fixed-capacity pass slots, descriptor leases, and completion cells;
+- service-class and conversation-quantum fairness;
+- exact native callback-to-continuation wake;
+- no allocation after readiness;
+- no host callback, storage write, telemetry sink, or general actor channel from
+  a pass or audio callback;
+- stop checks only at complete pass boundaries.
+
+### Assembly lanes
+
+- stable lane identity;
+- shared stage board and disjoint destinations;
+- generation-stamped entered/returned masks and one final-return callback;
+- no operation member blocks, parks, or carries a waiter at a stage boundary;
+- no channels, tickets, callbacks, allocation, exceptions, syscalls, or stop
+  checks inside an operation;
+- every value-producing operation is architecture assembly or an explicitly
+  approved AMX entry behind an assembly ABI leaf.
+
+## Tauri Contract
+
+Tauri may:
+
+- start and stop sessions;
+- enable/disable the microphone;
+- request interrupt, typed input, conversation switch, or snapshot;
+- update persisted runtime settings;
+- subscribe to sampled status and visualizer records.
+
+Tauri may not:
+
+- own the microphone or speaker callback;
+- submit model passes or tokens;
+- inspect native numerical buffers;
+- acknowledge a pass so recurrence can continue;
+- poll runtime state to discover progress.
+
+The visualizer consumes coalesced audio levels and native ticket snapshots at UI
+rate. Its callback is observational and can be removed without changing audio or
+model behavior.
+
+## Verification Gates
+
+1. Stall the Tauri/webview thread for five seconds while buffered native model
+   and audio progress continues within capacity.
+2. Stall the Rust dock worker after native input admission; native recurrence
+   continues until it genuinely needs another PCM lease or output space.
+3. Stop every scope from every parked state; each child resolves once and joins.
+4. Flood completion and observer sources; bounded drain preserves fairness and
+   observer loss never affects progress.
+5. Assert zero timed waits, sleeps, spins, `try_recv` loops, and periodic progress
+   timers in production source.
+6. Assert no Rust symbol receives token IDs, logits, model-pass descriptors, or
+   numerical pointers in the production link graph.
+7. Assert no C++ engine/model/session source contains a production numerical
+   loop; assembly symbol tests run on AArch64 and x86_64/Rosetta.

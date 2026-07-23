@@ -45,3 +45,5 @@ logs/
 /*.plist
 # self-chat soak output: keep transcripts, never the audio
 self_chat_out*/*.wav
+crates/liquid-audio/native/tests/fixtures/conformer/*.bin
+crates/liquid-audio/native/tools/build*/

@@ -58,6 +58,7 @@ export function DialogStatus() {
                     fg: (
                       {
                         connected: theme.success,
+                        connecting: theme.textMuted,
                         failed: theme.error,
                         disabled: theme.textMuted,
                         needs_auth: theme.warning,
@@ -73,6 +74,7 @@ export function DialogStatus() {
                   <span style={{ fg: theme.textMuted }}>
                     <Switch fallback={item.status}>
                       <Match when={item.status === "connected"}>Connected</Match>
+                      <Match when={item.status === "connecting"}>Connecting</Match>
                       <Match when={item.status === "failed" && item}>{(val) => val().error}</Match>
                       <Match when={item.status === "disabled"}>Disabled in configuration</Match>
                       <Match when={(item.status as string) === "needs_auth"}>

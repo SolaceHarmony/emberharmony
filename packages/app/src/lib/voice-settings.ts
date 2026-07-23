@@ -45,7 +45,6 @@ export interface Lfm2Settings {
   modelDir?: string
   moshiModelDir?: string
   device: Lfm2Device
-  vadThreshold: number
   /** Timestamped native voice call-graph diagnostics. */
   trace: boolean
   /** Per-mode decoding regimes; `interleaved` is the live conversation path. */
@@ -82,11 +81,10 @@ export const defaultVoiceSettings: VoiceSettings = {
   // Desktop resolves the default `model` in Rust; this literal is only the
   // web-build display fallback when no Tauri runtime exists.
   lfm2: {
-    engine: "moshiRealtime",
+    engine: "lfm2Interleaved",
     model: DEFAULT_LFM2_MODEL,
     moshiModel: DEFAULT_MOSHI_MODEL,
-    device: "metal",
-    vadThreshold: 0.012,
+    device: "cpu",
     trace: false,
     // Per-mode defaults mirror the vendor demo (audio-model.js): ASR
     // greedy/100, TTS text 0.7 + audio 0.8/top-64/1024. Interleaved keeps
@@ -182,7 +180,6 @@ export type NativeVoiceEvent =
   | { type: "state"; state: NativeVoiceState }
   | { type: "transcript"; role: "user" | "assistant"; text: string }
   | { type: "level"; rms: number }
-  | { type: "audioClip"; wav: number[]; ms: number }
   | { type: "ended"; reason?: string }
   | { type: "error"; message: string }
 

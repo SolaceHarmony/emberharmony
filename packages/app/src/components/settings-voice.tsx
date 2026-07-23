@@ -76,7 +76,7 @@ export const SettingsVoice: Component = () => {
   const effectiveUrl = () => url() ?? voice().livekit.url ?? (!desktop ? config()?.url : undefined) ?? ""
   const voice = (): VoiceSettings => tauriVoice()?.settings ?? defaultVoiceSettings
   const lfm2 = (): Lfm2Settings => voice().lfm2
-  const localEngine = (): VoiceEngineMode => lfm2().engine ?? "moshiRealtime"
+  const localEngine = (): VoiceEngineMode => lfm2().engine ?? "lfm2Interleaved"
   const modelDirValue = () => modelDirEdit() ?? lfm2().modelDir ?? ""
   const moshiModelDirValue = () => moshiModelDirEdit() ?? lfm2().moshiModelDir ?? ""
   const selectedModelDirValue = () => (localEngine() === "moshiRealtime" ? moshiModelDirValue() : modelDirValue())
@@ -701,20 +701,6 @@ export const SettingsVoice: Component = () => {
                   variant="secondary"
                   size="small"
                   triggerVariant="settings"
-                />
-              </SettingsRow>
-              <SettingsRow
-                title={language.t("settings.voice.row.vadThreshold.title")}
-                description={language.t("settings.voice.row.vadThreshold.description")}
-              >
-                <TextField
-                  hideLabel
-                  label={language.t("settings.voice.row.vadThreshold.title")}
-                  defaultValue={String(lfm2().vadThreshold)}
-                  onFocusOut={(e: FocusEvent) => {
-                    const n = numberFromInput(e)
-                    if (n !== undefined && n > 0) updateLfm2({ vadThreshold: n })
-                  }}
                 />
               </SettingsRow>
               <SettingsRow

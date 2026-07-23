@@ -1,9 +1,8 @@
 /**
  * Curated registry of LiveKit Inference voice integrations (tier 1: routed
  * through the LiveKit gateway with a single LiveKit credential, no
- * per-provider API keys). Model ids match the gateway model strings from
- * `@livekit/agents` inference typings. A future tier 2 adds direct plugin
- * providers with their own keys.
+ * per-provider API keys). Model ids are persisted configuration values passed
+ * to the configured LiveKit service.
  */
 export namespace VoiceRegistry {
   export interface Option {

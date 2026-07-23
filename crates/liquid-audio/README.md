@@ -1,30 +1,40 @@
 # liquid-audio
 
-Native LFM2.5-Audio engine and transitional Rust host rim used by the desktop
-voice stack. C++ and architecture kernels own the inference substrate; the
-remaining Candle compatibility paths are migration work, not the target design.
+Native LFM2.5-Audio engine used by the desktop voice stack. Native
+C++/kcoro/Flashkern and architecture kernels own the model image, inference,
+turn policy, CoreAudio callbacks, and PCM docks. The Rust crate contains desktop
+control records and checkpoint download support only; it has no native linkage
+or inference entry point.
 
 - Detailed architecture docs: `docs/`.
 - Native C/C++ sources: `native/`.
-- Public Rust API: `src/lib.rs`.
-- Tauri integration: `packages/desktop/src-tauri` depends on this crate by path.
+- Desktop Rust support: `src/lib.rs`.
+- Tauri UI/control integration: `packages/desktop/src-tauri`.
 
 Run from the repo root:
 
 ```sh
-cargo test -p liquid-audio --lib -- --nocapture
-cargo build -p liquid-audio --all-targets
+cmake -S crates/kcoro-sys/vendor/kcoro_arena -B build/kcoro
+cmake --build build/kcoro
+ctest --test-dir build/kcoro
+make -C crates/liquid-audio/native/tools
 ```
 
-On Apple Silicon, the local-only Rosetta lane cross-builds Darwin x86_64 and
-runs the resulting tests explicitly through Rosetta:
+The slow two-agent speech test is a native release-acceptance executable. It
+receives the checkpoint and output mode as ordinary arguments; no environment
+variable changes its implementation:
 
 ```sh
-./crates/liquid-audio/scripts/test-rosetta.sh
+crates/liquid-audio/native/tools/build/lfm-native-speech-test \
+  /absolute/LFM2.5-Audio-1.5B 8 silent
 ```
 
-The script reports whether Rosetta exposes AVX2. When it does not, feature-gated
-SIMD tests skip; x86 compilation, linking, ABI, scheduler, and dispatch checks
-still run. Actual AVX2/AVX-512 instruction correctness requires an x86 runner
-that advertises those features. Use `--require-avx2` when SIMD execution is the
-required gate; it fails instead of returning a partial green result.
+Use `buffered` or `stream` in place of `silent` only for deliberate audible
+acceptance. All modes consume the same in-memory native PCM leases.
+
+On Apple Silicon, cross-build the Darwin x86_64 suites and let macOS execute
+the test binaries through Rosetta directly:
+
+Configure the same CMake projects with
+`-DCMAKE_OSX_ARCHITECTURES=x86_64` for the Rosetta build. Unsupported
+instruction sets fail readiness; no scalar inference substitute is selected.

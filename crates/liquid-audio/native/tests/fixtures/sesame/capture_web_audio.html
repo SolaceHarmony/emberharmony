@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Web Audio analyser ground truth</title>
+<pre id="status">running</pre>
+<script>
+const rates = [16000, 24000, 44100, 48000]
+const kinds = ['zero', 'constant', 'impulse', 'integer', 'selected-square', 'high-square']
+
+function sample(kind, rate, frame) {
+  const n = frame % 256
+  if (kind === 'zero') return 0
+  if (kind === 'constant') return 0.125
+  if (kind === 'impulse') return n === 0 ? 0.5 : 0
+  if (kind === 'integer') return ((n * 17) % 31 - 15) / 64
+  const hz = kind === 'selected-square' ? 1000 : 4000
+  const half = Math.max(1, Math.floor(rate / hz / 2))
+  return Math.floor(n / half) % 2 === 0 ? 0.25 : -0.25
+}
+
+async function capture(rate, kind) {
+  const frames = 1024
+  const context = new OfflineAudioContext(1, frames, rate)
+  const buffer = context.createBuffer(1, frames, rate)
+  const pcm = buffer.getChannelData(0)
+  for (let frame = 0; frame < frames; frame++) {
+    pcm[frame] = Math.fround(sample(kind, rate, frame))
+  }
+  const source = context.createBufferSource()
+  const analyser = context.createAnalyser()
+  analyser.fftSize = 256
+  analyser.minDecibels = -100
+  analyser.maxDecibels = -30
+  analyser.smoothingTimeConstant = 0.8
+  source.buffer = buffer
+  source.connect(analyser)
+  analyser.connect(context.destination)
+  source.start()
+  await context.startRendering()
+  const bytes = new Uint8Array(analyser.frequencyBinCount)
+  analyser.getByteFrequencyData(bytes)
+  const lo = Math.floor(600 / (rate / 256))
+  const hi = Math.floor(2400 / (rate / 256))
+  return {rate, kind, lo, hi, bytes: Array.from(bytes.slice(lo, hi))}
+}
+
+async function captureSequence(rate) {
+  const segmentKinds = ['zero', 'selected-square', 'zero', 'integer', 'selected-square']
+  const frames = 256 * segmentKinds.length
+  const context = new OfflineAudioContext(1, frames, rate)
+  const buffer = context.createBuffer(1, frames, rate)
+  const pcm = buffer.getChannelData(0)
+  for (let frame = 0; frame < frames; frame++) {
+    const segment = Math.floor(frame / 256)
+    pcm[frame] = Math.fround(sample(segmentKinds[segment], rate, frame))
+  }
+  const source = context.createBufferSource()
+  const analyser = context.createAnalyser()
+  analyser.fftSize = 256
+  analyser.minDecibels = -100
+  analyser.maxDecibels = -30
+  analyser.smoothingTimeConstant = 0.8
+  source.buffer = buffer
+  source.connect(analyser)
+  analyser.connect(context.destination)
+  source.start()
+  const lo = Math.floor(600 / (rate / 256))
+  const hi = Math.floor(2400 / (rate / 256))
+  const snapshots = []
+  const suspensions = [256, 512, 768, 1024].map(frame =>
+    context.suspend(frame / rate).then(async () => {
+      const bytes = new Uint8Array(analyser.frequencyBinCount)
+      analyser.getByteFrequencyData(bytes)
+      snapshots.push({frame, currentTime: context.currentTime, bytes: Array.from(bytes.slice(lo, hi))})
+      await context.resume()
+    })
+  )
+  await Promise.all([context.startRendering(), ...suspensions])
+  snapshots.sort((a, b) => a.frame - b.frame)
+  return {rate, lo, hi, segmentKinds, snapshots}
+}
+
+Promise.all([
+  Promise.all(rates.flatMap(rate => kinds.map(kind => capture(rate, kind)))),
+  captureSequence(48000),
+]).then(([cases, sequence]) => {
+  window.fixture = {version: 1, generator: 'periodic-window-v1', cases, sequence}
+  document.querySelector('#status').textContent = JSON.stringify(window.fixture, null, 2)
+}).catch(error => {
+  window.fixtureError = String(error && error.stack || error)
+  document.querySelector('#status').textContent = window.fixtureError
+})
+</script>

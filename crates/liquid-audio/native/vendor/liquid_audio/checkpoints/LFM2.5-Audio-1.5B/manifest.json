@@ -1,0 +1,19 @@
+{
+  "repository": "LiquidAI/LFM2.5-Audio-1.5B",
+  "revision": "c362a0625dfe45aa588dce5f0ada28a7e5707628",
+  "files": [
+    {"path":"LICENSE","bytes":10575,"sha256":"c138fe99cb339429d6daba8aa44c3dc5996e1a8caf55dec76170f8d2d626ddf7","production_role":"license","required":true},
+    {"path":"README.md","bytes":10477,"sha256":"32eb18b7cdaeec20eff282e5601684271ad4b369021a1d04c600a1d1286d43ee","production_role":"documentation","required":false},
+    {"path":"chat_template.jinja","bytes":1296,"sha256":"89e790f027916b5a2bca145a6a8454e06ffc7a5043bf3b6d97829aff86bb543f","vendored_bytes":1297,"vendored_sha256":"50b68fe70f73c36b44793fa165cb0669f271041c2d238e2da58d32d02101dbbc","vendored_normalization":"one terminal LF","production_role":"conversation_template","required":true},
+    {"path":"config.json","bytes":2642,"sha256":"9c3f6a2881621141e5baa368cbd2ce8137793a1db5f8165aa850e5a37190f9e9","production_role":"main_schema","required":true},
+    {"path":"model.safetensors","bytes":2940723992,"sha256":"f38bb74d9792030bbfaebf2df8aae24bb2c875685b7ab4f9b16903dbf9393c1e","production_role":"main_weights","required":true},
+    {"path":"special_tokens_map.json","bytes":434,"sha256":"742aefe2b7dec496e8caffdba03a75d0c1a9925d53bd3f3e0d388c96b591b6f4","production_role":"text_tokenizer","required":true},
+    {"path":"tokenizer.json","bytes":4732404,"sha256":"fbb4071ea653afe958c24562139c2c09618f90bb6bf50d7669dfe10a0fa02e68","production_role":"text_tokenizer","required":true},
+    {"path":"tokenizer_config.json","bytes":91566,"sha256":"08292c7f40aad564c5ebcb6d52640bd4c90c5467093db1c6eace1ed4de5b85b6","production_role":"text_tokenizer","required":true},
+    {"path":"audio_detokenizer/config.json","bytes":1150,"sha256":"08dfc773eefd415a474914f6aba2708ff4550e23419c927ea06c0f9ba152b68d","production_role":"detokenizer_schema","required":true},
+    {"path":"audio_detokenizer/model.safetensors","bytes":314137512,"sha256":"d294aef1eacaab6dc7a5dab53fc88ac3fdd45c0a1994888489caaacf87d1ac70","production_role":"detokenizer_weights","required":true},
+    {"path":"audio_detokenizer/tokenizer.json","bytes":4732426,"sha256":"98cff83b4f6d7e9d8929bebc62b07e92cf1b3f99c80d16bafe8b84a75448f40b","production_role":"unused_inputs_embeds_packaging","required":false},
+    {"path":"audio_detokenizer/tokenizer_config.json","bytes":91509,"sha256":"36f511115e9d8952cbc9d15d9a20dfa7ce7d1444940e5c1dc42a762020c99bf5","production_role":"unused_inputs_embeds_packaging","required":false},
+    {"path":"tokenizer-e351c8d8-checkpoint125.safetensors","bytes":384644900,"sha256":"09b782f0629851a271227fb9d36db65c041790365f11bbe5d3d59369cf863f50","production_role":"legacy_mimi_not_loaded","required":false}
+  ]
+}

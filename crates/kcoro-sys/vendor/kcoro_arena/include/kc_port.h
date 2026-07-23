@@ -10,9 +10,11 @@ extern "C" {
 #endif
 
 typedef struct kc_port_mutex kc_port_mutex;
-typedef struct kc_port_cond kc_port_cond;
 typedef struct kc_port_thread kc_port_thread;
 typedef struct kc_port_wait_word kc_port_wait_word;
+typedef struct kc_port_wait_signal {
+    kc_port_wait_word *word;
+} kc_port_wait_signal;
 typedef void *(*kc_port_thread_fn)(void *arg);
 
 int kc_port_mutex_create(kc_port_mutex **out);
@@ -20,36 +22,50 @@ void kc_port_mutex_destroy(kc_port_mutex *mutex);
 void kc_port_mutex_lock(kc_port_mutex *mutex);
 void kc_port_mutex_unlock(kc_port_mutex *mutex);
 
-int kc_port_cond_create(kc_port_cond **out);
-void kc_port_cond_destroy(kc_port_cond *cond);
-void kc_port_cond_wait(kc_port_cond *cond, kc_port_mutex *mutex);
-int kc_port_cond_timedwait(kc_port_cond *cond, kc_port_mutex *mutex,
-                           uint64_t deadline_ns);
-void kc_port_cond_signal(kc_port_cond *cond);
-void kc_port_cond_broadcast(kc_port_cond *cond);
-
 /*
- * Expected-value wait words are the portable doorbell boundary for fixed
- * compute teams. Preparation may allocate and selects the host's direct address
- * wait backend once; wait and wake never search a registry or allocate. The
- * caller release-publishes a changed value before an ordinary wake. Wait returns
- * immediately when the value differs, parks without polling while it is equal,
- * and returns -ETIMEDOUT for an unchanged deadline. Release is exactly once; it
- * publishes one terminal increment and wakes operations that already entered the
- * wait object. No new operation may begin after release starts.
+ * Expected-value address dormancy is the private idle boundary for resident
+ * runtime/team workers. Preparation may allocate and selects the host's direct
+ * address backend once; park and wake never search a registry or allocate. The
+ * caller release-publishes a changed value before an ordinary wake. Park returns
+ * immediately when the value differs and becomes dormant without polling while
+ * it is equal. There is deliberately no deadline form. Release is exactly once;
+ * it publishes one terminal increment and wakes workers that already entered the
+ * registration. Entry and release linearize through one packed closed/count
+ * gate. No new worker may enter after release starts, and the owner must quiesce
+ * every potential caller before releasing the registration.
  */
 int kc_port_wait_u32_prepare(uint32_t *address, kc_port_wait_word **out);
-int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected,
-                     uint64_t deadline_ns);
+int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected);
 void kc_port_wake_u32_one(kc_port_wait_word *word);
 void kc_port_wake_u32_all(kc_port_wait_word *word);
+/* Two-phase wake ownership for a publisher whose terminal predicate also
+ * permits the registration owner to destroy its backing address. Acquire must
+ * happen while that publisher's enclosing lifetime is still retained. Release
+ * closes new guard admission and drains every acquired guard before freeing the
+ * registration, so a guard may publish the terminal predicate and wake after
+ * the enclosing lifetime counter reaches zero. A guard is move-only by
+ * convention and must be released exactly once. None of these operations
+ * allocates or searches a registry. */
+int kc_port_wait_u32_signal_acquire(kc_port_wait_word *word,
+                                    kc_port_wait_signal *signal);
+void kc_port_wait_u32_signal_one(const kc_port_wait_signal *signal);
+void kc_port_wait_u32_signal_all(const kc_port_wait_signal *signal);
+void kc_port_wait_u32_signal_release(kc_port_wait_signal *signal);
+/* True only when wake uses the host's direct address primitive and cannot
+ * acquire the pthread fallback mutex. The result is immutable after prepare. */
+int kc_port_wait_u32_wake_is_realtime_safe(const kc_port_wait_word *word);
+/* Closes operation admission without freeing the registration. out_admitted
+ * reports guards/waits/wakes that crossed the packed gate before closure.
+ * release may follow a prior close and drains those admitted operations. */
+int kc_port_wait_u32_close(kc_port_wait_word *word,
+                           uint32_t *out_admitted);
 void kc_port_wait_u32_release(kc_port_wait_word *word);
 
 int kc_port_thread_create(kc_port_thread **out, kc_port_thread_fn fn, void *arg);
 void kc_port_thread_join(kc_port_thread *thread);
+int kc_port_thread_cpu_ns(const kc_port_thread *thread, uint64_t *out_ns);
 unsigned kc_port_cpu_count(void);
 uint64_t kc_port_monotonic_ns(void);
-void kc_port_thread_yield(void);
 
 #ifdef __cplusplus
 }

@@ -39,7 +39,9 @@ export function DialogMcp() {
         value: name,
         title: name,
         description: status.status === "failed" ? "failed" : status.status,
-        footer: <Status enabled={local.mcp.isEnabled(name)} loading={loadingMcp === name} />,
+        footer: (
+          <Status enabled={local.mcp.isEnabled(name)} loading={loadingMcp === name || status.status === "connecting"} />
+        ),
         category: undefined,
       })),
     )
@@ -52,6 +54,7 @@ export function DialogMcp() {
       onTrigger: async (option: DialogSelectOption<string>) => {
         // Prevent toggling while an operation is already in progress
         if (loading() !== null) return
+        if (sync.data.mcp[option.value]?.status === "connecting") return
 
         setLoading(option.value)
         try {
@@ -72,12 +75,5 @@ export function DialogMcp() {
     },
   ])
 
-  return (
-    <DialogSelect
-      ref={setRef}
-      title="MCPs"
-      options={options()}
-      keybind={keybinds()}
-    />
-  )
+  return <DialogSelect ref={setRef} title="MCPs" options={options()} keybind={keybinds()} />
 }

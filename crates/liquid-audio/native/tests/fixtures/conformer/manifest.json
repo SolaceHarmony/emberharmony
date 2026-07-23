@@ -1,0 +1,665 @@
+{
+  "artifacts": [
+    {
+      "dtype": "bf16le",
+      "file": "tone440_sub_conv.bf16.bin",
+      "shape": [
+        1,
+        256,
+        7,
+        16
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_sub.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_pos_emb.bf16.bin",
+      "shape": [
+        1,
+        13,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_l0_ff1.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_l0_attn.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_l0_conv.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer00.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer01.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer02.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer03.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer04.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer05.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer06.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer07.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer08.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer09.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer10.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer11.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer12.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer13.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer14.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer15.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_layer16.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "tone440_adapter.bf16.bin",
+      "shape": [
+        7,
+        2048
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_sub_conv.bf16.bin",
+      "shape": [
+        1,
+        256,
+        4,
+        16
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_sub.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_pos_emb.bf16.bin",
+      "shape": [
+        1,
+        7,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_l0_ff1.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_l0_attn.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_l0_conv.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer00.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer01.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer02.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer03.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer04.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer05.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer06.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer07.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer08.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer09.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer10.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer11.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer12.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer13.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer14.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer15.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_layer16.bf16.bin",
+      "shape": [
+        1,
+        4,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "ramp_mix_adapter.bf16.bin",
+      "shape": [
+        4,
+        2048
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_sub_conv.bf16.bin",
+      "shape": [
+        1,
+        256,
+        1,
+        16
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_sub.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_pos_emb.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_l0_ff1.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_l0_attn.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_l0_conv.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer00.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer01.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer02.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer03.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer04.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer05.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer06.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer07.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer08.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer09.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer10.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer11.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer12.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer13.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer14.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer15.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_layer16.bf16.bin",
+      "shape": [
+        1,
+        1,
+        512
+      ]
+    },
+    {
+      "dtype": "bf16le",
+      "file": "single_adapter.bf16.bin",
+      "shape": [
+        1,
+        2048
+      ]
+    }
+  ],
+  "checkpoint": "LiquidAI/LFM2.5-Audio-1.5B c362a0625dfe, model.safetensors, BF16",
+  "generator": "encoder.rs tests::dump_conformer_fixtures (dies with this module)",
+  "geometry": {
+    "adapter": "LN -> 512x2048 -> gelu_erf -> 2048x2048",
+    "conv_kernel": 9,
+    "d_ff": 2048,
+    "d_model": 512,
+    "n_heads": 8,
+    "n_layers": 17,
+    "subsampling": "dw_striding x8, 256 ch",
+    "xscaling": false
+  },
+  "inputs": "committed mel fixtures' forward planes, cast BF16 per the prefill seam"
+}

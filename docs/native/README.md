@@ -1,64 +1,92 @@
 # Native Runtime Map
 
-The reusable Rust, C++, C, and assembly code lives at the repo root under `crates/`.
-The TypeScript/Bun app remains under `packages/`, and Tauri keeps its conventional
-Rust entrypoint at `packages/desktop/src-tauri`.
+The production voice path is split between a thin Rust product host and a native
+LFM2-Audio runtime. Rust owns application control, settings, opaque handles, and
+UI projection. Native C++/kcoro/Flashkern owns CoreAudio callbacks, checkpoint
+loading, model state, turn policy, scheduling, PCM storage, and inference. The
+production `liquid-audio` dependency graph is Candle-free.
 
 ## Crates
 
-- `crates/liquid-audio` - current hybrid LFM2.5-Audio crate; target is a thin
-  Rust handle wrapper over the complete C++/SIMD/assembly local voice runtime.
-- `crates/candle-flashfftconv` - migration-only Candle operators, deleted when
-  the native production kernel gates pass.
-- `crates/kcoro` - dependency-free safe Rust coordination kernel. Its first
-  production mount owns the sole Flashkern SQ broker future and exact CQ wake
-  edge; scopes, child tickets, recurrence, and service policy remain open.
-- `crates/kcoro-sys` - build-only sys crate for the vendored C conformance
-  oracle and expected-value host waits. Its C ticket scheduler is tested but is
-  not on Flashkern's production pass path.
+- `crates/liquid-audio` — production LFM2-Audio host API plus the native
+  C++/assembly runtime. Its Rust code sees opaque lifecycle handles, typed
+  control/events, and borrowed PCM spans; it does not load weights or execute
+  model math.
+- `crates/kcoro-sys` — production Rust bindings and build integration for the
+  vendored `kcoro_arena` runtime. The vendored C runtime owns retained
+  services, realtime notifier edges, fixed teams, fixed scopes, doorbells, and
+  correlated monotonic deadlines.
+- `crates/candle-flashfftconv` — workspace-only experimental Candle/Metal
+  kernels. The desktop does not depend on it.
 
-## Boundaries
+The former Rust/Candle LFM2 model crate was deleted after the native model path
+landed. Historical reports remain documentation, not a callable second model.
 
-- Bun/TypeScript calls Tauri commands; it does not import or build native crates directly.
-- Tauri depends on `liquid-audio` by path and owns persisted settings, command
-  registration, opaque handle lifetime, and bounded event projection.
-- `liquid-audio` currently owns the hybrid Rust/Candle model rim, the safe Rust
-  coordinator endpoint, and the private C ABI. C++ owns the resident checkpoint
-  image, native SQ/CQ and descriptors, fixed numerical lanes, and SIMD/assembly
-  dispatch.
-- `crates/kcoro` owns product coordination. At the current mount it routes one
-  synchronous borrowed-pointer pass; at cutover it owns scopes, tickets, and
-  recurrence without owning model math.
-- `kcoro-sys` compiles the C oracle and platform wait adapter. It is not the
-  product policy scheduler.
+Rust docking uses the production wrappers in `kcoro-sys`; model-pass scheduling
+remains native.
+
+## Ownership Boundaries
+
+- Bun/TypeScript calls Tauri commands and receives bounded observations. It
+  does not load a model or carry numerical payloads.
+- Tauri owns settings, opaque native handles, lifecycle commands, and UI event
+  projection. Platform stream lifetime is session-owned native state.
+- A hardware capture callback writes directly into a preallocated native PCM
+  lease and publishes a typed chunk record. A playback callback resolves and
+  drains a native playback lease. PCM is not transferred through stdout,
+  files, framework tensors, or a Rust-owned model buffer.
+- The native session owns the exact Sesame microphone detector and sample-clock
+  turn policy, route/recurrence state, native capture/playback storage, and
+  reliable ticket-correlated delivery.
+- `safetensors.cpp` loads the immutable resident checkpoint image. Bound model
+  values are pointer/shape/stride views into that image; dtype, alignment, or
+  layout copies are forbidden compatibility materialization.
+- Flashkern currently has one fixed `kc_team` per engine. A two-`BlockDomain`
+  grid remains proposed work; documentation must not describe it as landed.
 
 ## Native Source Layout
 
 `crates/liquid-audio/native/` uses C++/assembly-friendly directories:
 
-- `include/` — native ABI headers when a C/C++ interface needs to be shared.
-- `src/engine/` — resident native stage-machine code.
-- `kernels/aarch64/` — NEON/AArch64 kernels.
-- `kernels/x86_64/` — AVX/x86-64 kernels.
-- `reference/` - test-only scalar oracles excluded from the production link map;
-  no historical production implementation is retained.
+- `include/` — versioned product ABI plus explicitly private diagnostic and
+  test interfaces.
+- `src/io/` — native safetensors image loading and metadata validation.
+- `src/runtime/` — native sessions, PCM docks, Sesame policy, and bridge
+  records.
+- `src/engine/` — Flashkern route/pass state and fixed-team dispatch.
+- `src/model/`, `src/frontend/`, and `src/mimi/` — immutable plans, byte views,
+  activation arenas, and native model programs.
+- `kernels/aarch64/` and `kernels/x86_64/` — paired architecture math leaves.
+- `reference/` and `native/tests/fixtures/` — test-only evidence excluded from
+  the product link graph.
 
-Detailed design notes remain adjacent to the owning crate under `crates/*/docs/`.
+## Current Supervision Truth
+
+Each Flashkern team generation is guarded by a correlated hard deadline. The
+team records generation-stamped member entry and return state; completion and
+expiry race through one terminal decision. A hard expiry captures a reserved
+fatal capsule and aborts rather than recycling possibly live state.
+
+The fatal capsule is durably release-committed to a prefaulted, locked,
+file-backed store before abort. Platform crash-report ingestion and
+per-stage/shape calibration of the conservative one-second hard budget remain
+release gates.
+
+The native Sesame implementation contains independent microphone and playback
+state, and the native device callback feeds exact played-sample evidence into
+the playback stream. Real-device echo/AEC qualification remains open; Rust RMS
+is telemetry, not turn detection.
 
 ## Integration Guides
 
-- [`KCORO_ARENA_INTEGRATION.md`](KCORO_ARENA_INTEGRATION.md) - current and target
-  architecture, the source-exact mounted pass sequence, memory ownership, fixed
-  Flashkern lanes, wait exceptions, tickets/callbacks, host adapters, Tauri
-  observation, durable workflows, shutdown ordering, and verification gates.
-- [`10-stateful-multi-agent-runtime.md`](../../specs/10-stateful-multi-agent-runtime.md) -
-  one shared model with many conversation images, fast switching, perspective
-  forks, macro batching, delta hibernation, and WAL-backed orchestration.
+- [`KCORO_ARENA_INTEGRATION.md`](KCORO_ARENA_INTEGRATION.md) — live ownership,
+  callback, ticket, PCM, deadline, and teardown contracts.
+- [`10-stateful-multi-agent-runtime.md`](../../specs/10-stateful-multi-agent-runtime.md) —
+  future multi-conversation scheduling and persistence design.
 
 ## Performance Evidence
 
-- [`G0_FENCE_SPIN_321538F1.md`](baselines/G0_FENCE_SPIN_321538F1.md) - frozen
-  spin-era latency, wake, allocation, and raw percentile baseline.
-- [`G3_SHARED_DOORBELLS_D2C43ABD.md`](baselines/G3_SHARED_DOORBELLS_D2C43ABD.md) -
-  committed shared-doorbell contract, exact wake accounting, zero-spin idle
-  behavior, and the G0 percentile comparison.
+- [`G0_FENCE_SPIN_321538F1.md`](baselines/G0_FENCE_SPIN_321538F1.md) — historical
+  spin-era baseline.
+- [`G3_SHARED_DOORBELLS_D2C43ABD.md`](baselines/G3_SHARED_DOORBELLS_D2C43ABD.md) —
+  shared-doorbell wake accounting and idle behavior.

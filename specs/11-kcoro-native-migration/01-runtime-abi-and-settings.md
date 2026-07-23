@@ -6,14 +6,14 @@ Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 
 ## Goal
 
-Define one stable product C ABI plus one private SQ/CQ leaf through which Rust
-controls the native voice runtime. Tauri remains the product host; the dedicated
-Rust kcoro runtime owns realtime policy. Rust validates persisted settings,
-resolves model directories and credentials, coordinates opaque descriptors, and
-forwards small events. It does not own model tensors, PCM, numerical inference
-state, or compute/audio worker loops. C++ opens model files and is the sole
-caller of numerical kernel tables; Rust exposes no DSP, model, sampler, codec,
-or payload-bearing math API.
+Define one stable product C ABI plus two deliberately separate private queue
+contracts. The native model SQ/CQ and PCM docks stay entirely native. Tauri
+remains the product host; Rust owns persisted settings, opaque handles, control,
+and bounded event projection. Native code owns OS audio streams and all
+audio/model continuations. Rust does not own platform PCM, model tensors,
+passes, tokens, recurrence, or numerical state. C++ opens model files and
+controls plans, buffers, barriers, and dispatch; every numerical body called by
+that control layer is architecture assembly or an explicit Accelerate/AMX seam.
 
 ## Current Boundary
 
@@ -48,15 +48,16 @@ or payload-bearing math API.
 8. The ABI is a control plane, not an operator API. It exposes lifecycle,
    commands, bounded metadata events, and snapshots; it has no generic tensor
    operation or numerical payload push/pull function.
-9. Rust kcoro owns action/pass ticket identity and terminal promises. Native pass
-   slots remain private handles named by generation-protected descriptor IDs;
-   Tauri receives only bounded value snapshots and metadata events.
+9. The native runtime owns model action/pass ticket identity and terminal
+   promises. Rust kcoro owns only audio/control I/O operation identity. Native
+   pass slots remain generation-protected private handles; Tauri receives only
+   bounded value snapshots and metadata events.
 10. Reliable semantic callbacks and lossy telemetry observers are separate sink
     classes. Observer failure can never stop or delay a session.
-11. A fixed lane may publish one CQ cell and ring its doorbell, but it never
-    invokes arbitrary Rust. The resulting Rust continuation runs on a dedicated
-    kcoro worker, never on a fixed compute lane, audio callback, storage writer,
-    or Tauri thread.
+11. A fixed lane may publish one native CQ cell and ring its doorbell, but it
+    never invokes Rust. A native continuation consumes that edge. Rust kcoro is
+    resumed only by the separate PCM/control dock, never by an internal model
+    pass completion.
 
 ## Handle Graph
 
@@ -65,14 +66,14 @@ flowchart TB
     Runtime["LfmRuntime: workers, capabilities, platform adapters"]
     Model["LfmModel: immutable config, tokenizers, weight images, plans"]
     Session["LfmSession: audio streams, rings, VAD, native state"]
-    Scope["Rust kcoro session/conversation scope"]
+    Scope["Rust kcoro audio/control scope"]
     Conv["LfmConversation: mutable context and model state"]
-    Action["parent action ticket: turn, frame, workflow"]
-    Pass["child pass ticket: one full numerical pass"]
+    Action["native action ticket: turn, frame, workflow"]
+    Pass["native child pass ticket"]
 
     Runtime --> Model
     Runtime --> Session
-    Runtime --> Scope
+    Session --> Scope
     Model --> Session
     Session --> Conv
     Scope --> Action
@@ -96,8 +97,8 @@ Create these production headers under `crates/liquid-audio/native/include/`:
 
 ```text
 lfm_types.h       status, ABI version, IDs, spans, capability bits
-lfm_runtime.h     runtime lifecycle and snapshots
-lfm_model.h       synchronous model open and immutable metadata
+lfm_runtime.h     runtime/model lifecycle, snapshots, and memory accounting
+lfm_model.h       compatibility tombstone; includes lfm_runtime.h only
 lfm_session.h     audio session, commands, callbacks, statistics
 lfm_conversation.h conversation create/attach/reset/snapshot hooks
 lfm_observe.h     ticket IDs, bounded kernel snapshots, lossy observer sink
@@ -109,6 +110,11 @@ handwritten private declarations in
 `crates/liquid-audio/src/compute/weights.rs:25-71`, and
 `crates/liquid-audio/src/mimi_native.rs:19-30` are transitional and must not
 become three public ABIs.
+
+The transitional synchronous model-info, token-step, numerical prefill, and
+audio-code declarations live only in
+`crates/liquid-audio/native/src/model/lfm_model_legacy.h`. They remain linkable
+for offline oracle gates but are deliberately absent from the product headers.
 
 ## Core ABI Types
 
@@ -144,7 +150,7 @@ typedef enum LfmObserverLevelV1 {
 } LfmObserverLevelV1;
 
 typedef enum LfmServiceClassV1 {
-    LFM_SERVICE_DEADLINE = 1,
+    LFM_SERVICE_REALTIME = 1,
     LFM_SERVICE_INTERACTIVE = 2,
     LFM_SERVICE_BACKGROUND = 3
 } LfmServiceClassV1;
@@ -240,24 +246,24 @@ typedef struct LfmKernelSnapshotV1 {
     uint32_t total_lanes;
     uint32_t command_depth;
     uint32_t completion_depth;
-    uint32_t ready_deadline;
+    uint32_t ready_realtime;
     uint32_t ready_interactive;
     uint32_t ready_background;
     uint32_t active_service_class;
     uint32_t consecutive_passes;
     uint32_t reserved0;
-    uint64_t quantum_remaining_ns;
-    uint64_t active_pass_budget_ns;
+    uint64_t quantum_remaining_passes;
+    uint64_t active_pass_budget_generations;
     uint64_t longest_pass_ns;
-    uint64_t deadline_deferrals;
-    uint64_t deadline_misses;
+    uint64_t realtime_deferrals;
+    uint64_t reserved1;
     uint32_t ticket_capacity;
     uint32_t ticket_high_water;
     uint64_t coordination_wakes;
     uint64_t dispatch_wake_calls;
-    uint64_t fence_wake_calls;
-    uint64_t logical_fence_waiters;
-    uint64_t spurious_wait_returns;
+    uint64_t team_generations;
+    uint64_t completion_callbacks;
+    uint64_t reserved2;
     uint64_t dropped_telemetry;
 } LfmKernelSnapshotV1;
 ```
@@ -380,8 +386,8 @@ Semantics:
 - `destroy` performs no implicit unbounded join. It requires a joined object.
 - `on_stopped` is the final reliable semantic callback and occurs exactly once
   before join returns. Observer callbacks use their own detach/join contract.
-- action/pass terminal promises finish inside Rust kcoro coordination before
-  projected semantic or telemetry events reach the Tauri host;
+- model action/pass terminal promises finish inside native coordination before
+  PCM/control edges or projected telemetry reach the Rust host;
 - each pass ticket is single-shot and distinguishes numerical completion from
   committed versus stale publication.
 
