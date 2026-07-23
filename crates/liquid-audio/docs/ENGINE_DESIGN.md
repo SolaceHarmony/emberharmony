@@ -197,15 +197,18 @@ The 200 ms prepare gate currently records retained policy readiness only.
 Candidate-owned activation scratch and speculative numerical execution remain
 open work.
 
-The detector also implements separate playback adaptive state, but the product
-session currently calls only the microphone stream. Feeding exact playback
-evidence through Sesame remains an open integration gate; Rust output RMS is
-telemetry only.
+The product device callback feeds exact played-sample evidence into the
+detector's independent playback adaptive state. The 700 ms echo tail and
+400 ms sustained microphone evidence drive the correlated barge-in edge.
+Real-device echo/AEC qualification remains open; Rust output RMS is telemetry
+only.
 
 ## Correlated Deadlines
 
 Each numerical team generation is hard-supervised by a readiness-time
-`kc_deadline_source`. On macOS it uses a monotonic GCD one-shot; non-Apple
+`kc::TeamSupervisor`, which owns its `kc_deadline_source`, terminal
+arbitration, quorum observation, and `kc::FatalStore`. On macOS the source uses
+a monotonic GCD one-shot; non-Apple
 production runtime construction returns `LFM_STATUS_UNSUPPORTED` before
 admission, while private tests use a deterministic manual backend.
 
@@ -220,10 +223,13 @@ never-entered, and entered-not-returned masks in a reserved fatal capsule,
 suppresses CQ/recurrence/scratch retirement, and aborts. There is no numerical
 retry or potentially-live scratch reuse.
 
-The mechanism is landed, but two release requirements remain open: the capsule
-is not yet exported to a durable observable crash sink, and the one-second
-budget is a provisional floor rather than a calibrated per-stage/shape value.
-Soft nudge/rebroadcast behavior is not part of production.
+The capsule is copied into a setup-time-created, prefaulted, locked,
+file-backed shared mapping before `abort()`. Publication is bounded stores plus
+one release commit, so crash evidence survives without a failure-path
+allocation, format operation, or storage syscall. The one-second closed-table
+budget remains a conservative floor; calibrated per-stage/shape values and
+platform crash-report ingestion remain release work. Soft nudge/rebroadcast
+behavior is not part of production.
 
 ## Teardown
 
@@ -249,8 +255,11 @@ Current tests include:
 - `kcoro_arena/tests/team_executor_contract.cpp` for saturated-mailbox
   draining, multi-generation advancement, exact rejection completion,
   coalesced-edge safety, and callback-proven retirement;
+- `kcoro_arena/tests/team_supervisor_contract.cpp` for deadline retirement,
+  terminal arbitration, fatal-store persistence, and both missing-lane
+  classes;
 - `engine_hard_supervision.rs` for deadline retirement, terminal arbitration,
-  and fatal-capsule content;
+  product capsule content, and the native engine fault-injection seam;
 - `sesame_detector.rs` for exact browser evidence, circular windows, separate
   stream state, and malformed input;
 - `native_voice_session.rs` for PCM leases, exact sample-clock policy, pause

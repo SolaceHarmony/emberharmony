@@ -504,6 +504,14 @@ class PermitBroker {
         kc_ticket_id identity{};
         kc_ticket_id ticket{};
         std::uint32_t index = UINT32_MAX;
+        /*
+         * Retirement is durable state, not a one-shot event. A Stop callback
+         * can land after this continuation drains `event` but before it calls
+         * koro_cont_finish(); in that ordering the runtime correctly preserves
+         * the wake and re-enters the frame. The next invocation must still see
+         * the terminal predicate after the event record has been consumed.
+         */
+        std::atomic<bool> stop_requested{false};
         std::atomic<std::uint64_t> sequence{0};
         std::atomic<std::uint32_t> service{
             static_cast<std::uint32_t>(
@@ -578,6 +586,10 @@ class PermitBroker {
         for (;;) {
             frame->event = entry->event.exchange(
                 event_none_, std::memory_order_acq_rel);
+            if (entry->stop_requested.load(
+                    std::memory_order_acquire)) {
+                break;
+            }
             if (frame->event == event_none_) {
                 KORO_SUSPEND(continuation);
                 continue;
@@ -618,6 +630,10 @@ class PermitBroker {
     }
 
     void signal(Entry &entry, PermitEvent event) noexcept {
+        if (event == PermitEvent::Stop) {
+            entry.stop_requested.store(
+                true, std::memory_order_release);
+        }
         std::uint32_t empty = event_none_;
         if (!entry.event.compare_exchange_strong(
                 empty, static_cast<std::uint32_t>(event),

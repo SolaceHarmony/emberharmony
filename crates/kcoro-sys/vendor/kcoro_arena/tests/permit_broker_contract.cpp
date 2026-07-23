@@ -30,6 +30,7 @@ struct Record {
 };
 
 using Broker = kc::PermitBroker<Record, 5>;
+using StopBroker = kc::PermitBroker<Record, 64>;
 
 struct Probe {
     Broker *broker = nullptr;
@@ -149,9 +150,93 @@ void wait_grants(Probe &probe, unsigned count,
           message);
 }
 
+kc::PermitAdvance stop_step(void *, StopBroker::Lease,
+                            Record &, kc::PermitEvent) noexcept {
+    std::abort();
+}
+
+void stop_finished(void *, StopBroker::Lease, Record &,
+                   int) noexcept {
+    std::abort();
+}
+
+void retirement_edge_contract() {
+    kc::TicketSource tickets;
+    Probe probe;
+    probe.capacity_identity =
+        tickets.mint(KC_TICKET_KIND_CONTROL);
+
+    kc_runtime_t *runtime = nullptr;
+    /*
+     * Keep one spare board for continuation-slot retirement. unregister()
+     * closes publication admission immediately, but a callback that entered
+     * the slot gate before close may still hold the old slot until it returns.
+     * That is bounded retained state, not live work or another thread.
+     */
+    check(kc_runtime_create_capacity(4, 130, &runtime) == 0,
+          "retirement runtime creation failed");
+    check(kc_runtime_start(runtime) == 0,
+          "retirement runtime start failed");
+
+    /*
+     * Starting and immediately stopping a full permit board forces Stop to
+     * race first execution on several physical workers. The terminal predicate
+     * must survive when a route frame drains its event before the matching
+     * wake deposit reaches koro_cont_finish(). Reuse one ready runtime so this
+     * also proves no per-broker OS thread is created.
+     */
+    for (std::uint32_t cycle = 0; cycle < 4096; ++cycle) {
+        StopBroker broker;
+        const StopBroker::Config config = {
+            .runtime = runtime,
+            .tickets = &tickets,
+            .ticket_kind = KC_TICKET_KIND_WORKFLOW,
+            .age_promotion = 64,
+            .context = &probe,
+            .operations = {
+                .reset = reset,
+                .step = stop_step,
+                .finished = stop_finished,
+            },
+            .capacity_ready = {
+                capacity, &probe, probe.capacity_identity},
+        };
+        const int initialized = broker.initialize(config);
+        if (initialized != 0) {
+            std::fprintf(
+                stderr,
+                "retirement broker initialization failed at cycle %u: %d\n",
+                cycle, initialized);
+            std::abort();
+        }
+        check(broker.start() == 0,
+              "retirement broker start failed");
+        broker.request_stop();
+        check(kc_runtime_join_all(runtime) == 0,
+              "Stop edge was consumed without durable retirement");
+        check(broker.join() == 0,
+              "retirement broker service did not retire");
+        check(broker.destroy() == 0,
+              "retirement broker setup leases did not destroy");
+    }
+
+    kc_runtime_snapshot snapshot{};
+    check(kc_runtime_snapshot_get(runtime, &snapshot) == 0 &&
+              snapshot.active == 0 && snapshot.running == 0 &&
+              snapshot.queued == 0 && snapshot.workers == 4,
+          "retirement stress changed the bounded worker topology");
+    kc_runtime_request_stop(runtime);
+    check(kc_runtime_join(runtime) == 0,
+          "retirement runtime join failed");
+    check(kc_runtime_destroy(runtime) == 0,
+          "retirement runtime destroy failed");
+}
+
 } // namespace
 
 int main() {
+    retirement_edge_contract();
+
     check(Broker::age(7, 9) == 0,
           "snapshot-newer work did not receive age zero");
 

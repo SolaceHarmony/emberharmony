@@ -119,10 +119,10 @@ The current prepare edge records durable policy readiness only. Candidate-owned
 activation scratch and speculative model execution have not landed and must not
 be inferred from the name of the gate.
 
-The detector maintains separate mic and playback adaptive state and its tests
-exercise both. The production session currently invokes only
-`LFM_SESAME_STREAM_MIC`; it does not yet feed playback evidence into the
-detector. Playback-aware Sesame/echo classification is therefore an open gate.
+The detector maintains separate mic and playback adaptive state. The native
+device callback publishes exact played-sample evidence into the playback
+stream; its 700 ms echo tail and 400 ms sustained microphone evidence drive the
+correlated barge-in edge. Real-device echo/AEC qualification remains open.
 Rust RMS values are output/latency telemetry and must not be described as the
 turn detector.
 
@@ -190,11 +190,12 @@ not a polling waiter attached to an operation.
 
 ## Deadline Supervision
 
-`kc_deadline_source` is a fixed readiness-time pool. On macOS each slot uses a
-GCD one-shot based on monotonic `dispatch_time`; wall-clock timers are forbidden
-for speech and numerical liveness. Non-Apple production construction fails with
-`LFM_STATUS_UNSUPPORTED` before work is admitted. A deterministic manual source
-exists only behind private test constructors.
+`kc::TeamSupervisor` owns a fixed readiness-time `kc_deadline_source`, terminal
+arbiter, quorum observation, and `kc::FatalStore`. On macOS each deadline slot
+uses a GCD one-shot based on monotonic `dispatch_time`; wall-clock timers are
+forbidden for speech and numerical liveness. Non-Apple production construction
+fails with `LFM_STATUS_UNSUPPORTED` before work is admitted. A deterministic
+manual source exists only behind private test constructors.
 
 Every Flashkern generation currently has a hard-only one-second deadline.
 Completion and expiry race through one terminal CAS. If expiry wins, the
@@ -203,13 +204,12 @@ ticket lineage and stage/shape evidence into reserved storage, suppresses all
 CQ/recurrence/scratch retirement, and aborts. Stateful numerical work is not
 retried.
 
-This mechanism has landed, but release supervision is not complete:
-
-- the reserved fatal capsule is only in process memory when `abort()` executes;
-  a durable platform crash sink/export must make it observable;
-- the one-second value is a provisional floor. Per-stage/shape budgets must be
-  frozen from the target million-generation benchmark before tightening;
-- soft targeted nudges and full-team rebroadcast are not production behavior.
+The reserved fatal capsule is committed before abort to a setup-time-created,
+prefaulted, locked file-backed mapping. The failure path performs bounded
+stores and one release commit only. Release supervision still requires
+per-stage/shape budgets frozen from the target million-generation benchmark
+and platform crash-report ingestion. Soft targeted nudges and full-team
+rebroadcast are not production behavior.
 
 ## Memory and Numerical Boundaries
 

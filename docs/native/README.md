@@ -67,16 +67,15 @@ team records generation-stamped member entry and return state; completion and
 expiry race through one terminal decision. A hard expiry captures a reserved
 fatal capsule and aborts rather than recycling possibly live state.
 
-Two release gates remain open:
-
-- the fatal capsule is not yet exported to a durable, observable crash sink;
-- the one-second hard budget is provisional rather than calibrated per
-  stage/shape from the required target benchmark.
+The fatal capsule is durably release-committed to a prefaulted, locked,
+file-backed store before abort. Platform crash-report ingestion and
+per-stage/shape calibration of the conservative one-second hard budget remain
+release gates.
 
 The native Sesame implementation contains independent microphone and playback
-state, but the production session currently feeds only microphone evidence.
-Playback-aware Sesame/echo classification remains open; Rust RMS is telemetry,
-not turn detection.
+state, and the native device callback feeds exact played-sample evidence into
+the playback stream. Real-device echo/AEC qualification remains open; Rust RMS
+is telemetry, not turn detection.
 
 ## Integration Guides
 

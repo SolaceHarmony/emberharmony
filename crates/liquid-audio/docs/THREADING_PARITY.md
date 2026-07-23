@@ -113,12 +113,12 @@ one terminal decision.
 
 Current limitations:
 
-- the native detector's playback state exists, but production feeds only the
-  microphone stream;
+- playback-fed Sesame is mounted through the native device callback; real
+  hardware echo/AEC behavior still needs release qualification;
 - the Flashkern one-second hard deadline is provisional and not yet calibrated
   by stage/shape;
-- the fatal capsule is captured before abort but is not yet routed to a durable,
-  observable platform crash sink.
+- the fatal capsule is durably committed to its prefaulted file-backed store
+  before abort; platform crash-report ingestion remains release work.
 
 ## Teardown ownership
 

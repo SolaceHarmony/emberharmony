@@ -219,17 +219,22 @@ fn run_fatal_child(point: u32) -> FatalCapsule {
 }
 
 #[test]
-fn uncalibrated_production_passes_do_not_receive_a_fatal_budget() {
-    /* Every currently valid request family is explicitly disabled until its
-     * exact architecture/lane/stage/shape calibration is frozen. There is no
-     * universal fallback that may abort legitimate work. */
+fn mounted_production_passes_receive_the_closed_hard_budget() {
+    /* Every currently mounted request family is an explicit member of the
+     * closed production table. Unknown selectors still receive no fallback
+     * and are rejected before a team generation can be dispatched. */
     for request in [2, 3, 4, 8, 13, 14, 15] {
         assert_eq!(
             unsafe { lfm_internal_engine_hard_budget_for_test(0, request) },
-            0,
-            "request {request} acquired an uncalibrated fatal budget"
+            1_000_000_000,
+            "request {request} lost its production hard budget"
         );
     }
+    assert_eq!(
+        unsafe { lfm_internal_engine_hard_budget_for_test(0, 0xffff) },
+        0,
+        "an unknown request acquired a fallback budget"
+    );
     assert_eq!(
         unsafe { lfm_internal_engine_hard_budget_for_test(1, 15) },
         1_000_000_000,

@@ -4,11 +4,13 @@
 // threadgroup runs a kernel. There is no host coordinator publishing stages:
 // stages advance through fixed-team generation callbacks, tiles
 // are claimed off a bare fetch_add counter (so an E-core straggler simply claims
-// fewer), and each fence's last arriver runs that boundary's serial ladder work
-// (sumsq folds, conv update, qk-norm/rope/append, embed) exactly once. The only
-// runtime boundary is kcoro's fixed typed TeamExecutor: its retained frame
-// mounts one pass descriptor, and the final lane callback resumes that exact
-// frame before it publishes one correlated completion record.
+// fewer). Each generation's final-return callback advances the bounded program
+// cursor exactly once. Numerical serial phases are explicit generations owned
+// by their selected logical member; they are not smuggled into a host-side
+// barrier callback. The only runtime boundary is kcoro's fixed typed
+// TeamExecutor: its retained frame mounts one pass descriptor, and the final
+// member callback resumes that exact frame before it publishes one correlated
+// completion record.
 //
 // Every operation enters through a retained workflow ticket. Completion makes
 // the next continuation runnable; no caller thread waits on numerical progress.
@@ -31,21 +33,12 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
-#include <cstdio>
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
 
 #include "flashkern_depth.h"
 #include "flashkern_gemm.h"
@@ -62,14 +55,12 @@
 #include "kc_mailbox.hpp"
 #include "kc_permit_broker.hpp"
 #include "kc_team_executor.hpp"
+#include "kc_team_supervisor.hpp"
 #include "../runtime/lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
 
 extern "C" {
-#include "kc_deadline.h"
-#include "kc_port.h"
 #include "kc_runtime.h"
-#include "kc_service.h"
 #include "kc_team.h"
 #include "kcoro_stackless.h"
 }
@@ -122,21 +113,10 @@ constexpr size_t ENGINE_CACHELINE = 128;
 constexpr uint32_t PASS_PUBLISHER_CAPACITY =
     static_cast<uint32_t>(ROUTE_CAPACITY + PASS_CAPACITY);
 constexpr uint32_t TEAM_DEADLINE_SLOT = 0;
-/* Deterministic fault probes use a conservative hard deadline. Production
- * work receives no fatal deadline until its exact stage/shape class has a
- * frozen target-machine benchmark. An uncalibrated timeout is not safety: it
- * is a delayed process-abort bug against valid work. */
+/* The closed production request table below assigns this conservative
+ * generation ceiling to every currently mounted numerical family. Unknown
+ * work receives no fallback and is rejected before team dispatch. */
 constexpr uint64_t TEAM_PROBE_HARD_DEADLINE_NS = UINT64_C(1000000000);
-constexpr uint32_t TEAM_TERMINAL_BITS = 2;
-constexpr uint64_t TEAM_TERMINAL_MASK =
-    (UINT64_C(1) << TEAM_TERMINAL_BITS) - 1;
-constexpr uint64_t TEAM_GENERATION_MAX = UINT64_MAX >> TEAM_TERMINAL_BITS;
-enum : uint32_t {
-    TEAM_TERMINAL_IDLE = 0,
-    TEAM_TERMINAL_ACTIVE = 1,
-    TEAM_TERMINAL_COMPLETED = 2,
-    TEAM_TERMINAL_TIMED_OUT = 3,
-};
 constexpr size_t PREFILL_ROWS = LFM_PREFILL_MAX_ROWS;
 constexpr size_t TOKEN_INPUT_MAX_IDS = 8;
 static bool checked_size_product(size_t left, size_t right, size_t *out) {
@@ -843,36 +823,6 @@ struct alignas(ENGINE_CACHELINE) TeamFatalCapsule {
 static_assert(std::is_trivially_copyable_v<TeamFatalCapsule>);
 
 constexpr uint64_t TEAM_FATAL_SINK_MAGIC = UINT64_C(0x314c415441464b46);
-constexpr uint32_t TEAM_FATAL_SINK_ABI = 1;
-constexpr uint32_t TEAM_FATAL_SINK_COMMITTED = 1;
-
-/* One cache-isolated header followed by one TeamFatalCapsule. The file-backed
- * mapping is created, sized, prefaulted, and locked before inference admission.
- * Fatal publication therefore performs bounded memory stores only. MAP_SHARED
- * preserves the committed page after process death without adding a blocking
- * write/fsync/msync operation to the poisoned execution path. */
-struct alignas(ENGINE_CACHELINE) TeamFatalSinkHeader {
-    uint64_t magic = TEAM_FATAL_SINK_MAGIC;
-    uint32_t abi_version = TEAM_FATAL_SINK_ABI;
-    uint32_t header_size = sizeof(TeamFatalSinkHeader);
-    uint32_t capsule_size = sizeof(TeamFatalCapsule);
-    uint32_t committed = 0;
-    uint64_t runtime_epoch = 0;
-    uint64_t checksum = 0;
-    unsigned char reserved[ENGINE_CACHELINE - 40]{};
-};
-static_assert(sizeof(TeamFatalSinkHeader) == ENGINE_CACHELINE);
-static_assert(std::is_trivially_copyable_v<TeamFatalSinkHeader>);
-static_assert(std::atomic_ref<uint32_t>::is_always_lock_free);
-
-struct TeamFatalSink {
-#if !defined(_WIN32)
-    int descriptor = -1;
-    void *mapping = MAP_FAILED;
-    size_t bytes = 0;
-    char path[PATH_MAX]{};
-#endif
-};
 
 struct TeamFaultTestConfig {
     uint32_t member = 0;
@@ -880,199 +830,9 @@ struct TeamFaultTestConfig {
     const char *fatal_path = nullptr;
 };
 
-static constexpr size_t TEAM_FATAL_SINK_BYTES =
-    sizeof(TeamFatalSinkHeader) + sizeof(TeamFatalCapsule);
-
-static uint64_t fatal_capsule_checksum(const TeamFatalCapsule &capsule) {
-    const auto *bytes = reinterpret_cast<const unsigned char *>(&capsule);
-    uint64_t hash = UINT64_C(14695981039346656037);
-    for (size_t index = 0; index < sizeof(capsule); ++index) {
-        hash ^= bytes[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static int fatal_sink_create(TeamFatalSink *sink, uint64_t runtime_epoch,
-                             const char *requested_path) {
-#if defined(_WIN32)
-    (void)sink;
-    (void)runtime_epoch;
-    (void)requested_path;
-    return -ENOTSUP;
-#else
-    if (!sink || runtime_epoch == 0 || sink->mapping != MAP_FAILED ||
-        sink->descriptor != -1) {
-        return -EINVAL;
-    }
-    int descriptor = -1;
-    if (requested_path) {
-        const int length = std::snprintf(sink->path, sizeof(sink->path), "%s",
-                                         requested_path);
-        if (length <= 0 || static_cast<size_t>(length) >= sizeof(sink->path))
-            return -ENAMETOOLONG;
-        descriptor = ::open(sink->path,
-                            O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-    } else {
-        const char *directory = std::getenv("TMPDIR");
-        if (!directory || directory[0] == '\0') directory = "/tmp";
-        const int length = std::snprintf(
-            sink->path, sizeof(sink->path),
-            "%s/emberharmony-flashkern-fatal-XXXXXX", directory);
-        if (length <= 0 || static_cast<size_t>(length) >= sizeof(sink->path))
-            return -ENAMETOOLONG;
-        descriptor = ::mkstemp(sink->path);
-        if (descriptor >= 0) {
-            const int flags = ::fcntl(descriptor, F_GETFD);
-            if (flags < 0 || ::fcntl(descriptor, F_SETFD,
-                                      flags | FD_CLOEXEC) != 0) {
-                const int error = errno;
-                ::close(descriptor);
-                ::unlink(sink->path);
-                sink->path[0] = '\0';
-                return -error;
-            }
-        }
-    }
-    if (descriptor < 0) {
-        const int error = errno;
-        sink->path[0] = '\0';
-        return -error;
-    }
-    if (::ftruncate(descriptor,
-                    static_cast<off_t>(TEAM_FATAL_SINK_BYTES)) != 0) {
-        const int error = errno;
-        ::close(descriptor);
-        ::unlink(sink->path);
-        sink->path[0] = '\0';
-        return -error;
-    }
-    void *mapping = ::mmap(nullptr, TEAM_FATAL_SINK_BYTES,
-                           PROT_READ | PROT_WRITE, MAP_SHARED, descriptor, 0);
-    if (mapping == MAP_FAILED) {
-        const int error = errno;
-        ::close(descriptor);
-        ::unlink(sink->path);
-        sink->path[0] = '\0';
-        return -error;
-    }
-    std::memset(mapping, 0, TEAM_FATAL_SINK_BYTES);
-    auto *header = new (mapping) TeamFatalSinkHeader();
-    header->runtime_epoch = runtime_epoch;
-    /* One sub-page record should always fit the process lock budget. Refusing
-     * readiness is safer than advertising non-droppable fatal evidence backed
-     * by an evictable page. */
-    if (::mlock(mapping, TEAM_FATAL_SINK_BYTES) != 0) {
-        const int error = errno;
-        ::munmap(mapping, TEAM_FATAL_SINK_BYTES);
-        ::close(descriptor);
-        ::unlink(sink->path);
-        sink->path[0] = '\0';
-        return -error;
-    }
-    sink->descriptor = descriptor;
-    sink->mapping = mapping;
-    sink->bytes = TEAM_FATAL_SINK_BYTES;
-    return 0;
-#endif
-}
-
-static void fatal_sink_destroy(TeamFatalSink *sink) {
-#if !defined(_WIN32)
-    if (!sink) return;
-    if (sink->mapping != MAP_FAILED) {
-        (void)::munlock(sink->mapping, sink->bytes);
-        (void)::munmap(sink->mapping, sink->bytes);
-        sink->mapping = MAP_FAILED;
-        sink->bytes = 0;
-    }
-    if (sink->descriptor >= 0) {
-        (void)::close(sink->descriptor);
-        sink->descriptor = -1;
-    }
-    if (sink->path[0] != '\0') {
-        (void)::unlink(sink->path);
-        sink->path[0] = '\0';
-    }
-#else
-    (void)sink;
-#endif
-}
-
-static void fatal_sink_publish(TeamFatalSink *sink,
-                               const TeamFatalCapsule &capsule) {
-#if defined(_WIN32)
-    (void)sink;
-    (void)capsule;
-    std::abort();
-#else
-    if (!sink || sink->mapping == MAP_FAILED ||
-        sink->bytes != TEAM_FATAL_SINK_BYTES) {
-        std::abort();
-    }
-    auto *header = static_cast<TeamFatalSinkHeader *>(sink->mapping);
-    auto *destination = reinterpret_cast<TeamFatalCapsule *>(
-        static_cast<unsigned char *>(sink->mapping) + sizeof(*header));
-    std::memcpy(destination, &capsule, sizeof(capsule));
-    header->checksum = fatal_capsule_checksum(*destination);
-    std::atomic_ref<uint32_t>(header->committed).store(
-        TEAM_FATAL_SINK_COMMITTED, std::memory_order_release);
-#endif
-}
-
-static constexpr uint64_t team_terminal_word(uint64_t generation,
-                                             uint32_t state) {
-    return (generation << TEAM_TERMINAL_BITS) | state;
-}
-
-static constexpr uint64_t team_terminal_generation(uint64_t word) {
-    return word >> TEAM_TERMINAL_BITS;
-}
-
-static constexpr uint32_t team_terminal_state(uint64_t word) {
-    return static_cast<uint32_t>(word & TEAM_TERMINAL_MASK);
-}
-
-static bool claim_team_terminal(std::atomic<uint64_t> *word,
-                                uint64_t generation, uint32_t winner) {
-    uint64_t expected =
-        team_terminal_word(generation, TEAM_TERMINAL_ACTIVE);
-    return word->compare_exchange_strong(
-        expected, team_terminal_word(generation, winner),
-        std::memory_order_acq_rel, std::memory_order_acquire);
-}
-
-enum : int {
-    TEAM_COMPLETION_PROCESS = 1,
-    TEAM_COMPLETION_EXPIRY_WON = 2,
-};
-
-/* The deadline slot is the authoritative linearization point. A successful
- * retire proves expiry cannot publish for this arm, so only that outcome may
- * advance ACTIVE to COMPLETED. EXPIRY_WON deliberately leaves ACTIVE intact;
- * the deadline source's correlated notification then lets the supervisor
- * claim TIMED_OUT and terminate the poisoned process. */
-static int settle_team_completion(std::atomic<uint64_t> *terminal,
-                                  uint64_t generation, int retired) {
-    if (!terminal || generation == 0 || generation > TEAM_GENERATION_MAX)
-        return -EINVAL;
-    if (retired == KC_DEADLINE_RETIRE_RETIRED) {
-        return claim_team_terminal(terminal, generation,
-                                   TEAM_TERMINAL_COMPLETED)
-            ? TEAM_COMPLETION_PROCESS
-            : -EFAULT;
-    }
-    if (retired != KC_DEADLINE_RETIRE_EXPIRY_WON) return -EINVAL;
-
-    const uint64_t observed = terminal->load(std::memory_order_acquire);
-    if (team_terminal_generation(observed) != generation) return -EFAULT;
-    const uint32_t state = team_terminal_state(observed);
-    if (state != TEAM_TERMINAL_ACTIVE &&
-        state != TEAM_TERMINAL_TIMED_OUT) {
-        return -EFAULT;
-    }
-    return TEAM_COMPLETION_EXPIRY_WON;
-}
+using EngineSupervisor =
+    kc::TeamSupervisor<FlashkernRequest, TeamWorkDescriptor,
+                       TeamFatalCapsule, ENGINE_CACHELINE>;
 
 struct Engine {
     // Whole-pass programs use the engine records below; continuation-mounted
@@ -1091,9 +851,7 @@ struct Engine {
     kc_runtime_t *control_runtime = nullptr;
     EngineExecutor executor;
     AudioRouteBroker routes;
-    kc_service_t *supervisor_service = nullptr;
-    kc_service_notifier_t *supervisor_notifier = nullptr;
-    kc_deadline_source_t *team_deadlines = nullptr;
+    EngineSupervisor supervisor;
     int n_workers = 0;
     int control_started = 0;
     int executor_started = 0;
@@ -1106,22 +864,10 @@ struct Engine {
     PassSlotPool slots;
     PassSlot *active_slot = nullptr;
     FlashkernRequest active_submission{};
-    /* One fixed team means one active generation and therefore one reusable
-     * deadline slot. The deadline slot decides whether completion or expiry
-     * won first; only a successfully retired deadline may publish COMPLETED in
-     * this generation-stamped terminal word. */
-    std::atomic<uint64_t> team_terminal{0};
-    kc_deadline_arm team_deadline_arm{};
-    FlashkernRequest supervised_submission{};
-    kc_ticket_id supervised_deadline{};
-    uint64_t supervised_scope_generation = 0;
-    uint64_t supervised_team_generation = 0;
-    uint64_t supervised_armed_ns = 0;
-    uint64_t supervised_hard_budget_ns = 0;
+    /* Flashkern retains only the model-specific descriptor used for diagnostics
+     * and budget selection. kc::TeamSupervisor owns deadline lineage,
+     * terminal arbitration, quorum evidence, and fatal storage. */
     TeamWorkDescriptor supervised_work{};
-    std::atomic<uint32_t> fatal_ready{0};
-    TeamFatalCapsule fatal_capsule{};
-    TeamFatalSink fatal_sink{};
     bool manual_deadlines = false;
     bool hard_timeout_probe = false;
     // Numerical publishers take a bounded, single-pass lease. Plan mutation
@@ -1232,12 +978,6 @@ static void publish_engine_diagnostics(Engine *engine) {
     state.publications.fetch_add(1, std::memory_order_release);
 }
 
-
-static void notify_service(kc_service_notifier_t *notifier) {
-    if (!notifier) return;
-    const int status = kc_service_notifier_notify(notifier);
-    if (status != 0 && status != -ECANCELED) std::abort();
-}
 
 static void notify_route_broker(void *context) {
     Engine *engine = static_cast<Engine *>(context);
@@ -4120,10 +3860,6 @@ static bool ticket_equal(const kc_ticket_id &a, const kc_ticket_id &b) {
     return kc::ticket_equal(a, b);
 }
 
-static void deadline_supervisor_notify(void *context) {
-    notify_service(static_cast<kc_service_notifier_t *>(context));
-}
-
 static uint64_t expected_team_mask(const Engine *e) {
     if (!e || e->lanes_total == 0 || e->lanes_total > 64) std::abort();
     return e->lanes_total == 64
@@ -4196,10 +3932,9 @@ static TeamWorkDescriptor describe_active_generation(const Engine *e) {
     return work;
 }
 
-/* Closed calibration whitelist. Zero means the descriptor is valid but not
- * calibrated for fatal enforcement on this exact target/lane/stage/shape
- * class. No generic fallback budget is permitted. The deterministic poisoned
- * lane probe is the only presently armed class. */
+/* Closed production budget table. Every mounted request family has an explicit
+ * conservative hard ceiling; an unknown selector returns zero and
+ * kc::TeamSupervisor rejects it before the team generation is dispatched. */
 static uint64_t team_hard_budget_ns(bool hard_timeout_probe,
                                     const TeamWorkDescriptor &work) {
     if (hard_timeout_probe) return TEAM_PROBE_HARD_DEADLINE_NS;
@@ -4211,24 +3946,26 @@ static uint64_t team_hard_budget_ns(bool hard_timeout_probe,
     case REQ_PREFILL:
     case REQ_AUDIO_DETOKENIZE:
     case REQ_AUDIO_ENCODE:
-        return 0;
+        return TEAM_PROBE_HARD_DEADLINE_NS;
     default:
         return 0;
     }
 }
 
 static void fill_team_fatal_capsule(
-    TeamFatalCapsule *capsule, const FlashkernRequest &submission,
-    const kc_deadline_event &event, const TeamWorkDescriptor &work,
-    uint64_t armed_ns, uint64_t budget_ns, uint64_t elapsed_ns,
-    int quorum_status, const kc_team_quorum_snapshot &quorum) {
-    if (!capsule) std::abort();
+    void *, TeamFatalCapsule &capsule,
+    const FlashkernRequest &submission,
+    const TeamWorkDescriptor &work,
+    const kc_deadline_event &event, uint64_t armed_ns,
+    uint64_t budget_ns, uint64_t elapsed_ns,
+    int quorum_status,
+    const kc_team_quorum_snapshot &quorum) noexcept {
     const uint64_t never_entered =
         quorum.expected_mask & ~quorum.entered_mask;
     const uint64_t entered_not_returned =
         quorum.entered_mask & ~quorum.returned_mask;
-    *capsule = {
-        .size = sizeof(*capsule),
+    capsule = {
+        .size = sizeof(capsule),
         .abi_version = 2,
         .request = work.request,
         .stage = work.stage,
@@ -4262,160 +3999,40 @@ static void fill_team_fatal_capsule(
     };
 }
 
-static bool deadline_event_matches(const Engine *e,
-                                   const kc_deadline_event &event) {
-    const FlashkernRequest &submission = e->supervised_submission;
-    return e->supervised_hard_budget_ns != 0 &&
-           event.kind == KC_DEADLINE_EVENT_EXPIRED &&
-           event.slot == TEAM_DEADLINE_SLOT &&
-           event.scheduled_arm_generation != 0 &&
-           event.current_arm_generation ==
-               event.scheduled_arm_generation &&
-           event.team_generation == e->supervised_team_generation &&
-           event.scope_generation == e->supervised_scope_generation &&
-           event.epoch == submission.epoch &&
-           event.domain == e->tickets.epoch() &&
-           ticket_equal(event.child, e->supervised_deadline) &&
-           ticket_equal(event.parent, submission.ticket) &&
-           submission.parent.runtime_epoch != 0 &&
-           submission.parent.sequence != 0 &&
-           submission.parent.generation != 0 &&
-           submission.parent.kind == KC_TICKET_KIND_WORKFLOW;
-}
-
-static void team_supervisor_main(void *context) {
-    Engine *e = static_cast<Engine *>(context);
-    kc_deadline_event event = {
-    };
-    const int event_status = kc_deadline_source_event_get(
-        e->team_deadlines, TEAM_DEADLINE_SLOT, &event);
-    if (event_status == 0) {
-        if (!deadline_event_matches(e, event)) std::abort();
-        if (!claim_team_terminal(&e->team_terminal, event.team_generation,
-                                 TEAM_TERMINAL_TIMED_OUT)) {
-            std::abort();
-        }
-        kc_team_quorum_snapshot quorum = {
-            .generation = event.team_generation,
-            .expected_mask = expected_team_mask(e),
-            .entered_mask = 0,
-            .returned_mask = 0,
-        };
-        const int quorum_status = kc_team_quorum_snapshot_get(
-            e->executor.team(), event.team_generation, &quorum);
-        if (quorum_status != 0) {
-            quorum.expected_mask = expected_team_mask(e);
-        }
-        const uint64_t now = kc_port_monotonic_ns();
-        const uint64_t elapsed = now >= e->supervised_armed_ns
-            ? now - e->supervised_armed_ns
-            : 0;
-        fill_team_fatal_capsule(
-            &e->fatal_capsule, e->supervised_submission, event,
-            e->supervised_work, e->supervised_armed_ns,
-            e->supervised_hard_budget_ns, elapsed, quorum_status, quorum);
-        /* The file-backed mapping was created, prefaulted, and locked before
-         * admission. Publish the exact pointer-free record with bounded stores
-         * and a release commit; there is no Rust callback, pipe, allocation,
-         * lock, wait, formatting, or storage-sync syscall on this fatal path. */
-        e->fatal_ready.store(1, std::memory_order_release);
-        fatal_sink_publish(&e->fatal_sink, e->fatal_capsule);
-        std::abort();
-    } else if (event_status != -EAGAIN) {
-        std::abort();
-    }
-
-    kc_deadline_source_snapshot snapshot = {
-    };
-    if (kc_deadline_source_snapshot_get(e->team_deadlines, &snapshot) != 0) {
-        std::abort();
-    }
-    if (snapshot.phase == KC_DEADLINE_SOURCE_STOPPED &&
-        snapshot.pending_events == 0) {
-        if (kc_service_complete_current(e->supervisor_service) != 0) {
-            std::abort();
-        }
-    }
-}
-
 static void hard_timeout_probe_ready(void *context, uint64_t generation) {
     Engine *e = static_cast<Engine *>(context);
+    const kc::TeamSupervisorSnapshot snapshot =
+        e ? e->supervisor.snapshot() : kc::TeamSupervisorSnapshot{};
     if (!e || !e->hard_timeout_probe || !e->manual_deadlines ||
-        generation != e->supervised_team_generation ||
-        e->team_deadline_arm.team_generation != generation ||
-        e->supervised_hard_budget_ns != TEAM_PROBE_HARD_DEADLINE_NS) {
+        generation != snapshot.generation ||
+        snapshot.arm_team_generation != generation ||
+        snapshot.budget_ns != TEAM_PROBE_HARD_DEADLINE_NS) {
         std::abort();
     }
-    const uint64_t now = kc_port_monotonic_ns();
-    e->supervised_armed_ns = now >= e->supervised_hard_budget_ns
-        ? now - e->supervised_hard_budget_ns
-        : 0;
-    if (kc_deadline_source_advance_manual_test(
-            e->team_deadlines, e->supervised_hard_budget_ns) != 0 ||
-        kc_deadline_source_fire_manual_test(
-            e->team_deadlines, TEAM_DEADLINE_SLOT) != 0) {
+    if (e->supervisor.expire_manual_test(generation) != 0) {
         std::abort();
     }
 }
 
-static void begin_team_supervision(Engine *e, uint64_t generation) {
-    if (!e || !e->team_deadlines || generation == 0 ||
-        generation > TEAM_GENERATION_MAX) {
-        std::abort();
-    }
-    uint64_t terminal = e->team_terminal.load(std::memory_order_acquire);
-    const uint64_t prior_generation = team_terminal_generation(terminal);
-    const uint32_t prior_state = team_terminal_state(terminal);
-    if (!((prior_generation == 0 && prior_state == TEAM_TERMINAL_IDLE) ||
-          (prior_generation < generation &&
-           prior_state == TEAM_TERMINAL_COMPLETED)) ||
-        !e->active_slot ||
+static int begin_team_supervision(
+    Engine *e, uint64_t generation) noexcept {
+    if (!e || !e->active_slot ||
         e->active_submission.lease_generation == 0) {
-        std::abort();
+        return -EINVAL;
     }
-    if (!e->team_terminal.compare_exchange_strong(
-            terminal,
-            team_terminal_word(generation, TEAM_TERMINAL_ACTIVE),
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        std::abort();
-    }
-
-    e->supervised_submission = e->active_submission;
-    e->supervised_scope_generation =
-        e->active_submission.lease_generation;
-    e->supervised_team_generation = generation;
     e->supervised_work = describe_active_generation(e);
-    e->supervised_hard_budget_ns =
+    const uint64_t budget =
         team_hard_budget_ns(e->hard_timeout_probe, e->supervised_work);
-    e->team_deadline_arm = {};
-    e->supervised_deadline = {};
-    if (e->supervised_hard_budget_ns == 0) {
-        e->supervised_armed_ns = 0;
-        return;
-    }
-    const kc_ticket_id child =
-        e->tickets.mint(KC_TICKET_KIND_DEADLINE);
-    /* Publish every identity field before arming. If this control callback is
-     * descheduled for the whole hard budget immediately after the native timer
-     * is armed, its expiry still observes a complete pointer-free correlation
-     * record and correctly reports a never-entered generation. */
-    e->supervised_deadline = child;
-    e->supervised_armed_ns = kc_port_monotonic_ns();
-    const kc_deadline_arm_config config = {
-        .slot = TEAM_DEADLINE_SLOT,
-        .delay_ns = e->supervised_hard_budget_ns,
-        .child = child,
+    if (budget == 0) return -ENODATA;
+    return e->supervisor.begin(
+        e->active_submission, e->supervised_work,
+        {
         .parent = e->active_submission.ticket,
         .scope_generation = e->active_submission.lease_generation,
         .epoch = e->active_submission.epoch,
         .domain = e->tickets.epoch(),
-        .team_generation = generation,
-    };
-    kc_deadline_arm arm = {};
-    if (kc_deadline_source_arm(e->team_deadlines, &config, &arm) != 0) {
-        std::abort();
-    }
-    e->team_deadline_arm = arm;
+        },
+        generation, budget);
 }
 
 static int executor_begin(void *context,
@@ -4522,7 +4139,8 @@ static int executor_before_generation(
                             e->active_submission.ticket)) {
         std::abort();
     }
-    begin_team_supervision(e, generation);
+    const int status = begin_team_supervision(e, generation);
+    if (status != 0) return status;
     publish_engine_diagnostics(e);
     return 0;
 }
@@ -4533,7 +4151,7 @@ static void executor_generation_returned(
     Engine *e = static_cast<Engine *>(context);
     if (!e || !ticket_equal(submission.ticket,
                             e->active_submission.ticket) ||
-        e->supervised_team_generation != generation) {
+        e->supervisor.snapshot().generation != generation) {
         std::abort();
     }
     e->diagnostics.team_completion_edge.store(
@@ -4544,34 +4162,20 @@ static kc::TeamReturn executor_accept_generation(
     void *context, const FlashkernRequest &submission,
     uint64_t generation) noexcept {
     Engine *e = static_cast<Engine *>(context);
-    if (!e || e->supervised_team_generation != generation ||
+    if (!e || e->supervisor.snapshot().generation != generation ||
         !ticket_equal(submission.ticket,
                       e->active_submission.ticket)) {
         std::abort();
     }
     e->diagnostics.team_completion_consumed.store(
         generation, std::memory_order_release);
-    if (e->supervised_hard_budget_ns == 0) {
-        if (e->team_deadline_arm.arm_generation != 0 ||
-            !claim_team_terminal(&e->team_terminal, generation,
-                                 TEAM_TERMINAL_COMPLETED)) {
-            std::abort();
-        }
+    kc::TeamCompletion completion{};
+    const int status =
+        e->supervisor.complete(generation, &completion);
+    if (status != 0) std::abort();
+    if (completion == kc::TeamCompletion::Continue)
         return kc::TeamReturn::Continue;
-    }
-    if (e->team_deadline_arm.team_generation != generation ||
-        e->team_deadline_arm.slot != TEAM_DEADLINE_SLOT ||
-        e->team_deadline_arm.arm_generation == 0) {
-        std::abort();
-    }
-    const int retired = kc_deadline_source_retire(
-        e->team_deadlines, TEAM_DEADLINE_SLOT,
-        e->team_deadline_arm.arm_generation);
-    const int decision =
-        settle_team_completion(&e->team_terminal, generation, retired);
-    if (decision == TEAM_COMPLETION_PROCESS)
-        return kc::TeamReturn::Continue;
-    if (decision == TEAM_COMPLETION_EXPIRY_WON)
+    if (completion == kc::TeamCompletion::ExpiryWon)
         return kc::TeamReturn::Halt;
     std::abort();
 }
@@ -4712,8 +4316,7 @@ static void executor_finish(
 
 static void executor_stopping(void *context) noexcept {
     Engine *e = static_cast<Engine *>(context);
-    if (e && e->team_deadlines)
-        kc_deadline_source_request_stop(e->team_deadlines);
+    if (e) e->supervisor.request_stop();
 }
 
 static void executor_retired(void *context,
@@ -5193,14 +4796,6 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     if (!e) return nullptr;
     e->manual_deadlines = manual_deadlines;
     if (fault) e->hard_timeout_probe = true;
-    const int fatal_status = fatal_sink_create(
-        &e->fatal_sink, e->tickets.epoch(),
-        fault ? fault->fatal_path : nullptr);
-    if (fatal_status != 0) {
-        if (out_status) *out_status = fatal_status;
-        delete e;
-        return nullptr;
-    }
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
     e->block_count = workers == (int)GRID_LANES ? 2u : 1u;
@@ -5217,17 +4812,6 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     if (kc_runtime_create_capacity(
             runtime_config.worker_count, continuation_capacity,
             &e->control_runtime) != 0) {
-        lfm_engine_free(e);
-        return nullptr;
-    }
-    const kc_service_config supervisor_service_config = {
-        .callback = team_supervisor_main,
-        .context = e,
-    };
-    if (kc_service_create(e->control_runtime, &supervisor_service_config,
-                          &e->supervisor_service) != 0 ||
-        kc_service_notifier_create(e->supervisor_service,
-                                   &e->supervisor_notifier) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
@@ -5279,6 +4863,29 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         lfm_engine_free(e);
         return nullptr;
     }
+    const EngineSupervisor::Config supervisor_config = {
+        .runtime = e->control_runtime,
+        .team = e->executor.team(),
+        .tickets = &e->tickets,
+        .ticket_kind = KC_TICKET_KIND_DEADLINE,
+        .deadline_slot = TEAM_DEADLINE_SLOT,
+        .expected_mask = expected_team_mask(e),
+        .fatal_magic = TEAM_FATAL_SINK_MAGIC,
+        .fatal_path = fault ? fault->fatal_path : nullptr,
+        .manual_deadlines = manual_deadlines,
+        .context = e,
+        .operations = {
+            .fill_fatal = fill_team_fatal_capsule,
+            .fatal_published = nullptr,
+        },
+    };
+    const int supervisor_status =
+        e->supervisor.initialize(supervisor_config);
+    if (supervisor_status != 0) {
+        if (out_status) *out_status = supervisor_status;
+        lfm_engine_free(e);
+        return nullptr;
+    }
     if (fault && kc_team_inject_member_exit_for_test(
                      e->executor.team(), 1, fault->member, fault->point,
                      hard_timeout_probe_ready, e) != 0) {
@@ -5286,26 +4893,12 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         return nullptr;
     }
     e->pass_admission.bind(notify_route_broker, e);
-    const kc_deadline_source_config deadline_config = {
-        .capacity = 1,
-        .notify = deadline_supervisor_notify,
-        .context = e->supervisor_notifier,
-    };
-    const int deadline_status = manual_deadlines
-        ? kc_deadline_source_create_manual_test(&deadline_config,
-                                                &e->team_deadlines)
-        : kc_deadline_source_create(&deadline_config, &e->team_deadlines);
-    if (deadline_status != 0) {
-        if (out_status) *out_status = deadline_status;
-        lfm_engine_free(e);
-        return nullptr;
-    }
     if (kc_runtime_start(e->control_runtime) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
     e->control_started = 1;
-    if (kc_service_start(e->supervisor_service) != 0 ||
+    if (e->supervisor.start() != 0 ||
         e->executor.start() != 0) {
         lfm_engine_free(e);
         return nullptr;
@@ -5348,7 +4941,7 @@ int lfm_internal_engine_trigger_hard_timeout_probe_for_test(void *ep) {
     Engine *e = static_cast<Engine *>(ep);
     if (!e || !e->hard_timeout_probe || !e->manual_deadlines ||
         e->active_slot || e->cur_req != REQ_NONE ||
-        e->team_terminal.load(std::memory_order_acquire) != 0) {
+        e->supervisor.snapshot().terminal != 0) {
         return -EINVAL;
     }
     PassSlot *slot = reserve_pass_slot(e);
@@ -5374,10 +4967,7 @@ void lfm_engine_request_stop(void *ep) {
     if (!e) return;
     e->routes.request_stop();
     e->executor.request_stop();
-    if (!e->team_deadlines && e->supervisor_service)
-        kc_service_request_stop(e->supervisor_service);
-    if (e->team_deadlines && !e->executor_started)
-        kc_deadline_source_request_stop(e->team_deadlines);
+    if (!e->executor_started) e->supervisor.request_stop();
 }
 
 // Private implementation-backed protocol probes. Selector membership is
@@ -5398,40 +4988,60 @@ uint64_t lfm_internal_engine_hard_budget_for_test(uint32_t probe,
 int lfm_internal_engine_team_terminal_race_for_test(
     uint64_t generation, uint32_t first, uint32_t second,
     uint32_t *winner_bits, uint32_t *terminal_state) {
-    if (generation == 0 || generation > TEAM_GENERATION_MAX ||
+    const uint32_t completed =
+        static_cast<uint32_t>(kc::TeamTerminalState::Completed);
+    const uint32_t timed_out =
+        static_cast<uint32_t>(kc::TeamTerminalState::TimedOut);
+    if (generation == 0 ||
+        generation > kc::TeamTerminal::max_generation ||
         !winner_bits || !terminal_state ||
-        (first != TEAM_TERMINAL_COMPLETED &&
-         first != TEAM_TERMINAL_TIMED_OUT) ||
-        (second != TEAM_TERMINAL_COMPLETED &&
-         second != TEAM_TERMINAL_TIMED_OUT) ||
+        (first != completed && first != timed_out) ||
+        (second != completed && second != timed_out) ||
         first == second) {
         return -EINVAL;
     }
-    std::atomic<uint64_t> terminal{
-        team_terminal_word(generation, TEAM_TERMINAL_ACTIVE)};
+    kc::TeamTerminal terminal;
+    if (terminal.begin(generation) != 0) return -EFAULT;
     uint32_t winners = 0;
-    if (claim_team_terminal(&terminal, generation, first)) winners |= 1;
-    if (claim_team_terminal(&terminal, generation, second)) winners |= 2;
-    const uint64_t result = terminal.load(std::memory_order_acquire);
-    if (team_terminal_generation(result) != generation) return -EFAULT;
+    if (terminal.claim(
+            generation,
+            static_cast<kc::TeamTerminalState>(first))) {
+        winners |= 1;
+    }
+    if (terminal.claim(
+            generation,
+            static_cast<kc::TeamTerminalState>(second))) {
+        winners |= 2;
+    }
+    const uint64_t result = terminal.word();
+    if (kc::TeamTerminal::generation_of(result) != generation)
+        return -EFAULT;
     *winner_bits = winners;
-    *terminal_state = team_terminal_state(result);
+    *terminal_state = static_cast<uint32_t>(
+        kc::TeamTerminal::state_of(result));
     return 0;
 }
 
 int lfm_internal_engine_completion_decision_for_test(
     uint64_t generation, int retire_result, int *decision,
     uint32_t *terminal_state) {
-    if (generation == 0 || generation > TEAM_GENERATION_MAX || !decision ||
+    if (generation == 0 ||
+        generation > kc::TeamTerminal::max_generation || !decision ||
         !terminal_state) {
         return -EINVAL;
     }
-    std::atomic<uint64_t> terminal{
-        team_terminal_word(generation, TEAM_TERMINAL_ACTIVE)};
-    *decision = settle_team_completion(&terminal, generation, retire_result);
-    const uint64_t observed = terminal.load(std::memory_order_acquire);
-    if (team_terminal_generation(observed) != generation) return -EFAULT;
-    *terminal_state = team_terminal_state(observed);
+    kc::TeamTerminal terminal;
+    if (terminal.begin(generation) != 0) return -EFAULT;
+    kc::TeamCompletion completion{};
+    const int status =
+        terminal.settle(generation, retire_result, &completion);
+    if (status != 0) return status;
+    *decision = static_cast<int>(completion);
+    const uint64_t observed = terminal.word();
+    if (kc::TeamTerminal::generation_of(observed) != generation)
+        return -EFAULT;
+    *terminal_state = static_cast<uint32_t>(
+        kc::TeamTerminal::state_of(observed));
     return 0;
 }
 
@@ -5498,8 +5108,8 @@ int lfm_internal_engine_fatal_capsule_for_test(
     constexpr uint64_t armed_ns = 1000;
     constexpr uint64_t elapsed_ns = TEAM_PROBE_HARD_DEADLINE_NS + 123;
     fill_team_fatal_capsule(
-        out, submission, event, work, armed_ns, TEAM_PROBE_HARD_DEADLINE_NS,
-        elapsed_ns, 0, quorum);
+        nullptr, *out, submission, work, event, armed_ns,
+        TEAM_PROBE_HARD_DEADLINE_NS, elapsed_ns, 0, quorum);
     return 0;
 }
 
@@ -5687,7 +5297,7 @@ extern "C++" int lfm_internal_engine_diagnostic_view(
     Engine *engine = static_cast<Engine *>(ep);
     if (!engine || !out || !engine->control_runtime ||
         !engine->executor.continuation() || !engine->routes.service() ||
-        !engine->supervisor_service || !engine->executor.team()) {
+        !engine->supervisor.service() || !engine->executor.team()) {
         return -EINVAL;
     }
     *out = {
@@ -5695,7 +5305,7 @@ extern "C++" int lfm_internal_engine_diagnostic_view(
         .runtime = engine->control_runtime,
         .bridge_continuation = engine->executor.continuation(),
         .route_service = engine->routes.service(),
-        .supervisor_service = engine->supervisor_service,
+        .supervisor_service = engine->supervisor.service(),
         .team = engine->executor.team(),
         .owner = engine,
     };
@@ -5729,8 +5339,7 @@ extern "C++" int lfm_internal_engine_diagnostic_counts(
         .mailbox_completions_published = mailbox.completions_published,
         .mailbox_completions_consumed = mailbox.completions_consumed,
         .gang_lease = executor.generation,
-        .team_terminal =
-            engine->team_terminal.load(std::memory_order_acquire),
+        .team_terminal = engine->supervisor.snapshot().terminal,
         .pass_slots_live =
             engine->pass_slots_live.load(std::memory_order_acquire),
     };
@@ -5771,32 +5380,11 @@ void lfm_engine_free(void *ep) {
         std::abort();
     }
     if (e->routes.join() != 0) std::abort();
-    if (e->supervisor_service) {
-        if (kc_service_join(e->supervisor_service) != 0) std::abort();
-    }
+    if (e->supervisor.join() != 0) std::abort();
     e->retire.store(true, std::memory_order_release);
     if (e->executor.destroy() != 0) std::abort();
-    if (e->team_deadlines) {
-        if (kc_deadline_source_join(e->team_deadlines) != 0 ||
-            kc_deadline_source_destroy(e->team_deadlines) != 0) {
-            std::abort();
-        }
-        e->team_deadlines = nullptr;
-    }
-    /* A notifier is the callback-side lifetime lease. Every engine-owned
-     * producer has been stopped and all retained continuations are DONE before
-     * it is released; service_destroy intentionally refuses to race a live
-     * notifier. */
-    if (e->supervisor_notifier) {
-        if (kc_service_notifier_destroy(e->supervisor_notifier) != 0)
-            std::abort();
-        e->supervisor_notifier = nullptr;
-    }
     if (e->routes.destroy() != 0) std::abort();
-    if (e->supervisor_service) {
-        if (kc_service_destroy(e->supervisor_service) != 0) std::abort();
-        e->supervisor_service = nullptr;
-    }
+    if (e->supervisor.destroy() != 0) std::abort();
     if (e->control_runtime) {
         kc_runtime_request_stop(e->control_runtime);
         if (kc_runtime_join(e->control_runtime) != 0 ||
@@ -5805,7 +5393,6 @@ void lfm_engine_free(void *ep) {
         }
         e->control_runtime = nullptr;
     }
-    fatal_sink_destroy(&e->fatal_sink);
     delete e;
 }
 

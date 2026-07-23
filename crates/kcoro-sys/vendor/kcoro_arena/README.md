@@ -62,6 +62,10 @@ producer callback
 - `include/kc_permit_broker.hpp`: fixed fair permit pool with one retained
   continuation per admitted operation, exact completion resumption, and
   callback-published capacity
+- `include/kc_team_supervisor.hpp`: correlated per-generation hard supervision,
+  exact completion/expiry arbitration, and quorum-failure capture
+- `include/kc_fatal_store.hpp`: prefaulted, locked, durable fatal-record
+  publication with no failure-path allocation or storage syscall
 - `core/src/kc_runtime.c`: bounded ready board, worker lifecycle, and callback delivery
 - `core/src/kcoro_stackless.c`: saved program counter/frame and exact-ticket resume
 - `core/src/kc_service.c`: retained stackless services and realtime edges
@@ -99,6 +103,11 @@ The permit-broker contract proves service-class/FIFO/age ordering, age zero for
 records newer than the selector snapshot, exact stale-completion rejection,
 two concurrently dehydrated operations, completion during execution without a
 lost edge, retained multi-hop frames, and callback-driven retirement.
+The team-supervisor contract proves an unbudgeted generation cannot dispatch,
+normal completion retires the exact deadline, completion and expiry publish
+one terminal state, never-entered and entered-never-returned lanes produce
+exact quorum masks, and fatal evidence survives the required process abort in
+the durable store.
 Rust bindings are not the authority for the native kernel.
 
 ## License
