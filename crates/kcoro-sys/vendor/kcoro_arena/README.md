@@ -57,6 +57,8 @@ producer callback
   generation-lease primitives
 - `include/kc_mailbox.hpp`: fixed typed request/completion exchange with
   sequence-stamped cells, endpoint leases, and correlated callback edges
+- `include/kc_team_executor.hpp`: retained mailbox-to-team continuation with
+  exact generation callbacks and asynchronous retirement
 - `core/src/kc_runtime.c`: bounded ready board, worker lifecycle, and callback delivery
 - `core/src/kcoro_stackless.c`: saved program counter/frame and exact-ticket resume
 - `core/src/kc_service.c`: retained stackless services and realtime edges
@@ -87,7 +89,9 @@ sub-percent idle-worker CPU before and after work; and four logical team
 members completing one exact quorum generation over two physical workers.
 They also prove bounded admission publication, permanent-stop precedence over
 temporary sealing, unique canonical ticket minting, and stale fixed-slot lease
-rejection.
+rejection. The team-executor contract saturates its mailbox, advances one
+request across two quorum generations, rejects another request through its
+correlated completion, drains coalesced edges, and retires without a waiter.
 Rust bindings are not the authority for the native kernel.
 
 ## License

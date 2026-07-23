@@ -52,6 +52,11 @@ target_link_libraries(kcoro_coordination_contract_test PRIVATE kcoro)
 add_executable(kcoro_mailbox_contract_test tests/mailbox_contract.cpp)
 target_link_libraries(kcoro_mailbox_contract_test PRIVATE kcoro)
 
+add_executable(kcoro_team_executor_contract_test
+    tests/team_executor_contract.cpp
+)
+target_link_libraries(kcoro_team_executor_contract_test PRIVATE kcoro)
+
 add_test(NAME kcoro_stackless COMMAND kcoro_stackless_test)
 add_test(NAME kcoro_runtime_contract COMMAND kcoro_runtime_contract_test)
 add_test(NAME kcoro_team_contract COMMAND kcoro_team_contract_test)
@@ -59,3 +64,6 @@ add_test(NAME kcoro_coordination_contract
     COMMAND kcoro_coordination_contract_test
 )
 add_test(NAME kcoro_mailbox_contract COMMAND kcoro_mailbox_contract_test)
+add_test(NAME kcoro_team_executor_contract
+    COMMAND kcoro_team_executor_contract_test
+)

@@ -6,10 +6,10 @@ Status: current implementation plus explicitly marked next steps.
 
 Flashkern is the CPU inference device:
 
-- native C++ owns the engine object, plans, request/pass slots, descriptors,
-  queues, direct byte views, scratch, and numerical lifecycle;
-- kcoro owns every resident control worker and fixed-team member, their idle
-  dormancy, stop, and join;
+- native C++ owns the engine object, plans, request/pass slots, direct byte
+  views, scratch, model-stage selection, and numerical lifecycle;
+- kcoro owns every resident control worker, saved executor frame, typed
+  mailbox, fixed-team member, generation callback, and asynchronous retirement;
 - architecture assembly is the primary numerical implementation, with Apple
   Accelerate/AMX admitted only behind an explicit large-matrix ABI;
 - Rust docks control/observation through opaque native handles only; native
@@ -33,31 +33,32 @@ dormancy.
 ```mermaid
 sequenceDiagram
     participant S as Native session/caller
-    participant R as Route/bridge frame
-    participant SQ as Ticketed SQ
+    participant R as Route frame
+    participant E as kc::TeamExecutor
     participant T as kcoro fixed team
-    participant CQ as Native CQ
 
     S->>R: retain input leases + create route ticket
-    R->>SQ: publish validated pass descriptor
-    SQ-->>T: dispatch generation
+    R->>E: publish validated pass request
+    E-->>T: dispatch generation
     T->>T: claim assembly tiles; every member returns once
-    T-->>R: final return resumes exact bridge ticket
+    T-->>E: final return resumes exact executor frame
     alt another route label
-        R->>SQ: publish next generation on the same ticket
+        E-->>T: publish next generation on the same ticket
     else terminal outcome
-        R->>CQ: publish exact ticket completion
-        CQ-->>S: make retained session delivery runnable
+        E-->>R: consume exact completion + resume route
+        R-->>S: make retained session delivery runnable
         S->>S: validate ticket/epoch + release leases
     end
 ```
 
-`bridge_continuation_step` validates submissions and drains completions from a
-fixed saved frame. `bridge_team_complete` only publishes the completed
-generation and resumes that exact continuation; it never shepherds the next
-stage inline. `PassSlot::ProgramCursor` and request-specific records own every
-numerical value that survives a return. The Rust submitter callback and Rust
-numerical coordinator are gone.
+`kc::TeamExecutor` validates one fixed-mailbox request through caller-supplied
+`begin`, dispatches logical team members through `run_member`, and invokes
+`advance` only after the exact final-return edge resumes its saved frame. It
+publishes and consumes the correlated completion before calling Flashkern's
+`finish`; it never shepherds the next stage inline from the returning member.
+`PassSlot::ProgramCursor` and request-specific records own every numerical
+value that survives a return. The former Flashkern-local bridge interpreter,
+generation counters, mailbox endpoints, and team callback are gone.
 
 An accepted submission carries only `{pass_slot, ticket_generation}`. The
 engine-owned slot retains its typed byte views, program cursor, continuation,
@@ -69,18 +70,19 @@ into a caller's stack.
 ## Fixed Lanes
 
 `lfm_engine_new_status`, reached through `lfm_runtime_create`, creates one
-bounded kcoro runtime, a saved bridge continuation, route and team-supervisor
-services, and one stable logical `kc_team` on that same pool. Flashkern and
-`kc_team` create no lane pthreads. The runtime owns one infrastructure
-doorbell; there is no operation-owned idle registration or per-pass fence word.
+bounded kcoro runtime, one `kc::TeamExecutor`, route and team-supervisor
+services, and the executor's stable logical `kc_team` on that same pool.
+Flashkern and `kc_team` create no lane pthreads. The runtime owns one
+infrastructure doorbell; there is no operation-owned idle registration or
+per-pass fence word.
 
 Every member executes the same published stage program. Members fetch-add
 disjoint tiles and return after their complete assembly leaf. The final return
-publishes one edge to the bridge frame. The resumed bridge transition either
-publishes the next stage generation or the terminal CQ record. Members do not
-block one another at a barrier; after returning they are simply available for
-the next generation and workers become dormant only if the entire pool has no
-work.
+publishes one edge to the executor frame. The resumed executor invokes the
+model-specific bounded transition and either publishes the next stage
+generation or the terminal completion record. Members do not block one another
+at a barrier; after returning they are simply available for the next generation
+and workers become dormant only if the entire pool has no work.
 
 This is one team. The current engine may describe logical blocks for accounting,
 but it does not own two independent four-lane teams and cannot run two numerical
@@ -212,12 +214,14 @@ Soft nudge/rebroadcast behavior is not part of production.
 
 ## Teardown
 
-Stop closes admission and resumes the bridge frame. Accepted work settles into
-terminal CQ records, stale epochs lose publication authority, and all retained
-leases release exactly once. The canceled-and-empty SQ is the terminal edge
-that retires the logical team; the runtime then owns only terminal physical
-worker teardown. The bridge frame is destroyed only when submissions,
-completions, routes, pass slots, and retained I/O leases are all settled.
+Stop closes mailbox admission and resumes the executor frame. Accepted work
+settles into terminal completion records, stale epochs lose publication
+authority, and all retained leases release exactly once. The
+canceled-and-empty mailbox is the terminal edge that retires the logical team;
+the team's final retirement callback resumes the executor, which retires its
+endpoint leases and publishes its own terminal callback. Its setup leases are
+destroyed only after submissions, completions, routes, pass slots, and retained
+I/O leases are all settled.
 
 There is no production synchronous compatibility wrapper. Concurrent callers
 either acquire a generation-protected slot or receive a bounded admission
@@ -229,6 +233,9 @@ Current tests include:
 
 - `kcoro-sys/tests/fixed_team.rs` for fixed membership, callback completion,
   quorum snapshots, and stop/join ownership;
+- `kcoro_arena/tests/team_executor_contract.cpp` for saturated-mailbox
+  draining, multi-generation advancement, exact rejection completion,
+  coalesced-edge safety, and callback-proven retirement;
 - `engine_hard_supervision.rs` for deadline retirement, terminal arbitration,
   and fatal-capsule content;
 - `sesame_detector.rs` for exact browser evidence, circular windows, separate
