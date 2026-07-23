@@ -18,9 +18,8 @@
 //     intrinsics (float32x4_t: fmla/vmax/vsub, vectorized loads/stores). Matrix
 //     operations over mutable f32 activations may ride AMX via Accelerate;
 //     resident weights stay byte-addressed and use NEON/SSE register loads.
-//     Scalar code exists in exactly two places: the `..._ref` parity siblings
-//     under MIMI_SCALAR_REF, and sub-vector tail remainders. Transcendentals
-//     (erff/expf): lane-wise libm
+//     Scalar code exists only in sub-vector tail remainders and setup-time
+//     control. Transcendentals (erff/expf): lane-wise libm
 //     calls INSIDE the NEON sweep on the first pass (faithful tier — a
 //     polynomial vector exp/erf changes numerics; it enters later, behind the
 //     parity gate, as a fast-tier variant).
@@ -47,7 +46,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "lfm_visibility.h"
+#include "lfm_mimi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -127,7 +126,7 @@ float mimi_weight_load_f32(const uint8_t *bytes, uint64_t index);
  * Activation-only GEMM/GEMV may use Accelerate. The `mimi_weight_*` variants
  * stream little-endian checkpoint bytes through architecture registers without
  * a float pointer, alignment copy, staging plane, transpose, or repack.
- * Scalar _ref/tail code remains the parity-bisect path.
+ * Scalar code is limited to exact-order reductions and sub-vector tails.
  *   y[m] = sum_k w[m*k_stride + k] * x[k] (+ b[m])  — row-major W [M,K] */
 void mimi_gemv_f32(const float *w, const float *x, const float *bias_or_null,
                    float *y, int m, int k);
@@ -253,29 +252,6 @@ int  mimi_seanet_init(MimiSeanetState **st, const MimiWeightTable *w,
 int  mimi_seanet_step(MimiSeanetState *st, const float *x, int n_in, float *pcm);
 void mimi_seanet_reset(MimiSeanetState *st);
 
-/* 6. top level: model-lifetime plan + conversation-lifetime state */
-typedef struct MimiDecodePlan MimiDecodePlan;
-typedef struct MimiDecodeState MimiDecodeState;
-typedef struct LfmWeightImage LfmWeightImage;
-LFM_INTERNAL_API int mimi_decode_plan_new_from_image(
-    MimiDecodePlan **plan, const LfmWeightImage *image, char *err,
-    size_t errlen);
-LFM_INTERNAL_API void mimi_decode_plan_free(MimiDecodePlan *plan);
-LFM_INTERNAL_API uint64_t
-mimi_decode_plan_derived_bytes(const MimiDecodePlan *plan);
-LFM_INTERNAL_API uint64_t
-mimi_decode_plan_bound_weight_bytes(const MimiDecodePlan *plan);
-LFM_INTERNAL_API uint64_t
-mimi_decode_plan_compatibility_copied_bytes(const MimiDecodePlan *plan);
-LFM_INTERNAL_API int mimi_decode_state_new(MimiDecodeState **state,
-                                         const MimiDecodePlan *plan,
-                                         char *err, size_t errlen);
-LFM_INTERNAL_API void mimi_decode_state_free(MimiDecodeState *state);
-LFM_INTERNAL_API int mimi_decode_state_step(MimiDecodeState *state,
-                                          const uint32_t *codes,
-                                          float *pcm_out);
-LFM_INTERNAL_API void mimi_decode_state_reset(MimiDecodeState *state);
-LFM_INTERNAL_API uint64_t mimi_decode_state_bytes(const MimiDecodeState *state);
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

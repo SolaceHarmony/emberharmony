@@ -47,6 +47,9 @@ set(LFM_VOICE_SOURCES
     src/runtime/lfm_capture_format.cpp
     src/model/lfm_conformer.cpp
     src/engine/flashkern_prng.cpp
+)
+
+set(LFM_MIMI_SOURCES
     src/mimi/mimi_quant.cpp
     src/mimi/mimi_conv.cpp
     src/mimi/mimi_seanet.cpp
@@ -103,6 +106,18 @@ if(APPLE)
         "-framework AudioToolbox"
         "-framework CoreAudio"
         "-framework CoreFoundation"
+    )
+
+    # Mimi is retained for the future native Moshi tranche. LFM2.5 uses its
+    # own detokenizer and must not link this dormant decoder.
+    add_library(lfm_mimi STATIC EXCLUDE_FROM_ALL ${LFM_MIMI_SOURCES})
+    target_include_directories(lfm_mimi PUBLIC ${LFM_INCLUDE_DIRS})
+    target_compile_options(lfm_mimi PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-ffp-contract=off;-fvisibility=hidden;-Wall;-Wextra;-Werror>
+    )
+    target_link_libraries(lfm_mimi PUBLIC
+        lfm_weights
+        "-framework Accelerate"
     )
 endif()
 

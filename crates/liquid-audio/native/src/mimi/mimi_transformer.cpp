@@ -25,9 +25,9 @@
 // is NEON intrinsics as the primary path (rope rotation, score scale+mask
 // locally; layernorm, softmax, and gelu via the header primitives). Projection
 // scale/add epilogues write only their final residual values.
-// Scalar code exists only in the _ref parity siblings (MIMI_SCALAR_REF) and
-// sub-vector tails. Zero allocation in steady state (state + scratch carved
-// from MimiArena at init), POD state, f32 accumulate, documented orders.
+// Scalar code exists only in architecture-specific data movement, exact-order
+// control, and sub-vector tails. Zero allocation in steady state (state +
+// scratch carved from MimiArena at init), POD state, f32 accumulate.
 
 #include "mimi_kernel.h"
 
@@ -35,11 +35,13 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(__aarch64__) && defined(__ARM_NEON)
 #define MIMI_TR_NEON 1
 #include <arm_neon.h>
-#else
+#elif defined(__x86_64__) || defined(_M_X64)
 #define MIMI_TR_NEON 0
+#else
+#error "Mimi transformer supports arm64 and x86_64/Rosetta only"
 #endif
 
 /* ---- fixed dimensions (transformer.rs Config via mimi.rs v0_1) ---------- */
@@ -103,7 +105,7 @@ struct MimiTransformerState {
     float *rope_sin;         /* [TR_MAX_N][TR_HD2]                           */
 };
 
-/* ---- local NEON kernels (with _ref parity siblings) --------------------- */
+/* ---- local architecture kernels ----------------------------------------- */
 
 /* rope_i interleaved rotation over one 64-float head block, in place:
  *   y[2j]   = x[2j]*cos[j] - x[2j+1]*sin[j]
@@ -111,8 +113,9 @@ struct MimiTransformerState {
  * Scalar ref keeps the four products in separate statements so clang cannot
  * contract into fma (rustc computes them unfused); the NEON path uses
  * explicit vmul/vsub/vadd (unfused) for the same reason. */
-[[maybe_unused]] static void tr_rope_block_ref(float *hp, const float *crow,
-                                               const float *srow) {
+#if !MIMI_TR_NEON
+static void tr_rope_block_generic(float *hp, const float *crow,
+                                  const float *srow) {
     for (int j = 0; j < TR_HD2; j++) {
         const float x0 = hp[2 * j];
         const float x1 = hp[2 * j + 1];
@@ -126,6 +129,7 @@ struct MimiTransformerState {
         hp[2 * j + 1] = x0s + x1c;
     }
 }
+#endif
 
 static inline void tr_rope_block(float *hp, const float *crow, const float *srow) {
 #if MIMI_TR_NEON
@@ -143,20 +147,21 @@ static inline void tr_rope_block(float *hp, const float *crow, const float *srow
         vst2q_f32(hp + 2 * j, y);
     }
 #else
-    tr_rope_block_ref(hp, crow, srow);
+    tr_rope_block_generic(hp, crow, srow);
 #endif
 }
 
 /* attention score row: sc[i] = sc[i] * 0.125f + mask[i] (0 / -inf).
  * candle: affine mul (exact, power of two) then broadcast_add — kept as
  * separate vmul/vadd, tail scalar. */
-[[maybe_unused]] static void tr_scale_mask_ref(float *sc, const float *mrow,
-                                               int k_len) {
+#if !MIMI_TR_NEON
+static void tr_scale_mask_generic(float *sc, const float *mrow, int k_len) {
     for (int i = 0; i < k_len; i++) {
         const float scaled = sc[i] * TR_ATTN_SCALE;
         sc[i] = scaled + mrow[i];
     }
 }
+#endif
 
 static inline void tr_scale_mask(float *sc, const float *mrow, int k_len) {
 #if MIMI_TR_NEON
@@ -170,23 +175,21 @@ static inline void tr_scale_mask(float *sc, const float *mrow, int k_len) {
         sc[i] = scaled + mrow[i];
     }
 #else
-    tr_scale_mask_ref(sc, mrow, k_len);
+    tr_scale_mask_generic(sc, mrow, k_len);
 #endif
 }
 
 /* conv_layout boundary, n == 2 fast paths: [C,2] <-> [2,C] is a 512-wide
  * de/interleave (vld2q/vst2q). n == 1 is a straight copy; other n (cold,
  * priming-only shapes) fall back to the scalar movement loop. */
-[[maybe_unused]] static void tr_transpose_in_ref(const float *x, float *xt,
-                                                 int n, int t) {
+static void tr_transpose_in_generic(const float *x, float *xt, int n, int t) {
     for (int c = 0; c < TR_D; c++) {
         const float *row = x + (size_t)c * (size_t)n;
         for (int tp = 0; tp < t; tp++) xt[(size_t)tp * TR_D + c] = row[tp];
     }
 }
 
-[[maybe_unused]] static void tr_transpose_out_ref(const float *xt, float *y,
-                                                  int n, int t) {
+static void tr_transpose_out_generic(const float *xt, float *y, int n, int t) {
     for (int c = 0; c < TR_D; c++) {
         float *row = y + (size_t)c * (size_t)n;
         for (int tp = 0; tp < t; tp++) row[tp] = xt[(size_t)tp * TR_D + c];
@@ -210,7 +213,7 @@ static inline void tr_transpose_in(const float *x, float *xt, int n, int t) {
         return;
     }
 #endif
-    tr_transpose_in_ref(x, xt, n, t);
+    tr_transpose_in_generic(x, xt, n, t);
 }
 
 static inline void tr_transpose_out(const float *xt, float *y, int n, int t) {
@@ -231,7 +234,7 @@ static inline void tr_transpose_out(const float *xt, float *y, int n, int t) {
         return;
     }
 #endif
-    tr_transpose_out_ref(xt, y, n, t);
+    tr_transpose_out_generic(xt, y, n, t);
 }
 
 /* ---- init helpers -------------------------------------------------------- */
@@ -253,11 +256,13 @@ static const uint8_t *tr_find(const MimiWeightTable *w, const char *name,
     }
     int ok;
     if (d1 < 0) {
-        ok = (mw->shape && mw->ndim == 1 && mw->shape[0] == d0 &&
+        ok = (mw->shape && mw->ndim == 1 &&
+              mw->shape[0] == static_cast<uint64_t>(d0) &&
               mw->len == (uint64_t)d0);
     } else {
-        ok = (mw->shape && mw->ndim == 2 && mw->shape[0] == d0 &&
-              mw->shape[1] == d1 &&
+        ok = (mw->shape && mw->ndim == 2 &&
+              mw->shape[0] == static_cast<uint64_t>(d0) &&
+              mw->shape[1] == static_cast<uint64_t>(d1) &&
               mw->len == (uint64_t)d0 * (uint64_t)d1);
     }
     if (!ok || mw->bytes == NULL) {
@@ -434,7 +439,7 @@ extern "C" int mimi_transformer_step(MimiTransformerState *st, const float *x,
         mask_scalar = 0;
     }
 #endif
-    if (mask_scalar) { /* _ref / overflow fallback */
+    if (mask_scalar) { /* 64-bit position path */
         for (int tp = 0; tp < t; tp++) {
             const int64_t q_abs = (int64_t)csl + tp;
             float *mrow = st->maskv + (size_t)tp * TR_CTX;
@@ -822,9 +827,8 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *       intermediate: `scaled` is a distinct f32 result, and the following add
  *       spells `prior + scaled` with residual as the left operand. The native
  *       build's load-bearing -ffp-contract=off forbids contraction.
- *     - rope: local tr_rope_block (NEON vld2q/vst2q, unfused vmul/vsub/vadd),
- *       _ref sibling under MIMI_SCALAR_REF; table build is NEON vmul +
- *       lane-wise cosf/sinf.
+ *     - rope: local tr_rope_block (NEON vld2q/vst2q, unfused vmul/vsub/vadd);
+ *       table build is NEON vmul + lane-wise cosf/sinf.
  *     - mask fill: NEON int32-lane sweep (vcge/vcle/vbsl selecting 0/-inf),
  *       scalar tail; positions are cast to int32 under a
  *       csl+t+250 < INT32_MAX guard (scalar int64 fallback beyond — the
@@ -847,7 +851,6 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *     2. Native resident-byte SIMD and activation-only AMX/cblas vs candle's
  *        gemm crate use different blocking and fma schedules — per-GEMM
  *        ulp-band drift is expected and is the accepted faithful-tier cost.
- *        Bisect path: MIMI_SCALAR_REF builds + unit 6's _ref gemv/gemm.
  *     3. This unit's parity also depends on unit 6 honoring (f) exactly —
  *        especially layer_norm's naive one-pass sum/sum2 and softmax's
  *        divide-by-sum. If unit 6 shipped Welford or two-pass mean/var,

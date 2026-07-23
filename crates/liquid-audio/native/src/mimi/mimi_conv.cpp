@@ -14,9 +14,9 @@
 //   ConvDownsample1d (encode-only), batched StreamMask (batch==1: the mask is
 //     always None here, so every mask where_cond branch collapses to identity).
 //
-// MATH IS ASSEMBLY (her rule): every reduction/sweep is aarch64 NEON
-// (float32x4_t / vfmaq_f32) as the PRIMARY path. Scalar exists only in the
-// MIMI_SCALAR_REF parity sibling build and in sub-vector tail remainders.
+// MATH IS ASSEMBLY (her rule): every reduction/sweep is architecture SIMD
+// (NEON on arm64, SSE on x86_64/Rosetta) as the primary path. Scalar exists
+// only in sub-vector tail remainders.
 // Data marshalling (weight/carry gathers, strided scatters) is not "math" and
 // stays scalar, mirroring candle's own inp_cont / k_cont staging copies.
 //
@@ -30,17 +30,16 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(__aarch64__) && !defined(MIMI_SCALAR_REF)
+#if defined(__aarch64__)
 #define MIMI_NEON 1
 #define MIMI_SSE2 0
 #include <arm_neon.h>
-#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(MIMI_SCALAR_REF)
+#elif defined(__x86_64__) || defined(_M_X64)
 #define MIMI_NEON 0
 #define MIMI_SSE2 1
 #include <immintrin.h>
 #else
-#define MIMI_NEON 0
-#define MIMI_SSE2 0
+#error "Mimi convolution supports arm64 and x86_64/Rosetta only"
 #endif
 
 // Cap on frames-per-step for the convtr time-axis reduction scratch. The
@@ -62,57 +61,73 @@ enum { MIMI_CONV_MAX_NIN = MIMI_FRAME_OUT };
 // capacity never changes arithmetic within either backend and never allocates.
 
 /* ======================================================================== *
- *  NEON contiguous primitives (primary path; scalar under MIMI_SCALAR_REF)
+ *  architecture SIMD contiguous primitives
  * ======================================================================== */
 
 // y[i] += w * x[i]      — the vectorized MAC (conv1d time axis, convtr in-ch reduction)
 static inline void vaxpy(float *y, const float *x, float w, int n) {
+    int i = 0;
 #if MIMI_NEON
     const float32x4_t wv = vdupq_n_f32(w);
-    int i = 0;
     for (; i + 4 <= n; i += 4)
         vst1q_f32(y + i, vfmaq_f32(vld1q_f32(y + i), vld1q_f32(x + i), wv));
-    for (; i < n; ++i) y[i] += w * x[i];      // sub-vector tail
-#else
-    for (int i = 0; i < n; ++i) y[i] += w * x[i];
+#elif MIMI_SSE2
+    const __m128 wv = _mm_set1_ps(w);
+    for (; i + 4 <= n; i += 4) {
+        _mm_storeu_ps(y + i, _mm_add_ps(_mm_loadu_ps(y + i),
+                                        _mm_mul_ps(_mm_loadu_ps(x + i), wv)));
+    }
 #endif
+    for (; i < n; ++i) y[i] += w * x[i];
 }
 
 // y[i] = s * x[i]       — depthwise upsample multiply (channel axis)
 static inline void vscale(float *y, const float *x, float s, int n) {
+    int i = 0;
 #if MIMI_NEON
     const float32x4_t sv = vdupq_n_f32(s);
-    int i = 0;
     for (; i + 4 <= n; i += 4) vst1q_f32(y + i, vmulq_f32(vld1q_f32(x + i), sv));
-    for (; i < n; ++i) y[i] = x[i] * s;
-#else
-    for (int i = 0; i < n; ++i) y[i] = x[i] * s;
+#elif MIMI_SSE2
+    const __m128 sv = _mm_set1_ps(s);
+    for (; i + 4 <= n; i += 4) {
+        _mm_storeu_ps(y + i, _mm_mul_ps(_mm_loadu_ps(x + i), sv));
+    }
 #endif
+    for (; i < n; ++i) y[i] = x[i] * s;
 }
 
 // y[i] += c             — bias broadcast-add over a contiguous time run
 static inline void vadd_scalar(float *y, float c, int n) {
+    int i = 0;
 #if MIMI_NEON
     const float32x4_t cv = vdupq_n_f32(c);
-    int i = 0;
     for (; i + 4 <= n; i += 4) vst1q_f32(y + i, vaddq_f32(vld1q_f32(y + i), cv));
-    for (; i < n; ++i) y[i] += c;
-#else
-    for (int i = 0; i < n; ++i) y[i] += c;
+#elif MIMI_SSE2
+    const __m128 cv = _mm_set1_ps(c);
+    for (; i + 4 <= n; i += 4) {
+        _mm_storeu_ps(y + i, _mm_add_ps(_mm_loadu_ps(y + i), cv));
+    }
 #endif
+    for (; i < n; ++i) y[i] += c;
 }
 
 // y[i] += p[i] - c      — overlap-add of prior carry with bias removed
 static inline void voverlap(float *y, const float *p, float c, int n) {
+    int i = 0;
 #if MIMI_NEON
     const float32x4_t cv = vdupq_n_f32(c);
-    int i = 0;
     for (; i + 4 <= n; i += 4)
         vst1q_f32(y + i, vaddq_f32(vld1q_f32(y + i), vsubq_f32(vld1q_f32(p + i), cv)));
-    for (; i < n; ++i) y[i] += p[i] - c;
-#else
-    for (int i = 0; i < n; ++i) y[i] += p[i] - c;
+#elif MIMI_SSE2
+    const __m128 cv = _mm_set1_ps(c);
+    for (; i + 4 <= n; i += 4) {
+        _mm_storeu_ps(
+            y + i,
+            _mm_add_ps(_mm_loadu_ps(y + i),
+                       _mm_sub_ps(_mm_loadu_ps(p + i), cv)));
+    }
 #endif
+    for (; i < n; ++i) y[i] += p[i] - c;
 }
 
 // Rotate equal-shaped carry banks after every reader of `prev` has finished.
@@ -186,7 +201,8 @@ static void weight_norm_fold(const uint8_t *v, const uint8_t *g, float *out,
 
 // Exact-shape check (review P2: the header promises rejection of misshaped
 // weights, not just wrong element counts): 3-D, dims match, data non-null.
-static int wcheck3(const MimiWeight *ww, int64_t d0, int64_t d1, int64_t d2) {
+static int wcheck3(const MimiWeight *ww, uint64_t d0, uint64_t d1,
+                   uint64_t d2) {
     return ww && ww->bytes && ww->ndim == 3 && ww->shape &&
            ww->shape[0] == d0 && ww->shape[1] == d1 && ww->shape[2] == d2;
 }
@@ -971,11 +987,10 @@ extern "C" uint64_t mimi_conv_matrix_workspace_bytes_saved(void) {
  *      take a *streamable node* prefix and this unit appends ".conv.conv" /
  *      ".convtr.convtr". If the arbiter instead intends prefix == the direct
  *      weight parent, drop the two snprintf(base, "%s.conv.conv"/"...") lines.
- *   2. Scalar code lives ONLY in: the MIMI_SCALAR_REF build (every vNNN helper
- *      degrades to a scalar loop -> that build IS the `_ref` parity sibling for
- *      bisecting), sub-vector tail remainders inside the NEON helpers, and pure
- *      activation/carry marshalling (strided gathers and scatters). Resident
- *      weights are never staged, repacked, transposed, widened, or aligned.
+ *   2. Scalar code is limited to sub-vector tail remainders and pure
+ *      activation/carry marshalling (strided gathers and scatters). Supported
+ *      targets use NEON or SSE for every contiguous sweep. Resident weights are
+ *      never staged, repacked, transposed, widened, or aligned.
  *   3. Numerics are the *faithful* tier (ulp band), not bit-exact: NEON's 4-lane
  *      grouping of the AXPY accumulation differs from candle's f32 vec_dot lane
  *      order; the harness measures the band. A per-kk byte-load SIMD GEMM

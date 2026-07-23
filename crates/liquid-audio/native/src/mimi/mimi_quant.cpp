@@ -18,10 +18,6 @@
 #include <cstdio>
 #include <cstring>
 
-#if defined(__ARM_NEON) && !defined(MIMI_SCALAR_REF)
-#include <arm_neon.h>
-#endif
-
 // ---------------------------------------------------------------------------
 // Compile-time shape facts for this checkpoint (mirror mimi_kernel.h enums).
 // ---------------------------------------------------------------------------
@@ -64,31 +60,11 @@ struct MimiQuantState {
 // ===========================================================================
 namespace {
 
-#ifdef MIMI_SCALAR_REF
-// Scalar reference sibling for the NEON accumulate (parity bisecting).
-// acc[i] += x[i] for i in [0,n); lanes independent, no cross-lane reduction.
-void vec_add_ref(float *acc, const float *x, int n) {
-    for (int i = 0; i < n; ++i) acc[i] += x[i];
-}
-#endif
-
 // acc[i] += x[i], i in [0,n). Elementwise add across a codebook contribution;
-// accumulation order is per-index only (no reduction across i), so NEON and
-// scalar agree bit-for-bit.
+// accumulation order is per-index only (no reduction across i). The shared
+// native sweep owns the architecture implementation.
 inline void vec_add(float *acc, const float *x, int n) {
-#ifdef MIMI_SCALAR_REF
-    vec_add_ref(acc, x, n);
-#elif defined(__ARM_NEON)
-    int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t a = vld1q_f32(acc + i);
-        float32x4_t b = vld1q_f32(x + i);
-        vst1q_f32(acc + i, vaddq_f32(a, b));
-    }
-    for (; i < n; ++i) acc[i] += x[i];
-#else
-    for (int i = 0; i < n; ++i) acc[i] += x[i];
-#endif
+    mimi_add_vec_f32(acc, x, acc, n);
 }
 
 // Fold one EuclideanCodebook: dst[k,d] = embedding_sum[k,d] / max(usage[k],eps).
@@ -351,7 +327,6 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
   - Arena budget: this unit folds 8 codebooks * 2048 * 256 * 4 B = 16 MiB into
     immutable derived plan storage, plus one 256-float (1 KiB) per-conversation
     residual plane. The two former 512-float projected planes are gone.
-  - NEON vec_add has a scalar sibling vec_add_ref under -DMIMI_SCALAR_REF; both
-    are bit-identical (elementwise add). fold_codebook and clamp are scalar-only
-    (init-time / trivial), so they need no _ref.
+  - vec_add delegates to the shared architecture sweep. fold_codebook and clamp
+    are setup-time / trivial scalar control and have no alternate implementation.
 --------------------------------------------------------------------------- */

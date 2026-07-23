@@ -14,17 +14,13 @@
 // Skipped:  SeaNetEncoder, lstm (lstm=0), final_activation (None).
 //
 // Engine discipline: zero allocation in steady state (all scratch carved from the
-// MimiArena once at init, sized worst-case), POD state, f32 accumulate, scalar
-// reference siblings under MIMI_SCALAR_REF, no exceptions across the ABI.
+// MimiArena once at init, sized worst-case), POD state, f32 accumulate, one
+// architecture-selected implementation, no exceptions across the ABI.
 
 #include "mimi_kernel.h"
 
 #include <cstdio>   // snprintf
 #include <cstring>  // strlen (unused guard-free)
-
-#if defined(__aarch64__) && !defined(MIMI_SCALAR_REF)
-#include <arm_neon.h>
-#endif
 
 /* ------------------------------------------------------------------------- *
  * Derived geometry (from SeaNetDecoder::new, cfg v0_1).

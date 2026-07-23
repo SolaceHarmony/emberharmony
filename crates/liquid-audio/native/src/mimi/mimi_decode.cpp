@@ -34,7 +34,9 @@
 // AMX matrix coprocessor via Accelerate's cblas. Resident weights never cross
 // that typed API: their variants load checkpoint bytes into NEON/SSE registers.
 // The header is include-only at compile time; linking requires Accelerate.
-#ifdef __APPLE__
+#if !defined(__APPLE__)
+#error "The native Mimi decoder requires Apple Accelerate"
+#else
 // Opt into the modern (non-deprecated) CBLAS interface. LP64 only — do NOT set
 // ACCELERATE_LAPACK_ILP64, so cblas args stay 32-bit `int` and match the
 // header's int M/K/N ABI. Without this, cblas_sgemm/sgemv warn as deprecated on
@@ -46,8 +48,7 @@
 #endif
 
 // NEON is the primary path for the activation/elementwise/reduction sweeps and
-// for layer-norm; the scalar bodies below are the _ref parity-bisect path,
-// selected on non-NEON targets or with -DMIMI_SCALAR_REF.
+// for layer-norm. x86_64/Rosetta uses its architecture implementation.
 #if (defined(__aarch64__) || defined(__ARM_ARCH_ISA_A64)) && defined(__ARM_NEON)
 #define MIMI_HAVE_NEON 1
 #include <arm_neon.h>
@@ -167,7 +168,7 @@ extern "C" float mimi_weight_load_f32(const uint8_t *bytes, uint64_t index) {
 // reinterpret only the register bits; scalar tails assemble little-endian u32
 // explicitly in mimi_weight_load_f32. No C++ float object is ever manufactured
 // inside the sealed image.
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
 static inline float32x4_t mimi_weight_load4_f32(const uint8_t *bytes) {
     return vreinterpretq_f32_u8(vld1q_u8(bytes));
 }
@@ -175,7 +176,7 @@ static inline float32x4_t mimi_weight_load4_f32(const uint8_t *bytes) {
 static inline float mimi_weight_sum4(float32x4_t values) {
     return vaddvq_f32(values);
 }
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
 static inline __m128 mimi_weight_load4_f32(const uint8_t *bytes) {
     __m128 values;
     std::memcpy(&values, bytes, sizeof(values));
@@ -220,31 +221,11 @@ extern "C" const MimiWeight *mimi_weight_find(const MimiWeightTable *t,
 //   - sweeps / softmax / layer-norm : NEON intrinsics, transcendentals applied
 //     LANE-WISE with libm erff/expf (no polynomial vector approximations — that
 //     would move the numerics off the faithful tier).
-// Parity-bisect: build -DMIMI_SCALAR_REF to force the scalar reference bodies
-// (and, off-Apple, the scalar gemm/gemv _ref siblings) and diff against them.
 // ===========================================================================
 
 // -------- gemv: y[m] = sum_k w[m*k + k] * x[k] (+ bias[m]); W row-major [M,K] --
-// Scalar reference (parity-bisect path + off-Apple fallback).
-[[maybe_unused]] static void mimi_gemv_f32_ref(const float *w, const float *x,
-                                               const float *bias, float *y,
-                                               int m, int k) {
-    for (int i = 0; i < m; ++i) {
-        const float *wr = w + (size_t)i * (size_t)k;
-        float s = 0.0f;
-        for (int j = 0; j < k; ++j) {
-            s += wr[j] * x[j];  // sequential accumulation, low index -> high
-        }
-        if (bias) {
-            s += bias[i];
-        }
-        y[i] = s;
-    }
-}
-
 extern "C" void mimi_gemv_f32(const float *w, const float *x,
                               const float *bias_or_null, float *y, int m, int k) {
-#if defined(__APPLE__) && !defined(MIMI_SCALAR_REF)
     // W is row-major [M,K] == an M-by-K cblas matrix, lda = K, no transpose.
     // beta 0 => cblas overwrites y with W*x (y is not read). Bias is a separate
     // explicit loop AFTER the cblas call (the AMX matmul carries no bias term).
@@ -254,43 +235,15 @@ extern "C" void mimi_gemv_f32(const float *w, const float *x,
             y[i] += bias_or_null[i];
         }
     }
-#else
-    mimi_gemv_f32_ref(w, x, bias_or_null, y, m, k);
-#endif
 }
 
 // -------- gemm: C[M,N] = A[M,K]*B[K,N] (beta 0) or += (beta 1); row-major -----
-// Scalar reference (parity-bisect path + off-Apple fallback), loop order i-k-j.
-[[maybe_unused]] static void mimi_gemm_f32_ref(const float *a, const float *b,
-                                               float *c, int m, int k, int n,
-                                               int beta) {
-    for (int i = 0; i < m; ++i) {
-        float *cr = c + (size_t)i * (size_t)n;
-        if (beta == 0) {
-            for (int j = 0; j < n; ++j) {
-                cr[j] = 0.0f;
-            }
-        }
-        for (int p = 0; p < k; ++p) {
-            const float aval = a[(size_t)i * (size_t)k + (size_t)p];
-            const float *br = b + (size_t)p * (size_t)n;
-            for (int j = 0; j < n; ++j) {
-                cr[j] += aval * br[j];
-            }
-        }
-    }
-}
-
 extern "C" void mimi_gemm_f32(const float *a, const float *b, float *c, int m,
                               int k, int n, int beta) {
-#if defined(__APPLE__) && !defined(MIMI_SCALAR_REF)
     // Direct row-major mapping, NO transpose (weights are a buffer, movement is
     // theft): A[M,K] lda=K, B[K,N] ldb=N, C[M,N] ldc=N; beta 0 overwrite / 1 acc.
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, a,
                 k, b, n, (float)beta, c, n);
-#else
-    mimi_gemm_f32_ref(a, b, c, m, k, n, beta);
-#endif
 }
 
 static inline float mimi_weight_gemv_row_f32(const uint8_t *w,
@@ -299,7 +252,7 @@ static inline float mimi_weight_gemv_row_f32(const uint8_t *w,
                                               int k) {
     float sum = 0.0f;
     int j = 0;
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
     float32x4_t acc2 = vdupq_n_f32(0.0f);
@@ -322,7 +275,7 @@ static inline float mimi_weight_gemv_row_f32(const uint8_t *w,
     acc0 = vaddq_f32(acc0, acc1);
     acc2 = vaddq_f32(acc2, acc3);
     sum = mimi_weight_sum4(vaddq_f32(acc0, acc2));
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
     __m128 acc0 = _mm_setzero_ps();
     __m128 acc1 = _mm_setzero_ps();
     __m128 acc2 = _mm_setzero_ps();
@@ -408,7 +361,7 @@ extern "C" void mimi_weight_gemm_f32(const uint8_t *w, const float *b,
     }
     for (int i = 0; i < m; ++i) {
         float *row = c + static_cast<size_t>(i) * n;
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
         if (n == 2) {
             float32x2_t acc = beta ? vld1_f32(row) : vdup_n_f32(0.0f);
             for (int p = 0; p < k; ++p) {
@@ -420,7 +373,7 @@ extern "C" void mimi_weight_gemm_f32(const uint8_t *w, const float *b,
             vst1_f32(row, acc);
             continue;
         }
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
         if (n == 2) {
             __m128 acc = beta ? _mm_setr_ps(row[0], row[1], 0.0f, 0.0f)
                               : _mm_setzero_ps();
@@ -445,14 +398,14 @@ extern "C" void mimi_weight_gemm_f32(const uint8_t *w, const float *b,
                 mimi_weight_load_f32(w, static_cast<uint64_t>(i) * k + p);
             const float *input = b + static_cast<size_t>(p) * n;
             int j = 0;
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
             const float32x4_t vw = vdupq_n_f32(weight);
             for (; j + 4 <= n; j += 4) {
                 vst1q_f32(row + j,
                           vaddq_f32(vld1q_f32(row + j),
                                     vmulq_f32(vw, vld1q_f32(input + j))));
             }
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
             const __m128 vw = _mm_set1_ps(weight);
             for (; j + 4 <= n; j += 4) {
                 _mm_storeu_ps(row + j,
@@ -467,7 +420,7 @@ extern "C" void mimi_weight_gemm_f32(const uint8_t *w, const float *b,
 
 extern "C" void mimi_weight_gemm_tn_f32(const uint8_t *w, const float *b,
                                           float *c, int rows, int k, int n) {
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     // Decode's wide transposed-convolution route has n==2. Vectorize across
     // four checkpoint rows so every resident load stays contiguous even though
     // the row-major output columns are short.
@@ -509,7 +462,7 @@ extern "C" void mimi_weight_gemm_tn_f32(const uint8_t *w, const float *b,
         }
         return;
     }
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
     if (n > 0 && n < 4) {
         int row = 0;
         for (; row + 4 <= rows; row += 4) {
@@ -559,14 +512,14 @@ extern "C" void mimi_weight_gemm_tn_f32(const uint8_t *w, const float *b,
                 w, static_cast<uint64_t>(p) * rows + row);
             const float *input = b + static_cast<size_t>(p) * n;
             int j = 0;
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
             const float32x4_t vw = vdupq_n_f32(weight);
             for (; j + 4 <= n; j += 4) {
                 vst1q_f32(output + j,
                           vaddq_f32(vld1q_f32(output + j),
                                     vmulq_f32(vw, vld1q_f32(input + j))));
             }
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
             const __m128 vw = _mm_set1_ps(weight);
             for (; j + 4 <= n; j += 4) {
                 _mm_storeu_ps(output + j,
@@ -782,7 +735,7 @@ extern "C" float mimi_elu_f32(float x, float alpha) {
 // NEON vectorizes the 0.5*x*(1+e) arithmetic; erff is applied lane-wise (no
 // vector-poly substitution). Tail via the scalar helper.
 extern "C" void mimi_gelu_erf_vec_f32(const float *x, float *y, int n) {
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     const float32x4_t half = vdupq_n_f32(0.5f);
     const float32x4_t one = vdupq_n_f32(1.0f);
     const float32x4_t inv_sqrt2 = vdupq_n_f32(0.70710678118654752440f);
@@ -814,7 +767,7 @@ extern "C" void mimi_gelu_erf_vec_f32(const float *x, float *y, int n) {
 // -------- elu sweep: y[i] = elu(x[i], alpha) ----------------------------------
 // NEON select between the x>0 and alpha*(exp(x)-1) branches; expf lane-wise.
 extern "C" void mimi_elu_vec_f32(const float *x, float *y, int n, float alpha) {
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     const float32x4_t one = vdupq_n_f32(1.0f);
     int i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -848,7 +801,7 @@ extern "C" void mimi_elu_vec_f32(const float *x, float *y, int n, float alpha) {
 // -------- add sweep: y[i] = a[i] + b[i] (streaming skip / residual add) --------
 extern "C" void mimi_add_vec_f32(const float *a, const float *b, float *y,
                                  int n) {
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     int i = 0;
     for (; i + 4 <= n; i += 4) {
         vst1q_f32(y + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
@@ -866,7 +819,7 @@ extern "C" void mimi_add_vec_f32(const float *a, const float *b, float *y,
 // -------- scale sweep: y[i] = x[i] * s[i] elementwise (LayerScale) -------------
 extern "C" void mimi_scale_vec_f32(const float *x, const float *s, float *y,
                                    int n) {
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     int i = 0;
     for (; i + 4 <= n; i += 4) {
         vst1q_f32(y + i, vmulq_f32(vld1q_f32(x + i), vld1q_f32(s + i)));
@@ -887,7 +840,7 @@ extern "C" void mimi_softmax_f32(float *x, int n) {
     if (n <= 0) {
         return;
     }
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     // pass 1: max
     float32x4_t vmax = vdupq_n_f32(x[0]);
     int i = 0;
@@ -1008,7 +961,7 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
     const float mean = sum / (float)n;
     const float var = sum2 / (float)n - mean * mean;
     const float inv_std = 1.0f / sqrtf(var + eps);
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     const float32x4_t vmean = vdupq_n_f32(mean);
     const float32x4_t vinv = vdupq_n_f32(inv_std);
     // apply: y = ((x−mean)·inv_std)·w + b, unfused adds (vaddq, not vmlaq).
@@ -1041,13 +994,13 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
 extern "C" void mimi_weight_scale_vec_f32(const float *x, const uint8_t *s,
                                             float *y, int n) {
     int i = 0;
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     for (; i + 4 <= n; i += 4) {
         vst1q_f32(y + i,
                   vmulq_f32(vld1q_f32(x + i),
                             mimi_weight_load4_f32(s + i * sizeof(float))));
     }
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
     for (; i + 4 <= n; i += 4) {
         _mm_storeu_ps(y + i,
                       _mm_mul_ps(_mm_loadu_ps(x + i),
@@ -1071,7 +1024,7 @@ extern "C" void mimi_weight_layer_norm_f32(const float *x, const uint8_t *w,
     const float variance = sum2 / static_cast<float>(n) - mean * mean;
     const float inv = 1.0f / sqrtf(variance + eps);
     int i = 0;
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+#if defined(MIMI_HAVE_NEON)
     const float32x4_t vmean = vdupq_n_f32(mean);
     const float32x4_t vinv = vdupq_n_f32(inv);
     for (; i + 4 <= n; i += 4) {
@@ -1083,7 +1036,7 @@ extern "C" void mimi_weight_layer_norm_f32(const float *x, const uint8_t *w,
             b ? mimi_weight_load4_f32(b + i * sizeof(float)) : vdupq_n_f32(0.0f);
         vst1q_f32(y + i, vaddq_f32(vmulq_f32(normed, vw), vb));
     }
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+#elif defined(MIMI_HAVE_SSE2)
     const __m128 vmean = _mm_set1_ps(mean);
     const __m128 vinv = _mm_set1_ps(inv);
     for (; i + 4 <= n; i += 4) {
@@ -1594,10 +1547,10 @@ extern "C" void mimi_decode_state_reset(MimiDecodeState *d) {
  *    var=sum((x-mean)^2)/n via vmlaq (BIASED, /n — matches candle_nn::LayerNorm);
  *    pass 3 y=(x-mean)/sqrt(var+eps)*w+b via vmlaq(vb, normed, vw), eps added to
  *    var BEFORE sqrt, eps supplied by the caller. NULL w/b => 1/0.
- *  LINKING: gemm/gemv need `-framework Accelerate`. Compiling this .cpp does NOT
- *    (cblas is header-only decls); the arbiter's build.rs adds the framework.
- *  Every scalar body above is gated to the _ref/-DMIMI_SCALAR_REF path or a
- *  sub-vector tail; resident hot paths are byte-load NEON/SSE.
+ *  LINKING: gemm/gemv need `-framework Accelerate`; the isolated native Mimi
+ *    target supplies that framework.
+ *  Scalar arithmetic is limited to exact-order reductions, transcendental
+ *  lanes, and sub-vector tails; resident hot paths are byte-load NEON/SSE.
  *
  * (e) UNCERTAINTIES / ARBITER RECONCILIATION
  * ------------------------------------------
@@ -1612,14 +1565,10 @@ extern "C" void mimi_decode_state_reset(MimiDecodeState *d) {
  *     double-emit step cannot overflow the latent buffers or pcm_out. If the
  *     arbiter proves emit is bounded at 2, this can drop to 2 (buffers shrink,
  *     pcm capacity stays per header).
- *  4. Accumulation order for parity. Resident gemv uses a fixed four-register
- *     reduction tree; matrix variants preserve ascending-K accumulation per
- *     output. This differs from candle's blocked gemm (ulp-band tier). NEON reductions
- *     (softmax/layernorm lane-sums) also differ from a strict sequential sum.
- *     Bisect with -DMIMI_SCALAR_REF (forces scalar gemm/gemv + scalar
- *     sweep bodies). Transcendentals are libm erff/expf lane-wise (NOT vector
- *     polynomials) to stay on the faithful tier. Softmax is max-subtracted
- *     3-pass matching candle's softmax_last_dim formula.
+ *  4. Accumulation order. Resident gemv uses a fixed four-register reduction
+ *     tree; matrix variants preserve ascending-K accumulation per output.
+ *     Transcendentals are libm erff/expf lane-wise (not vector polynomials).
+ *     Softmax is max-subtracted and three-pass.
  *  5. Quantizer emptiness. mimi_decode_state_step assumes `codes` is a present single
  *     frame (true on our path). There is no ABI way to pass "empty codes" to
  *     mimi_quant_decode, so the None-codes arm of Rust decode_step is not

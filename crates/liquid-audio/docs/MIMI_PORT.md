@@ -91,11 +91,10 @@ an LFM2.5 model or conversation.
   (`cblas_sgemm`/`cblas_sgemv`) — we have a matrix coprocessor, nobody
   hand-rolls a vanilla GEMM. EVERYTHING else — conv inner loops, softmax
   reductions, layernorm, RoPE rotation, ELU/GELU sweeps, elementwise
-  add/scale — is hand NEON intrinsics from the FIRST pass; scalar C++ exists
-  only in the `_ref` parity siblings and sub-vector tails. Transcendentals
+  add/scale — is architecture SIMD from the first pass; scalar C++ exists only
+  in exact-order reductions, setup control, and sub-vector tails. Transcendentals
   (erff/expf) stay lane-wise libm inside the NEON sweeps on the faithful tier;
-  polynomial vector approximations are fast-tier, admitted only behind the
-  parity gate.
+  polynomial vector approximations are not linked.
 - **Accumulation order is documented per kernel.** Target numerics tier:
   *faithful* — ulp-band parity vs moshi-Rust per module (candle's blocked gemm
   is not economically bit-reproducible); thresholds measured by the harness,
@@ -108,17 +107,14 @@ an LFM2.5 model or conversation.
 - C linkage entry points; no exceptions across the ABI; no candle, no Rust
   types below the seam.
 
-## Verification ladder (arbiter-owned)
+## Verification required before Moshi adoption
 
-1. Per-module parity harness: Rust `#[test]`s feed identical weights + seeded
-   inputs to the moshi module and the C++ unit via FFI; report max |Δ| and ulp
-   band per stage. Bisect with the scalar reference path.
-2. Chain parity: N-frame `decode_step` stream vs moshi, state carried across
-   frames (the streaming semantics are where ports rot — partial frames,
-   left-context, KV ring wrap at 250).
-3. e2e: perf-chain wav vs current PERF hash — expected to move; the audible
-   dual-path e2e + her ear bless the re-arm.
-4. Future Moshi integration: the Mimi kernel runs as a typed pass on the same
+1. C++23 full-value component traces cover quantization, convolution carry,
+   KV-ring wrap, reset, and the complete native decode chain. No Rust oracle or
+   FFI execution path is restored.
+2. A fixed-token native chain carries state across at least 130 frames, crosses
+   the 250-slot KV wrap, resets, and repeats deterministically.
+3. The Mimi kernel runs as a typed pass on the same
    Flashkern lane team as the Moshi backbone, with its own request kind at the
    pass boundary.
    Because it is a native C++ program (no Rust frames cross the fences), its lane
@@ -137,9 +133,7 @@ an LFM2.5 model or conversation.
       the slow tensor-op path; the REAL path is ops.rs cpu_fwd — one-pass
       sum/sum², naive var, recip(sqrt)) — rewritten; softmax final op is
       per-element DIVISION (`*d /= sum_exp`), not reciprocal-multiply —
-      rewritten; **builds MUST use `-ffp-contract=off`** (clang default
-      contracts a*b+c into fma even in scalar _ref paths; rustc never does —
-      without this flag the parity siblings are not oracles). Checkpoint
+      rewritten; **builds MUST use `-ffp-contract=off`**. Checkpoint
       stores PRE-FOLDED conv weights (0 weight_g/v) — fold path dormant,
       arena tightens toward ~16 MiB zero-copy.
       Prefix seam reconciled: seanet passes streamable-node prefixes, conv
@@ -181,24 +175,21 @@ an LFM2.5 model or conversation.
       Still open from the verdict: AMX dispatch is inferred from the 5.6x on
       GEMM-bound shapes, not proven by counters; cold init ~665 ms (page
       faults + re-arm) needs one measurement pass at integration.
-- [x] isolated build wiring: build.rs compiles the five units as C++23 with
-      `-ffp-contract=off` (load-bearing). The private plan binds only the
-      reserved Mimi component. LFM2.5 never constructs the plan or state.
+- [x] isolated build wiring: CMake and the native tools Makefile expose
+      `liblfm_mimi.a` as an explicit C++23 component with
+      `-ffp-contract=off` (load-bearing). It is excluded from the default
+      LFM2.5 product and speech-test link. The private plan binds only the
+      reserved Mimi component.
 - [x] LFM2.5 isolation: native LFM2.5 recurrence has no `REQ_MIMI_DECODE`, no
       Mimi state, no Mimi weights, and no version fallback. Its released
       detokenizer is mandatory.
 - [ ] Moshi production adoption: the future native Moshi model owner must load
       its main and Mimi sources into one image, construct the retained native
       plan/state, and mount the request on its coroutine route.
-- [x] chain parity, in-repo (tests/mimi_native_parity.rs, gate rung 2/6):
-      130 frames across the 250-slot KV wrap through the production FFI —
-      worst |Δ| = 3.085e-6 (assert 5e-5), post-reset 2.9e-7. Tighter than
-      the shadow review's 4.11e-6: the sequential-layernorm fix landed in
-      between (lane-blocked reduction NaN'd on near-constant rows — probe-
-      proven; accumulation now bit-matches candle's sequential order, apply
-      stays NEON). Final verdict's P2s also closed: stage errors propagate
-      through `mimi_decode_state_step` (negative rc never reads as priming);
-      upsample weight validated exact-shape + non-null.
+- [ ] native C++ trace gate: the former Rust FFI parity harness was retired
+      with Rust inference ownership. Before Moshi can mount this retained
+      component, replace its historical 130-frame/KV-wrap evidence with a
+      direct C++23 full-value trace over the component API.
 - [ ] Moshi engine integration: add a Moshi-owned typed Mimi request to the
       native SQ/CQ. Equal-rate output must write its retained playback
       reservation directly; other device rates use conversation-owned scratch

@@ -3,11 +3,13 @@ KCORO := ../../../kcoro-sys/vendor/kcoro_arena
 BUILD ?= build
 CXX ?= clang++
 CC ?= clang
+AR ?= ar
 CXXFLAGS ?= -O3 -std=c++23 -Wall -Wextra -Werror -pthread
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -pthread -D_GNU_SOURCE
 CPPFLAGS := -I$(ROOT)/include -I$(ROOT)/src/io -I$(ROOT)/src/model -I$(ROOT)/vendor -I$(KCORO)/include
 PRODUCT_CPPFLAGS := $(CPPFLAGS) -I$(ROOT)/src/detokenizer -I$(ROOT)/src/runtime -I$(ROOT)/src/mimi
 PRODUCT_CXXFLAGS := -O3 -std=c++23 -ffp-contract=off -pthread -fvisibility=hidden
+MIMI_CXXFLAGS := $(PRODUCT_CXXFLAGS) -Wall -Wextra -Werror
 PRODUCT_CFLAGS := -O2 -std=c11 -pthread -D_GNU_SOURCE -fvisibility=hidden
 DEPFLAGS := -MMD -MP
 
@@ -43,12 +45,13 @@ PRODUCT_CXX_SOURCES := \
 	src/runtime/lfm_capture_format.cpp \
 	src/model/lfm_conformer.cpp \
 	src/engine/flashkern_prng.cpp \
+	$(KERNEL_CPP)
+MIMI_CXX_SOURCES := \
 	src/mimi/mimi_quant.cpp \
 	src/mimi/mimi_conv.cpp \
 	src/mimi/mimi_seanet.cpp \
 	src/mimi/mimi_transformer.cpp \
-	src/mimi/mimi_decode.cpp \
-	$(KERNEL_CPP)
+	src/mimi/mimi_decode.cpp
 PRODUCT_C_SOURCES :=
 KERNEL_ASM_SOURCES := \
 	kernels/$(KERNEL_ARCH)/flashkern_prng.S \
@@ -61,6 +64,7 @@ KERNEL_ASM_SOURCES := \
 	kernels/$(KERNEL_ARCH)/flashkern_detokenizer.S \
 	kernels/$(KERNEL_ARCH)/flashkern_conformer.S
 PRODUCT_CXX_OBJECTS := $(patsubst %.cpp,$(BUILD)/product/%.o,$(PRODUCT_CXX_SOURCES))
+MIMI_CXX_OBJECTS := $(patsubst %.cpp,$(BUILD)/mimi/%.o,$(MIMI_CXX_SOURCES))
 PRODUCT_C_OBJECTS := $(patsubst %.c,$(BUILD)/product/%.o,$(PRODUCT_C_SOURCES))
 KERNEL_ASM_OBJECTS := $(patsubst %.S,$(BUILD)/product/%.o,$(KERNEL_ASM_SOURCES))
 SPEECH_OBJECTS := $(BUILD)/product/tests/native_speech_to_speech.o \
@@ -83,6 +87,7 @@ endif
 CXXFLAGS += $(ARCH_FLAGS)
 CFLAGS += $(ARCH_FLAGS)
 PRODUCT_CXXFLAGS += $(ARCH_FLAGS)
+MIMI_CXXFLAGS += $(ARCH_FLAGS)
 PRODUCT_CFLAGS += $(ARCH_FLAGS)
 KERNEL_FLAGS += $(ARCH_FLAGS)
 
@@ -114,6 +119,13 @@ $(BUILD)/kc_port_posix.o: $(KCORO)/port/posix.c | $(BUILD)
 $(BUILD)/product/%.o: $(ROOT)/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(PRODUCT_CPPFLAGS) $(PRODUCT_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/mimi/%.o: $(ROOT)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(PRODUCT_CPPFLAGS) $(MIMI_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/liblfm_mimi.a: $(MIMI_CXX_OBJECTS)
+	$(AR) rcs $@ $^
 
 $(BUILD)/product/$(KERNEL_CPP:.cpp=.o): $(ROOT)/$(KERNEL_CPP)
 	@mkdir -p $(dir $@)
